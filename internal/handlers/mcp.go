@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/NetGnarus/intentgate-gateway/internal/audit"
 	"github.com/NetGnarus/intentgate-gateway/internal/budget"
 	"github.com/NetGnarus/intentgate-gateway/internal/capability"
 	"github.com/NetGnarus/intentgate-gateway/internal/extractor"
@@ -47,6 +48,10 @@ type MCPHandlerConfig struct {
 	// have a verified capability token reaching the budget stage.
 	// Default false (dev mode allows missing tokens).
 	RequireBudget bool
+	// Audit is the emitter for one-event-per-decision audit records.
+	// When nil, a NullEmitter is substituted so the handler always has
+	// a safe target.
+	Audit audit.Emitter
 }
 
 type mcpHandler struct {
@@ -75,6 +80,9 @@ type mcpHandler struct {
 func NewMCPHandler(cfg MCPHandlerConfig) http.Handler {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
+	}
+	if cfg.Audit == nil {
+		cfg.Audit = audit.NewNullEmitter()
 	}
 	return &mcpHandler{cfg: cfg}
 }
@@ -128,8 +136,8 @@ func (h *mcpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleToolsCall runs each enabled check in order then returns the
-// stub allow result. Future sessions add policy and budget checks
-// between intent and the stub allow.
+// stub allow result. Every decision (allow or block at any stage)
+// emits one audit event before the response is returned.
 func (h *mcpHandler) handleToolsCall(ctx context.Context, req *mcp.Request, r *http.Request) *mcp.Response {
 	start := time.Now()
 
@@ -143,27 +151,31 @@ func (h *mcpHandler) handleToolsCall(ctx context.Context, req *mcp.Request, r *h
 			"params.name is required", nil)
 	}
 
+	var (
+		capResult capabilityCheckResult
+		intResult intentCheckResult
+	)
+
 	// Check 1: capability.
-	capResult := h.runCapabilityCheck(r, params.Name)
+	capResult = h.runCapabilityCheck(r, params.Name)
 	if capResult.err != nil {
 		h.cfg.Logger.Info("mcp tools/call blocked",
-			"tool", params.Name,
-			"check", "capability",
-			"reason", capResult.err.Error(),
-		)
+			"tool", params.Name, "check", "capability",
+			"reason", capResult.err.Error())
+		h.emitAudit(ctx, r, params, capResult, intResult,
+			audit.DecisionBlock, audit.CheckCapability, capResult.err.Error(), start)
 		return mcp.NewErrorResponse(req.ID, mcp.CodeCapabilityFailed,
 			"capability check failed", capResult.err.Error())
 	}
 
 	// Check 2: intent.
-	intResult := h.runIntentCheck(ctx, r, params.Name, capResult.agentID)
+	intResult = h.runIntentCheck(ctx, r, params.Name, capResult.agentID)
 	if intResult.err != nil {
 		h.cfg.Logger.Info("mcp tools/call blocked",
-			"tool", params.Name,
-			"check", "intent",
-			"agent", capResult.agentID,
-			"reason", intResult.err.Error(),
-		)
+			"tool", params.Name, "check", "intent",
+			"agent", capResult.agentID, "reason", intResult.err.Error())
+		h.emitAudit(ctx, r, params, capResult, intResult,
+			audit.DecisionBlock, audit.CheckIntent, intResult.err.Error(), start)
 		return mcp.NewErrorResponse(req.ID, mcp.CodeIntentFailed,
 			"intent check failed", intResult.err.Error())
 	}
@@ -172,11 +184,10 @@ func (h *mcpHandler) handleToolsCall(ctx context.Context, req *mcp.Request, r *h
 	polResult := h.runPolicyCheck(ctx, params, capResult, intResult)
 	if polResult.err != nil {
 		h.cfg.Logger.Info("mcp tools/call blocked",
-			"tool", params.Name,
-			"check", "policy",
-			"agent", capResult.agentID,
-			"reason", polResult.err.Error(),
-		)
+			"tool", params.Name, "check", "policy",
+			"agent", capResult.agentID, "reason", polResult.err.Error())
+		h.emitAudit(ctx, r, params, capResult, intResult,
+			audit.DecisionBlock, audit.CheckPolicy, polResult.err.Error(), start)
 		return mcp.NewErrorResponse(req.ID, mcp.CodePolicyFailed,
 			"policy check failed", polResult.err.Error())
 	}
@@ -185,11 +196,10 @@ func (h *mcpHandler) handleToolsCall(ctx context.Context, req *mcp.Request, r *h
 	bdgResult := h.runBudgetCheck(ctx, capResult)
 	if bdgResult.err != nil {
 		h.cfg.Logger.Info("mcp tools/call blocked",
-			"tool", params.Name,
-			"check", "budget",
-			"agent", capResult.agentID,
-			"reason", bdgResult.err.Error(),
-		)
+			"tool", params.Name, "check", "budget",
+			"agent", capResult.agentID, "reason", bdgResult.err.Error())
+		h.emitAudit(ctx, r, params, capResult, intResult,
+			audit.DecisionBlock, audit.CheckBudget, bdgResult.err.Error(), start)
 		return mcp.NewErrorResponse(req.ID, mcp.CodeBudgetFailed,
 			"budget check failed", bdgResult.err.Error())
 	}
@@ -208,6 +218,8 @@ func (h *mcpHandler) handleToolsCall(ctx context.Context, req *mcp.Request, r *h
 		"budget", bdgResult.summary,
 		"arg_keys", argKeys,
 	)
+	h.emitAudit(ctx, r, params, capResult, intResult,
+		audit.DecisionAllow, audit.CheckNone, "all four checks passed", start)
 
 	result := mcp.ToolCallResult{
 		Content: []mcp.ContentBlock{{
@@ -410,6 +422,52 @@ func (h *mcpHandler) runBudgetCheck(ctx context.Context, cap capabilityCheckResu
 		return budgetCheckResult{summary: fmt.Sprintf("ok: %d call(s)", d.Used)}
 	}
 	return budgetCheckResult{summary: d.Reason}
+}
+
+// emitAudit builds and emits one audit event for the current request.
+// Called exactly once per decision: at every block path and at the
+// final allow path.
+//
+// The helper consolidates field gathering so each call site only has
+// to specify what's specific to its decision (decision, check, reason).
+// Everything else is plucked from the in-flight request and the
+// partial check results.
+func (h *mcpHandler) emitAudit(
+	ctx context.Context,
+	r *http.Request,
+	params *mcp.ToolCallParams,
+	cap capabilityCheckResult,
+	intent intentCheckResult,
+	decision audit.Decision,
+	check audit.Check,
+	reason string,
+	start time.Time,
+) {
+	if h.cfg.Audit == nil {
+		return
+	}
+
+	argKeys := make([]string, 0, len(params.Arguments))
+	for k := range params.Arguments {
+		argKeys = append(argKeys, k)
+	}
+
+	e := audit.NewEvent(decision, params.Name)
+	e.Check = check
+	e.Reason = reason
+	e.AgentID = cap.agentID
+	e.ArgKeys = argKeys
+	e.LatencyMS = time.Since(start).Milliseconds()
+	e.RemoteIP = r.RemoteAddr
+
+	if cap.token != nil {
+		e.CapabilityTokenID = cap.token.ID
+	}
+	if intent.intent != nil {
+		e.IntentSummary = intent.intent.Summary
+	}
+
+	h.cfg.Audit.Emit(ctx, e)
 }
 
 // errMissingCapability is the static error returned when a token is

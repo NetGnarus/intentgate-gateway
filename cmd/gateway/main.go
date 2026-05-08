@@ -32,6 +32,8 @@
 //	INTENTGATE_REQUIRE_BUDGET       set to "true" to reject /v1/mcp calls
 //	                                that lack a verified capability token
 //	                                at the budget stage.
+//	INTENTGATE_AUDIT_TARGET         where to emit audit events. Recognized
+//	                                values: "stdout" (default), "none".
 package main
 
 import (
@@ -46,6 +48,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/NetGnarus/intentgate-gateway/internal/audit"
 	"github.com/NetGnarus/intentgate-gateway/internal/budget"
 	"github.com/NetGnarus/intentgate-gateway/internal/capability"
 	"github.com/NetGnarus/intentgate-gateway/internal/extractor"
@@ -70,6 +73,7 @@ func main() {
 	extractorURL := envOr("INTENTGATE_EXTRACTOR_URL", "")
 	policyFile := envOr("INTENTGATE_POLICY_FILE", "")
 	redisURL := envOr("INTENTGATE_REDIS_URL", "")
+	auditTarget := envOr("INTENTGATE_AUDIT_TARGET", "stdout")
 
 	masterKey, err := loadMasterKey(logger)
 	if err != nil {
@@ -95,6 +99,12 @@ func main() {
 		os.Exit(1)
 	}
 
+	auditEmitter, auditDesc, err := audit.FromTarget(auditTarget)
+	if err != nil {
+		logger.Error("invalid INTENTGATE_AUDIT_TARGET", "err", err)
+		os.Exit(1)
+	}
+
 	logger.Info("intentgate gateway starting",
 		"addr", addr,
 		"version", version,
@@ -104,6 +114,7 @@ func main() {
 		"intent_extractor", extractorURL != "",
 		"policy_source", policySource,
 		"budget_store", budgetSource,
+		"audit_target", auditDesc,
 	)
 
 	srv := server.New(server.Config{
@@ -117,6 +128,7 @@ func main() {
 		Policy:            policyEngine,
 		Budget:            budgetStore,
 		RequireBudget:     requireBudget,
+		Audit:             auditEmitter,
 	})
 
 	errCh := make(chan error, 1)

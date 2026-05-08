@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/NetGnarus/intentgate-gateway/internal/audit"
 	"github.com/NetGnarus/intentgate-gateway/internal/budget"
 	"github.com/NetGnarus/intentgate-gateway/internal/extractor"
 	"github.com/NetGnarus/intentgate-gateway/internal/handlers"
@@ -43,6 +44,9 @@ type Config struct {
 	// RequireBudget rejects calls without a verified capability token
 	// from reaching the budget stage. Default false (dev mode).
 	RequireBudget bool
+	// Audit is the emitter for one-event-per-decision audit records.
+	// nil falls back to a NullEmitter (no events emitted).
+	Audit audit.Emitter
 }
 
 // New constructs an *http.Server with all gateway routes and middleware.
@@ -77,6 +81,7 @@ func New(cfg Config) *http.Server {
 		Policy:            cfg.Policy,
 		Budget:            cfg.Budget,
 		RequireBudget:     cfg.RequireBudget,
+		Audit:             cfg.Audit,
 	}))
 
 	handler := chain(mux,

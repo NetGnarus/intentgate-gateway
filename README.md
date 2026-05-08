@@ -115,6 +115,7 @@ internal/capability/  # Macaroon-style HMAC capability tokens, caveats, codec
 internal/extractor/   # HTTP client for the intent extractor + LRU cache
 internal/policy/      # OPA Rego engine + embedded default_policy.rego
 internal/budget/      # Per-token call counters: MemoryStore + RedisStore
+internal/audit/       # OCSF-lite Event + Emitter (stdout / none)
 pkg/                  # reserved for public packages (future SDK integration types)
 Dockerfile            # multi-stage: build in golang:1.22-alpine, run in distroless
 Makefile              # build / run / test / docker / smoke / mint / gen-key
@@ -146,6 +147,7 @@ runs as a non-root user.
 | `INTENTGATE_POLICY_FILE`        | _unset_ | Path to a customer Rego policy file. When unset, the embedded `default_policy.rego` is used.             |
 | `INTENTGATE_REDIS_URL`          | _unset_ | Redis URL for the budget counter store, e.g. `redis://localhost:6379/0`. When unset, an in-memory store is used (single-replica only). |
 | `INTENTGATE_REQUIRE_BUDGET`     | `false` | When `true`, `/v1/mcp tools/call` requires a verified capability token before the budget stage runs.     |
+| `INTENTGATE_AUDIT_TARGET`       | `stdout`| Where audit events go. `stdout` (default) emits one JSON event per line; `none` disables emission.       |
 
 More configuration arrives with the intent extractor client, policy
 engine, and storage layers.
@@ -183,6 +185,48 @@ make smoke-cap-strict
 
 `igctl decode <token>` pretty-prints a token's contents (without
 verifying the signature) for debugging.
+
+## Audit events
+
+Every authorization decision (allow or block at any of the four
+stages) emits one structured JSON event on stdout. The shape is
+OCSF-lite: easy to ingest into Splunk, Datadog, Sentinel, or any
+stack that consumes line-delimited JSON.
+
+Sample event for a blocked policy decision:
+
+```json
+{
+  "ts":                   "2026-05-08T22:30:11.452Z",
+  "event":                "intentgate.tool_call",
+  "schema_version":       "1",
+  "decision":             "block",
+  "check":                "policy",
+  "reason":               "transfer above 10000 EUR threshold",
+  "agent_id":             "finance-copilot-v3",
+  "session_id":           "sess_abc",
+  "tool":                 "transfer_funds",
+  "arg_keys":             ["amount_eur"],
+  "capability_token_id":  "Z1ssWBrtbGjV...",
+  "intent_summary":       "Pay vendor invoice from Globex",
+  "latency_ms":           4,
+  "remote_ip":            "127.0.0.1:53104"
+}
+```
+
+`arg_keys` carries field names but never values — argument values may
+contain sensitive data (PII, financial details, credentials) and are
+deliberately omitted from the audit log.
+
+Events appear interleaved with normal request logs on stdout. To
+isolate audit lines:
+
+```sh
+./bin/gateway 2>&1 | grep '"event":"intentgate.tool_call"'
+```
+
+In production, pipe stdout through a log shipper (vector, fluent-bit,
+promtail) into your SIEM.
 
 ## Policy authoring
 
@@ -222,7 +266,7 @@ input.capability    object
 - [x] Intent extractor client + intent check (second of four)
 - [x] Embedded OPA policy evaluation (third of four)
 - [x] Budget enforcement (Redis-backed, fourth of four; taint TBD)
-- [ ] Audit log emission (OCSF / ECS)
+- [x] Audit log emission (OCSF-lite JSON to stdout)
 - [ ] Upstream proxying for `tools/list`, `initialize`, `ping`
 - [ ] Helm chart
 
