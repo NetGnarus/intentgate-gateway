@@ -1,0 +1,27 @@
+# Build outputs
+bin/
+out/
+dist/
+coverage.out
+coverage.html
+*.test
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Editors / IDEs
+.idea/
+.vscode/
+*.swp
+*~
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# Local env / secrets — never commit these
+.env
+.env.local
+.env.*.local
