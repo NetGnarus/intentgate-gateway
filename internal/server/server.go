@@ -33,11 +33,15 @@ func New(cfg Config) *http.Server {
 	// operators verifying the binary is up.
 	mux.Handle("GET /healthz", handlers.NewHealthHandler(cfg.Version))
 
-	// Tool-call ingress: agents POST tool-call requests here.
-	// In v0.1 this is a stub that parses, logs, and returns "allow".
-	// The four-check pipeline (capability → intent → policy → budget)
-	// is added in subsequent sessions.
+	// Tool-call ingress, REST shape — kept for ad-hoc curl testing.
+	// Same stub behavior as the MCP endpoint, simpler request body.
 	mux.Handle("POST /v1/tool-call", handlers.NewToolCallHandler(logger))
+
+	// MCP ingress, JSON-RPC 2.0 shape — the canonical contract for
+	// MCP-speaking clients (LangChain, Anthropic SDK with MCP, custom).
+	// In v0.1 this handles "tools/call" only; other methods return
+	// JSON-RPC MethodNotFound until upstream proxying lands.
+	mux.Handle("POST /v1/mcp", handlers.NewMCPHandler(logger))
 
 	handler := chain(mux,
 		recoverer(logger),    // outermost: catches panics from any handler

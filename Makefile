@@ -39,10 +39,20 @@ docker-run:
 smoke:
 	@echo '--- GET /healthz'
 	@curl -sf http://localhost:8080/healthz | (jq . 2>/dev/null || cat); echo
-	@echo '--- POST /v1/tool-call'
+	@echo '--- POST /v1/tool-call (REST shape)'
 	@curl -sX POST http://localhost:8080/v1/tool-call \
 		-H 'Content-Type: application/json' \
 		-d '{"tool":"read_invoice","args":{"id":"123"},"agent_id":"finance-copilot-v3","session_id":"sess_abc"}' \
+		| (jq . 2>/dev/null || cat); echo
+	@echo '--- POST /v1/mcp tools/call (JSON-RPC 2.0 shape)'
+	@curl -sX POST http://localhost:8080/v1/mcp \
+		-H 'Content-Type: application/json' \
+		-d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_invoice","arguments":{"id":"123"}}}' \
+		| (jq . 2>/dev/null || cat); echo
+	@echo '--- POST /v1/mcp ping (expect MethodNotFound)'
+	@curl -sX POST http://localhost:8080/v1/mcp \
+		-H 'Content-Type: application/json' \
+		-d '{"jsonrpc":"2.0","id":2,"method":"ping"}' \
 		| (jq . 2>/dev/null || cat); echo
 
 clean:
