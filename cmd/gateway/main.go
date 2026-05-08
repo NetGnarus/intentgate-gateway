@@ -18,6 +18,11 @@
 //	                                gateway restart)
 //	INTENTGATE_REQUIRE_CAPABILITY   set to "true" to reject /v1/mcp calls
 //	                                that don't carry a valid Bearer token
+//	INTENTGATE_EXTRACTOR_URL        base URL of the intent extractor service,
+//	                                e.g. "http://extractor:8090". When unset,
+//	                                the intent check is disabled.
+//	INTENTGATE_REQUIRE_INTENT       set to "true" to reject /v1/mcp calls
+//	                                that don't carry an X-Intent-Prompt header
 package main
 
 import (
@@ -32,6 +37,7 @@ import (
 	"time"
 
 	"github.com/NetGnarus/intentgate-gateway-/internal/capability"
+	"github.com/NetGnarus/intentgate-gateway-/internal/extractor"
 	"github.com/NetGnarus/intentgate-gateway-/internal/server"
 )
 
@@ -46,6 +52,8 @@ func main() {
 
 	addr := envOr("INTENTGATE_ADDR", ":8080")
 	requireCap := envOr("INTENTGATE_REQUIRE_CAPABILITY", "") == "true"
+	requireIntent := envOr("INTENTGATE_REQUIRE_INTENT", "") == "true"
+	extractorURL := envOr("INTENTGATE_EXTRACTOR_URL", "")
 
 	masterKey, err := loadMasterKey(logger)
 	if err != nil {
@@ -53,10 +61,18 @@ func main() {
 		os.Exit(1)
 	}
 
+	var extractorClient *extractor.Client
+	if extractorURL != "" {
+		extractorClient = extractor.New(extractorURL, 1024)
+		logger.Info("intent extractor configured", "url", extractorURL)
+	}
+
 	logger.Info("intentgate gateway starting",
 		"addr", addr,
 		"version", version,
 		"require_capability", requireCap,
+		"require_intent", requireIntent,
+		"intent_extractor", extractorURL != "",
 	)
 
 	srv := server.New(server.Config{
@@ -65,6 +81,8 @@ func main() {
 		Version:           version,
 		MasterKey:         masterKey,
 		RequireCapability: requireCap,
+		Extractor:         extractorClient,
+		RequireIntent:     requireIntent,
 	})
 
 	errCh := make(chan error, 1)

@@ -15,17 +15,18 @@ separate, private repositories — see the
 
 ## Status
 
-`v0.1.0-dev` — **HTTP + MCP framing + capability check.**
+`v0.1.0-dev` — **HTTP + MCP framing + capability + intent.**
 
 The server boots and accepts requests on three endpoints:
 
 - `GET  /healthz` — liveness probe.
 - `POST /v1/tool-call` — simple flat JSON shape, kept for ad-hoc curl testing.
-- `POST /v1/mcp` — JSON-RPC 2.0 / Model Context Protocol. Canonical contract for MCP-speaking clients. Verifies a capability token (Bearer, Macaroon-style HMAC chain) when present and evaluates its caveats against the requested tool.
+- `POST /v1/mcp` — JSON-RPC 2.0 / Model Context Protocol. Runs two of the four checks before allowing the call:
+  - **Capability** (Bearer token, Macaroon-style HMAC chain). Caveats are evaluated against the requested tool.
+  - **Intent.** When `X-Intent-Prompt` is supplied and an extractor is configured, the gateway calls the [extractor service](../extractor/), gets a structured intent (`allowed_tools` / `forbidden_tools`), and verifies the requested tool is permitted.
 
-Three of four checks remain (intent, policy, budget). When all four are
-in place, every well-formed call is gated by the full pipeline; for now,
-calls that pass capability are allowed with a stub reason.
+Two of four checks remain (policy, budget). For now, calls that pass
+capability and intent are allowed with a stub reason.
 
 ## Quick start
 
@@ -134,6 +135,8 @@ runs as a non-root user.
 | `INTENTGATE_ADDR`               | `:8080` | HTTP listen address.                                                                                     |
 | `INTENTGATE_MASTER_KEY`         | _unset_ | base64url-encoded HMAC key for capability tokens. If unset, an ephemeral key is generated and logged.    |
 | `INTENTGATE_REQUIRE_CAPABILITY` | `false` | When `true`, `/v1/mcp` rejects calls without a valid Bearer capability token (instead of allowing them). |
+| `INTENTGATE_EXTRACTOR_URL`      | _unset_ | Base URL of the [intent extractor service](../extractor/). When unset, the intent check is disabled.     |
+| `INTENTGATE_REQUIRE_INTENT`     | `false` | When `true`, `/v1/mcp` rejects calls without an `X-Intent-Prompt` header.                                |
 
 More configuration arrives with the intent extractor client, policy
 engine, and storage layers.
@@ -177,7 +180,7 @@ verifying the signature) for debugging.
 - [x] HTTP skeleton, `/v1/tool-call` and `/healthz`
 - [x] MCP / JSON-RPC request parsing (`/v1/mcp`, `tools/call` only)
 - [x] Capability tokens (HMAC-SHA256, Macaroon-style attenuation chain)
-- [ ] Intent extractor client (calls the Python service)
+- [x] Intent extractor client + intent check (second of four)
 - [ ] Embedded OPA policy evaluation
 - [ ] Budget and taint enforcement (Redis-backed)
 - [ ] Audit log emission (OCSF / ECS)

@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -8,6 +9,7 @@ import (
 	"time"
 
 	"github.com/NetGnarus/intentgate-gateway-/internal/capability"
+	"github.com/NetGnarus/intentgate-gateway-/internal/extractor"
 	"github.com/NetGnarus/intentgate-gateway-/internal/mcp"
 )
 
@@ -22,6 +24,13 @@ type MCPHandlerConfig struct {
 	// capability token. When false (default in dev), missing tokens are
 	// allowed through with a warning logged.
 	RequireCapability bool
+	// Extractor is the optional intent-extractor client. When nil, the
+	// intent check is skipped. When non-nil, every tools/call carrying
+	// an X-Intent-Prompt header is checked against the extracted intent.
+	Extractor *extractor.Client
+	// RequireIntent rejects requests that don't carry an
+	// X-Intent-Prompt header. Independent of RequireCapability.
+	RequireIntent bool
 }
 
 type mcpHandler struct {
@@ -30,15 +39,19 @@ type mcpHandler struct {
 
 // NewMCPHandler returns the HTTP handler for POST /v1/mcp.
 //
-// In v0.1 only the "tools/call" method is implemented. Other MCP methods
-// (tools/list, initialize, ping) return JSON-RPC MethodNotFound until
-// upstream-server proxying lands in a later session.
+// Pipeline (v0.1):
 //
-// Capability check (first of four). If a Bearer token is supplied, the
-// handler verifies its signature under MasterKey and evaluates the
-// caveat chain against the request. Failures return JSON-RPC error
-// CodeCapabilityFailed (-32010). The other three checks (intent,
-// policy, budget) land in subsequent sessions.
+//  1. Parse the JSON-RPC envelope.
+//  2. Dispatch on method. Only "tools/call" is implemented.
+//  3. Capability check: verify the Bearer token's HMAC chain and
+//     evaluate its caveats against the requested tool. Returns
+//     CodeCapabilityFailed (-32010) on failure.
+//  4. Intent check: if an X-Intent-Prompt header is present and an
+//     extractor is configured, the gateway extracts structured intent
+//     (cached) and verifies the requested tool is permitted by it.
+//     Returns CodeIntentFailed (-32011) on failure.
+//  5. (Future) policy and budget checks.
+//  6. Return the stub allow response.
 func NewMCPHandler(cfg MCPHandlerConfig) http.Handler {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
@@ -73,7 +86,7 @@ func (h *mcpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	switch req.Method {
 	case mcp.MethodToolsCall:
-		resp := h.handleToolsCall(&req, r)
+		resp := h.handleToolsCall(r.Context(), &req, r)
 		if notification {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -94,10 +107,10 @@ func (h *mcpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleToolsCall runs the (currently only) capability check, then
-// returns the stub allow result. Future sessions add intent, policy,
-// and budget checks between capability and the stub allow.
-func (h *mcpHandler) handleToolsCall(req *mcp.Request, r *http.Request) *mcp.Response {
+// handleToolsCall runs each enabled check in order then returns the
+// stub allow result. Future sessions add policy and budget checks
+// between intent and the stub allow.
+func (h *mcpHandler) handleToolsCall(ctx context.Context, req *mcp.Request, r *http.Request) *mcp.Response {
 	start := time.Now()
 
 	params, err := mcp.ParseToolCallParams(req.Params)
@@ -110,8 +123,7 @@ func (h *mcpHandler) handleToolsCall(req *mcp.Request, r *http.Request) *mcp.Res
 			"params.name is required", nil)
 	}
 
-	// Capability check: verify the Bearer token (if any) and evaluate
-	// its caveats against the requested tool.
+	// Check 1: capability.
 	capResult := h.runCapabilityCheck(r, params.Name)
 	if capResult.err != nil {
 		h.cfg.Logger.Info("mcp tools/call blocked",
@@ -123,6 +135,19 @@ func (h *mcpHandler) handleToolsCall(req *mcp.Request, r *http.Request) *mcp.Res
 			"capability check failed", capResult.err.Error())
 	}
 
+	// Check 2: intent.
+	intResult := h.runIntentCheck(ctx, r, params.Name, capResult.agentID)
+	if intResult.err != nil {
+		h.cfg.Logger.Info("mcp tools/call blocked",
+			"tool", params.Name,
+			"check", "intent",
+			"agent", capResult.agentID,
+			"reason", intResult.err.Error(),
+		)
+		return mcp.NewErrorResponse(req.ID, mcp.CodeIntentFailed,
+			"intent check failed", intResult.err.Error())
+	}
+
 	// Argument values may contain sensitive data — log only the keys.
 	argKeys := make([]string, 0, len(params.Arguments))
 	for k := range params.Arguments {
@@ -132,6 +157,7 @@ func (h *mcpHandler) handleToolsCall(req *mcp.Request, r *http.Request) *mcp.Res
 		"tool", params.Name,
 		"agent", capResult.agentID,
 		"capability", capResult.summary,
+		"intent", intResult.summary,
 		"arg_keys", argKeys,
 	)
 
@@ -155,23 +181,21 @@ func (h *mcpHandler) handleToolsCall(req *mcp.Request, r *http.Request) *mcp.Res
 	return resp
 }
 
-// capabilityCheckResult bundles what the capability stage learned about
-// the request so the remaining handler can log/decide accordingly.
+// capabilityCheckResult bundles what the capability stage learned.
 type capabilityCheckResult struct {
-	agentID string // empty if no token was supplied
-	summary string // short audit string ("ok", "skipped (no token)", ...)
-	err     error  // non-nil = check failed; handler must reject
+	agentID string
+	summary string
+	err     error
 }
 
-// runCapabilityCheck inspects the Authorization header, verifies the
-// Bearer token under the master key (if any), and evaluates its caveats
-// against the requested tool name.
-//
-// Three outcome categories:
-//
-//   - Token present and valid → result.err == nil, agentID = token.Subject
-//   - Token absent and not required → result.err == nil, summary "skipped"
-//   - Token absent and required, OR token invalid → result.err non-nil
+// intentCheckResult bundles what the intent stage learned.
+type intentCheckResult struct {
+	summary string // short description ("ok: matched read_invoice", "skipped (no header)", ...)
+	err     error
+}
+
+// runCapabilityCheck verifies the Bearer token's HMAC chain and
+// evaluates its caveats against the requested tool.
 func (h *mcpHandler) runCapabilityCheck(r *http.Request, tool string) capabilityCheckResult {
 	encoded, err := capability.FromAuthorizationHeader(r.Header.Get("Authorization"))
 	if err != nil {
@@ -203,10 +227,53 @@ func (h *mcpHandler) runCapabilityCheck(r *http.Request, tool string) capability
 	return capabilityCheckResult{agentID: tok.Subject, summary: "ok"}
 }
 
+// runIntentCheck reads the X-Intent-Prompt header and asks the
+// extractor for structured intent, then verifies the requested tool
+// is permitted by that intent.
+//
+// Three outcome categories:
+//
+//   - Header present, extractor configured → call extractor, enforce.
+//   - Header missing, RequireIntent false  → skip (dev mode default).
+//   - Header missing, RequireIntent true   → fail closed.
+//   - Extractor unconfigured               → skip (gateway in standalone mode).
+func (h *mcpHandler) runIntentCheck(ctx context.Context, r *http.Request, tool, agentID string) intentCheckResult {
+	prompt := r.Header.Get("X-Intent-Prompt")
+	if prompt == "" {
+		if h.cfg.RequireIntent {
+			return intentCheckResult{err: errMissingIntent}
+		}
+		return intentCheckResult{summary: "skipped (no prompt header)"}
+	}
+	if h.cfg.Extractor == nil {
+		if h.cfg.RequireIntent {
+			return intentCheckResult{err: errExtractorNotConfigured}
+		}
+		h.cfg.Logger.Warn("intent header present but no extractor configured",
+			"tool", tool,
+			"hint", "set INTENTGATE_EXTRACTOR_URL to enable intent enforcement")
+		return intentCheckResult{summary: "skipped (no extractor configured)"}
+	}
+
+	intent, err := h.cfg.Extractor.Extract(ctx, prompt, agentID)
+	if err != nil {
+		// Failing the extractor means we don't know the intent. Fail closed.
+		return intentCheckResult{err: err}
+	}
+	ok, reason := intent.Allows(tool)
+	if !ok {
+		return intentCheckResult{err: capError(reason)}
+	}
+	return intentCheckResult{summary: "ok: " + reason}
+}
+
 // errMissingCapability is the static error returned when a token is
-// required but absent. Defined as a package var for cheap equality
-// checks in tests.
-var errMissingCapability = capError("capability token required (INTENTGATE_REQUIRE_CAPABILITY=true)")
+// required but absent.
+var (
+	errMissingCapability      = capError("capability token required (INTENTGATE_REQUIRE_CAPABILITY=true)")
+	errMissingIntent          = capError("intent prompt required (INTENTGATE_REQUIRE_INTENT=true)")
+	errExtractorNotConfigured = capError("intent prompt provided but no extractor URL is configured")
+)
 
 // capError is a tiny error type so we don't pull in fmt for one string.
 type capError string

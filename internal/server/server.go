@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/NetGnarus/intentgate-gateway-/internal/extractor"
 	"github.com/NetGnarus/intentgate-gateway-/internal/handlers"
 )
 
@@ -23,6 +24,12 @@ type Config struct {
 	// RequireCapability rejects /v1/mcp requests that don't carry a
 	// valid Bearer capability token. Default false (dev mode).
 	RequireCapability bool
+	// Extractor is the optional intent-extractor client. nil means no
+	// intent check is performed.
+	Extractor *extractor.Client
+	// RequireIntent rejects /v1/mcp requests that don't carry an
+	// X-Intent-Prompt header. Default false (dev mode).
+	RequireIntent bool
 }
 
 // New constructs an *http.Server with all gateway routes and middleware.
@@ -52,6 +59,8 @@ func New(cfg Config) *http.Server {
 		Logger:            logger,
 		MasterKey:         cfg.MasterKey,
 		RequireCapability: cfg.RequireCapability,
+		Extractor:         cfg.Extractor,
+		RequireIntent:     cfg.RequireIntent,
 	}))
 
 	handler := chain(mux,
