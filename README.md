@@ -15,17 +15,17 @@ separate, private repositories — see the
 
 ## Status
 
-`v0.1.0-dev` — **HTTP + MCP framing.**
+`v0.1.0-dev` — **HTTP + MCP framing + capability check.**
 
 The server boots and accepts requests on three endpoints:
 
 - `GET  /healthz` — liveness probe.
 - `POST /v1/tool-call` — simple flat JSON shape, kept for ad-hoc curl testing.
-- `POST /v1/mcp` — JSON-RPC 2.0 / Model Context Protocol. Canonical contract for MCP-speaking clients.
+- `POST /v1/mcp` — JSON-RPC 2.0 / Model Context Protocol. Canonical contract for MCP-speaking clients. Verifies a capability token (Bearer, Macaroon-style HMAC chain) when present and evaluates its caveats against the requested tool.
 
-Both tool-call endpoints currently return a stubbed `"allow"` decision —
-the four-check pipeline (capability, intent, policy, budget) is not
-wired up yet. That lands in session 3+.
+Three of four checks remain (intent, policy, budget). When all four are
+in place, every well-formed call is gated by the full pipeline; for now,
+calls that pass capability are allowed with a stub reason.
 
 ## Quick start
 
@@ -102,13 +102,15 @@ Methods other than `tools/call` currently return a JSON-RPC
 ## Project layout
 
 ```
-cmd/gateway/        # main package, entrypoint, graceful shutdown
-internal/server/    # HTTP server, middleware (request logger, panic recovery)
-internal/handlers/  # /healthz, /v1/tool-call, /v1/mcp handlers
-internal/mcp/       # JSON-RPC 2.0 envelope, MCP method types, error codes
-pkg/                # reserved for public packages (future SDK integration types)
-Dockerfile          # multi-stage: build in golang:1.22-alpine, run in distroless
-Makefile            # build / run / test / docker / smoke targets
+cmd/gateway/          # gateway binary entrypoint, graceful shutdown
+cmd/igctl/            # developer CLI: gen-key / mint / decode
+internal/server/      # HTTP server, middleware (request logger, panic recovery)
+internal/handlers/    # /healthz, /v1/tool-call, /v1/mcp handlers
+internal/mcp/         # JSON-RPC 2.0 envelope, MCP method types, error codes
+internal/capability/  # Macaroon-style HMAC capability tokens, caveats, codec
+pkg/                  # reserved for public packages (future SDK integration types)
+Dockerfile            # multi-stage: build in golang:1.22-alpine, run in distroless
+Makefile              # build / run / test / docker / smoke / mint / gen-key
 ```
 
 The repository follows the standard Go layout: `cmd/` holds main packages,
@@ -127,20 +129,56 @@ runs as a non-root user.
 
 ## Configuration
 
-| Env var             | Default | Description                  |
-| ------------------- | ------- | ---------------------------- |
-| `INTENTGATE_ADDR`   | `:8080` | HTTP listen address.         |
+| Env var                         | Default | Description                                                                                              |
+| ------------------------------- | ------- | -------------------------------------------------------------------------------------------------------- |
+| `INTENTGATE_ADDR`               | `:8080` | HTTP listen address.                                                                                     |
+| `INTENTGATE_MASTER_KEY`         | _unset_ | base64url-encoded HMAC key for capability tokens. If unset, an ephemeral key is generated and logged.    |
+| `INTENTGATE_REQUIRE_CAPABILITY` | `false` | When `true`, `/v1/mcp` rejects calls without a valid Bearer capability token (instead of allowing them). |
 
-More configuration arrives with the policy engine, intent extractor client,
-and storage layers.
+More configuration arrives with the intent extractor client, policy
+engine, and storage layers.
+
+## Capability tokens (the first of four checks)
+
+`/v1/mcp` verifies Macaroon-style HMAC-SHA256 capability tokens passed
+in the `Authorization: Bearer <token>` header. Tokens carry caveats
+(agent_lock, expiry, tool whitelist, tool blacklist) signed in a chain
+under the gateway's master key. Holders can attenuate a token (append
+caveats to make it more restrictive) without the master key — that's
+the property that makes safe parent → sub-agent delegation possible.
+
+Spin it up end-to-end:
+
+```sh
+# 1. Generate a master key and export it
+export INTENTGATE_MASTER_KEY=$(make gen-key)
+
+# 2. Run the gateway in strict mode (rejects calls without tokens)
+INTENTGATE_REQUIRE_CAPABILITY=true ./bin/gateway
+
+# 3. In another shell, mint a token allowing only read_invoice
+TOKEN=$(./bin/igctl mint --subject finance-copilot-v3 --tools "read_invoice" --ttl 1h)
+
+# 4. Smoke test: read_invoice allowed, send_email blocked
+make smoke-cap TOKEN=$TOKEN
+
+# 5. Tampered tokens are rejected
+make smoke-cap-bad TOKEN=$TOKEN
+
+# 6. Strict mode rejects unauthenticated calls
+make smoke-cap-strict
+```
+
+`igctl decode <token>` pretty-prints a token's contents (without
+verifying the signature) for debugging.
 
 ## v0.1 roadmap
 
 - [x] HTTP skeleton, `/v1/tool-call` and `/healthz`
 - [x] MCP / JSON-RPC request parsing (`/v1/mcp`, `tools/call` only)
-- [ ] Capability tokens (HMAC-SHA256, attenuation chain)
-- [ ] Embedded OPA policy evaluation
+- [x] Capability tokens (HMAC-SHA256, Macaroon-style attenuation chain)
 - [ ] Intent extractor client (calls the Python service)
+- [ ] Embedded OPA policy evaluation
 - [ ] Budget and taint enforcement (Redis-backed)
 - [ ] Audit log emission (OCSF / ECS)
 - [ ] Upstream proxying for `tools/list`, `initialize`, `ping`

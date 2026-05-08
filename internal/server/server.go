@@ -17,6 +17,12 @@ type Config struct {
 	Logger *slog.Logger
 	// Version is reported by /healthz.
 	Version string
+	// MasterKey is the HMAC key used to verify capability tokens on
+	// /v1/mcp. May be nil only when RequireCapability is false.
+	MasterKey []byte
+	// RequireCapability rejects /v1/mcp requests that don't carry a
+	// valid Bearer capability token. Default false (dev mode).
+	RequireCapability bool
 }
 
 // New constructs an *http.Server with all gateway routes and middleware.
@@ -39,9 +45,14 @@ func New(cfg Config) *http.Server {
 
 	// MCP ingress, JSON-RPC 2.0 shape — the canonical contract for
 	// MCP-speaking clients (LangChain, Anthropic SDK with MCP, custom).
-	// In v0.1 this handles "tools/call" only; other methods return
-	// JSON-RPC MethodNotFound until upstream proxying lands.
-	mux.Handle("POST /v1/mcp", handlers.NewMCPHandler(logger))
+	// In v0.1 this handles "tools/call" only with the capability check;
+	// other methods return JSON-RPC MethodNotFound until upstream
+	// proxying lands.
+	mux.Handle("POST /v1/mcp", handlers.NewMCPHandler(handlers.MCPHandlerConfig{
+		Logger:            logger,
+		MasterKey:         cfg.MasterKey,
+		RequireCapability: cfg.RequireCapability,
+	}))
 
 	handler := chain(mux,
 		recoverer(logger),    // outermost: catches panics from any handler
