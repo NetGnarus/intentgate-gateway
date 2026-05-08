@@ -11,6 +11,7 @@ import (
 	"github.com/NetGnarus/intentgate-gateway/internal/capability"
 	"github.com/NetGnarus/intentgate-gateway/internal/extractor"
 	"github.com/NetGnarus/intentgate-gateway/internal/mcp"
+	"github.com/NetGnarus/intentgate-gateway/internal/policy"
 )
 
 // MCPHandlerConfig configures the /v1/mcp handler.
@@ -31,6 +32,10 @@ type MCPHandlerConfig struct {
 	// RequireIntent rejects requests that don't carry an
 	// X-Intent-Prompt header. Independent of RequireCapability.
 	RequireIntent bool
+	// Policy is the OPA-backed policy engine, evaluated as the third of
+	// the four checks. May be nil only in dev mode (the policy check is
+	// skipped). main.go always supplies one in normal operation.
+	Policy *policy.Engine
 }
 
 type mcpHandler struct {
@@ -50,8 +55,10 @@ type mcpHandler struct {
 //     extractor is configured, the gateway extracts structured intent
 //     (cached) and verifies the requested tool is permitted by it.
 //     Returns CodeIntentFailed (-32011) on failure.
-//  5. (Future) policy and budget checks.
-//  6. Return the stub allow response.
+//  5. Policy check: evaluate the request against the configured Rego
+//     policy bundle. Returns CodePolicyFailed (-32012) on deny.
+//  6. (Future) budget check.
+//  7. Return the stub allow response.
 func NewMCPHandler(cfg MCPHandlerConfig) http.Handler {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
@@ -148,6 +155,19 @@ func (h *mcpHandler) handleToolsCall(ctx context.Context, req *mcp.Request, r *h
 			"intent check failed", intResult.err.Error())
 	}
 
+	// Check 3: policy (OPA / Rego).
+	polResult := h.runPolicyCheck(ctx, params, capResult, intResult)
+	if polResult.err != nil {
+		h.cfg.Logger.Info("mcp tools/call blocked",
+			"tool", params.Name,
+			"check", "policy",
+			"agent", capResult.agentID,
+			"reason", polResult.err.Error(),
+		)
+		return mcp.NewErrorResponse(req.ID, mcp.CodePolicyFailed,
+			"policy check failed", polResult.err.Error())
+	}
+
 	// Argument values may contain sensitive data — log only the keys.
 	argKeys := make([]string, 0, len(params.Arguments))
 	for k := range params.Arguments {
@@ -158,6 +178,7 @@ func (h *mcpHandler) handleToolsCall(ctx context.Context, req *mcp.Request, r *h
 		"agent", capResult.agentID,
 		"capability", capResult.summary,
 		"intent", intResult.summary,
+		"policy", polResult.summary,
 		"arg_keys", argKeys,
 	)
 
@@ -190,7 +211,14 @@ type capabilityCheckResult struct {
 
 // intentCheckResult bundles what the intent stage learned.
 type intentCheckResult struct {
-	summary string // short description ("ok: matched read_invoice", "skipped (no header)", ...)
+	summary string                     // short description for logs
+	intent  *extractor.ExtractedIntent // populated when extraction ran; nil if skipped
+	err     error
+}
+
+// policyCheckResult bundles what the policy stage learned.
+type policyCheckResult struct {
+	summary string // short description ("ok: <reason>", "skipped (no engine)", ...)
 	err     error
 }
 
@@ -262,9 +290,58 @@ func (h *mcpHandler) runIntentCheck(ctx context.Context, r *http.Request, tool, 
 	}
 	ok, reason := intent.Allows(tool)
 	if !ok {
-		return intentCheckResult{err: capError(reason)}
+		return intentCheckResult{intent: intent, err: capError(reason)}
 	}
-	return intentCheckResult{summary: "ok: " + reason}
+	return intentCheckResult{intent: intent, summary: "ok: " + reason}
+}
+
+// runPolicyCheck evaluates the Rego policy bundled into (or supplied to)
+// the gateway. The policy sees the requested tool, its arguments, the
+// agent ID from the verified capability token, and — when intent
+// extraction ran — the extractor's structured output.
+//
+// When no engine is configured, the check is skipped (dev convenience).
+// In production, main.go always supplies an engine: either a customer-
+// authored policy from INTENTGATE_POLICY_FILE or the embedded default.
+func (h *mcpHandler) runPolicyCheck(
+	ctx context.Context,
+	params *mcp.ToolCallParams,
+	cap capabilityCheckResult,
+	intent intentCheckResult,
+) policyCheckResult {
+	if h.cfg.Policy == nil {
+		return policyCheckResult{summary: "skipped (no policy engine)"}
+	}
+
+	in := policy.Input{
+		Tool:    params.Name,
+		Args:    params.Arguments,
+		AgentID: cap.agentID,
+	}
+	if cap.agentID != "" {
+		in.Capability = &policy.InputCap{Subject: cap.agentID}
+	}
+	if intent.intent != nil {
+		in.Intent = &policy.InputIntent{
+			Summary:        intent.intent.Summary,
+			AllowedTools:   intent.intent.AllowedTools,
+			ForbiddenTools: intent.intent.ForbiddenTools,
+			Confidence:     intent.intent.Confidence,
+		}
+	}
+
+	d, err := h.cfg.Policy.Evaluate(ctx, in)
+	if err != nil {
+		// Engine failure = fail closed.
+		return policyCheckResult{err: err}
+	}
+	if !d.Allow {
+		return policyCheckResult{err: capError(d.Reason)}
+	}
+	if d.Reason != "" {
+		return policyCheckResult{summary: "ok: " + d.Reason}
+	}
+	return policyCheckResult{summary: "ok"}
 }
 
 // errMissingCapability is the static error returned when a token is

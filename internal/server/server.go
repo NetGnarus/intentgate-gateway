@@ -8,6 +8,7 @@ import (
 
 	"github.com/NetGnarus/intentgate-gateway/internal/extractor"
 	"github.com/NetGnarus/intentgate-gateway/internal/handlers"
+	"github.com/NetGnarus/intentgate-gateway/internal/policy"
 )
 
 // Config configures a new gateway server.
@@ -30,6 +31,9 @@ type Config struct {
 	// RequireIntent rejects /v1/mcp requests that don't carry an
 	// X-Intent-Prompt header. Default false (dev mode).
 	RequireIntent bool
+	// Policy is the OPA-backed policy engine. nil means the policy
+	// check is skipped (dev convenience).
+	Policy *policy.Engine
 }
 
 // New constructs an *http.Server with all gateway routes and middleware.
@@ -61,6 +65,7 @@ func New(cfg Config) *http.Server {
 		RequireCapability: cfg.RequireCapability,
 		Extractor:         cfg.Extractor,
 		RequireIntent:     cfg.RequireIntent,
+		Policy:            cfg.Policy,
 	}))
 
 	handler := chain(mux,

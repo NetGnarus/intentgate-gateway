@@ -23,12 +23,15 @@
 //	                                the intent check is disabled.
 //	INTENTGATE_REQUIRE_INTENT       set to "true" to reject /v1/mcp calls
 //	                                that don't carry an X-Intent-Prompt header
+//	INTENTGATE_POLICY_FILE          path to a customer Rego policy file. When
+//	                                unset, the embedded default policy is used.
 package main
 
 import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -38,6 +41,7 @@ import (
 
 	"github.com/NetGnarus/intentgate-gateway/internal/capability"
 	"github.com/NetGnarus/intentgate-gateway/internal/extractor"
+	"github.com/NetGnarus/intentgate-gateway/internal/policy"
 	"github.com/NetGnarus/intentgate-gateway/internal/server"
 )
 
@@ -54,6 +58,7 @@ func main() {
 	requireCap := envOr("INTENTGATE_REQUIRE_CAPABILITY", "") == "true"
 	requireIntent := envOr("INTENTGATE_REQUIRE_INTENT", "") == "true"
 	extractorURL := envOr("INTENTGATE_EXTRACTOR_URL", "")
+	policyFile := envOr("INTENTGATE_POLICY_FILE", "")
 
 	masterKey, err := loadMasterKey(logger)
 	if err != nil {
@@ -67,12 +72,19 @@ func main() {
 		logger.Info("intent extractor configured", "url", extractorURL)
 	}
 
+	policyEngine, policySource, err := loadPolicyEngine(logger, policyFile)
+	if err != nil {
+		logger.Error("failed to load policy", "err", err)
+		os.Exit(1)
+	}
+
 	logger.Info("intentgate gateway starting",
 		"addr", addr,
 		"version", version,
 		"require_capability", requireCap,
 		"require_intent", requireIntent,
 		"intent_extractor", extractorURL != "",
+		"policy_source", policySource,
 	)
 
 	srv := server.New(server.Config{
@@ -83,6 +95,7 @@ func main() {
 		RequireCapability: requireCap,
 		Extractor:         extractorClient,
 		RequireIntent:     requireIntent,
+		Policy:            policyEngine,
 	})
 
 	errCh := make(chan error, 1)
@@ -138,6 +151,32 @@ func loadMasterKey(logger *slog.Logger) ([]byte, error) {
 		"hint", "set INTENTGATE_MASTER_KEY in your environment for stable tokens",
 	)
 	return key, nil
+}
+
+// loadPolicyEngine constructs the OPA-backed policy engine. If policyFile
+// is non-empty, the file's contents are compiled as the customer's Rego
+// source. Otherwise the embedded default policy is used.
+//
+// The returned source-description string ("file:/path" or "embedded
+// default") is logged at startup so operators can confirm which policy
+// is active.
+func loadPolicyEngine(logger *slog.Logger, policyFile string) (*policy.Engine, string, error) {
+	source := ""
+	desc := "embedded default"
+	if policyFile != "" {
+		raw, err := os.ReadFile(policyFile)
+		if err != nil {
+			return nil, "", fmt.Errorf("read %s: %w", policyFile, err)
+		}
+		source = string(raw)
+		desc = "file:" + policyFile
+	}
+	eng, err := policy.NewEngine(context.Background(), source)
+	if err != nil {
+		return nil, "", err
+	}
+	logger.Info("policy engine ready", "source", desc, "bytes", len(source))
+	return eng, desc, nil
 }
 
 func envOr(key, fallback string) string {

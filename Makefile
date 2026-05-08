@@ -11,6 +11,7 @@ IMAGE   ?= intentgate/gateway:dev
         gen-key mint mint-readonly mint-strict mint-broad \
         smoke smoke-cap smoke-cap-bad smoke-cap-strict \
         smoke-intent smoke-intent-block \
+        smoke-policy-allow smoke-policy-block \
         igctl clean
 
 # Default target: produce both binaries.
@@ -181,6 +182,30 @@ smoke-intent-block:
 		-H 'Authorization: Bearer $(TOKEN)' \
 		-H 'X-Intent-Prompt: Process today AP invoices' \
 		-d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_customer_list","arguments":{}}}' \
+		| (jq . 2>/dev/null || cat); echo
+
+# Policy-flow smoke tests. The default policy allows transfer_funds
+# at or below 10,000 EUR and denies above. These exercise the third
+# of the four checks. Tokens used here pair with intent prompts that
+# match the tool, so capability and intent both pass.
+smoke-policy-allow:
+	@test -n "$(TOKEN)" || (echo "set TOKEN=<encoded-token>"; exit 1)
+	@echo '--- POST /v1/mcp tools/call transfer_funds 1240 EUR (should ALLOW under policy threshold)'
+	@curl -sX POST http://localhost:8080/v1/mcp \
+		-H 'Content-Type: application/json' \
+		-H 'Authorization: Bearer $(TOKEN)' \
+		-H 'X-Intent-Prompt: Pay vendor invoice from Globex' \
+		-d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"transfer_funds","arguments":{"amount_eur":1240}}}' \
+		| (jq . 2>/dev/null || cat); echo
+
+smoke-policy-block:
+	@test -n "$(TOKEN)" || (echo "set TOKEN=<encoded-token>"; exit 1)
+	@echo '--- POST /v1/mcp tools/call transfer_funds 50000 EUR (should BLOCK on policy)'
+	@curl -sX POST http://localhost:8080/v1/mcp \
+		-H 'Content-Type: application/json' \
+		-H 'Authorization: Bearer $(TOKEN)' \
+		-H 'X-Intent-Prompt: Pay vendor invoice from Globex' \
+		-d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"transfer_funds","arguments":{"amount_eur":50000}}}' \
 		| (jq . 2>/dev/null || cat); echo
 
 clean:

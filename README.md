@@ -15,18 +15,19 @@ separate, private repositories — see the
 
 ## Status
 
-`v0.1.0-dev` — **HTTP + MCP framing + capability + intent.**
+`v0.1.0-dev` — **HTTP + MCP framing + capability + intent + policy.**
 
 The server boots and accepts requests on three endpoints:
 
 - `GET  /healthz` — liveness probe.
 - `POST /v1/tool-call` — simple flat JSON shape, kept for ad-hoc curl testing.
-- `POST /v1/mcp` — JSON-RPC 2.0 / Model Context Protocol. Runs two of the four checks before allowing the call:
+- `POST /v1/mcp` — JSON-RPC 2.0 / Model Context Protocol. Runs three of the four checks before allowing the call:
   - **Capability** (Bearer token, Macaroon-style HMAC chain). Caveats are evaluated against the requested tool.
   - **Intent.** When `X-Intent-Prompt` is supplied and an extractor is configured, the gateway calls the [extractor service](../extractor/), gets a structured intent (`allowed_tools` / `forbidden_tools`), and verifies the requested tool is permitted.
+  - **Policy.** OPA-backed Rego engine (embedded). Customer policies can express thresholds, time-of-day rules, agent-specific overrides, and arbitrary business logic. A starter policy is shipped; override via `INTENTGATE_POLICY_FILE`.
 
-Two of four checks remain (policy, budget). For now, calls that pass
-capability and intent are allowed with a stub reason.
+One of four checks remains (budget). Calls passing all three current
+checks are allowed with a stub reason.
 
 ## Quick start
 
@@ -109,6 +110,8 @@ internal/server/      # HTTP server, middleware (request logger, panic recovery)
 internal/handlers/    # /healthz, /v1/tool-call, /v1/mcp handlers
 internal/mcp/         # JSON-RPC 2.0 envelope, MCP method types, error codes
 internal/capability/  # Macaroon-style HMAC capability tokens, caveats, codec
+internal/extractor/   # HTTP client for the intent extractor + LRU cache
+internal/policy/      # OPA Rego engine + embedded default_policy.rego
 pkg/                  # reserved for public packages (future SDK integration types)
 Dockerfile            # multi-stage: build in golang:1.22-alpine, run in distroless
 Makefile              # build / run / test / docker / smoke / mint / gen-key
@@ -137,6 +140,7 @@ runs as a non-root user.
 | `INTENTGATE_REQUIRE_CAPABILITY` | `false` | When `true`, `/v1/mcp` rejects calls without a valid Bearer capability token (instead of allowing them). |
 | `INTENTGATE_EXTRACTOR_URL`      | _unset_ | Base URL of the [intent extractor service](../extractor/). When unset, the intent check is disabled.     |
 | `INTENTGATE_REQUIRE_INTENT`     | `false` | When `true`, `/v1/mcp` rejects calls without an `X-Intent-Prompt` header.                                |
+| `INTENTGATE_POLICY_FILE`        | _unset_ | Path to a customer Rego policy file. When unset, the embedded `default_policy.rego` is used.             |
 
 More configuration arrives with the intent extractor client, policy
 engine, and storage layers.
@@ -175,13 +179,43 @@ make smoke-cap-strict
 `igctl decode <token>` pretty-prints a token's contents (without
 verifying the signature) for debugging.
 
+## Policy authoring
+
+The default policy lives at `internal/policy/default_policy.rego` and
+demonstrates a realistic mix: read-only tools allowed, routine writes
+allowed, `transfer_funds` split on a 10,000 EUR threshold,
+destructive tools blocked outright.
+
+To override, copy that file, edit, and point the gateway at it:
+
+```sh
+cp internal/policy/default_policy.rego /etc/intentgate/policy.rego
+$EDITOR /etc/intentgate/policy.rego
+INTENTGATE_POLICY_FILE=/etc/intentgate/policy.rego ./bin/gateway
+```
+
+The required entry point is `data.intentgate.policy.decision` returning
+`{"allow": <bool>, "reason": <string>}`. The gateway treats any other
+shape (or a runtime error) as fail-closed (deny). Policies see this
+input shape:
+
+```
+input.tool          string
+input.args          object
+input.agent_id      string  (from the verified capability token)
+input.intent        object  (optional; populated when intent extraction ran)
+  .summary, .allowed_tools, .forbidden_tools, .confidence
+input.capability    object
+  .subject
+```
+
 ## v0.1 roadmap
 
 - [x] HTTP skeleton, `/v1/tool-call` and `/healthz`
 - [x] MCP / JSON-RPC request parsing (`/v1/mcp`, `tools/call` only)
 - [x] Capability tokens (HMAC-SHA256, Macaroon-style attenuation chain)
 - [x] Intent extractor client + intent check (second of four)
-- [ ] Embedded OPA policy evaluation
+- [x] Embedded OPA policy evaluation (third of four)
 - [ ] Budget and taint enforcement (Redis-backed)
 - [ ] Audit log emission (OCSF / ECS)
 - [ ] Upstream proxying for `tools/list`, `initialize`, `ping`
