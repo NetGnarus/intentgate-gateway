@@ -6,8 +6,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/NetGnarus/intentgate-gateway-/internal/extractor"
-	"github.com/NetGnarus/intentgate-gateway-/internal/handlers"
+	"github.com/NetGnarus/intentgate-gateway/internal/extractor"
+	"github.com/NetGnarus/intentgate-gateway/internal/handlers"
 )
 
 // Config configures a new gateway server.

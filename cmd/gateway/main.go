@@ -36,9 +36,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/NetGnarus/intentgate-gateway-/internal/capability"
-	"github.com/NetGnarus/intentgate-gateway-/internal/extractor"
-	"github.com/NetGnarus/intentgate-gateway-/internal/server"
+	"github.com/NetGnarus/intentgate-gateway/internal/capability"
+	"github.com/NetGnarus/intentgate-gateway/internal/extractor"
+	"github.com/NetGnarus/intentgate-gateway/internal/server"
 )
 
 // version is overridden at build time via -ldflags="-X main.version=...".

@@ -8,9 +8,9 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/NetGnarus/intentgate-gateway-/internal/capability"
-	"github.com/NetGnarus/intentgate-gateway-/internal/extractor"
-	"github.com/NetGnarus/intentgate-gateway-/internal/mcp"
+	"github.com/NetGnarus/intentgate-gateway/internal/capability"
+	"github.com/NetGnarus/intentgate-gateway/internal/extractor"
+	"github.com/NetGnarus/intentgate-gateway/internal/mcp"
 )
 
 // MCPHandlerConfig configures the /v1/mcp handler.
