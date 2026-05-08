@@ -25,6 +25,13 @@
 //	                                that don't carry an X-Intent-Prompt header
 //	INTENTGATE_POLICY_FILE          path to a customer Rego policy file. When
 //	                                unset, the embedded default policy is used.
+//	INTENTGATE_REDIS_URL            Redis connection string for the budget
+//	                                store, e.g. "redis://localhost:6379/0".
+//	                                When unset, an in-memory store is used
+//	                                (single-replica only).
+//	INTENTGATE_REQUIRE_BUDGET       set to "true" to reject /v1/mcp calls
+//	                                that lack a verified capability token
+//	                                at the budget stage.
 package main
 
 import (
@@ -39,10 +46,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/NetGnarus/intentgate-gateway/internal/budget"
 	"github.com/NetGnarus/intentgate-gateway/internal/capability"
 	"github.com/NetGnarus/intentgate-gateway/internal/extractor"
 	"github.com/NetGnarus/intentgate-gateway/internal/policy"
 	"github.com/NetGnarus/intentgate-gateway/internal/server"
+	"github.com/redis/go-redis/v9"
 )
 
 // version is overridden at build time via -ldflags="-X main.version=...".
@@ -57,8 +66,10 @@ func main() {
 	addr := envOr("INTENTGATE_ADDR", ":8080")
 	requireCap := envOr("INTENTGATE_REQUIRE_CAPABILITY", "") == "true"
 	requireIntent := envOr("INTENTGATE_REQUIRE_INTENT", "") == "true"
+	requireBudget := envOr("INTENTGATE_REQUIRE_BUDGET", "") == "true"
 	extractorURL := envOr("INTENTGATE_EXTRACTOR_URL", "")
 	policyFile := envOr("INTENTGATE_POLICY_FILE", "")
+	redisURL := envOr("INTENTGATE_REDIS_URL", "")
 
 	masterKey, err := loadMasterKey(logger)
 	if err != nil {
@@ -78,13 +89,21 @@ func main() {
 		os.Exit(1)
 	}
 
+	budgetStore, budgetSource, err := loadBudgetStore(logger, redisURL)
+	if err != nil {
+		logger.Error("failed to initialize budget store", "err", err)
+		os.Exit(1)
+	}
+
 	logger.Info("intentgate gateway starting",
 		"addr", addr,
 		"version", version,
 		"require_capability", requireCap,
 		"require_intent", requireIntent,
+		"require_budget", requireBudget,
 		"intent_extractor", extractorURL != "",
 		"policy_source", policySource,
+		"budget_store", budgetSource,
 	)
 
 	srv := server.New(server.Config{
@@ -96,6 +115,8 @@ func main() {
 		Extractor:         extractorClient,
 		RequireIntent:     requireIntent,
 		Policy:            policyEngine,
+		Budget:            budgetStore,
+		RequireBudget:     requireBudget,
 	})
 
 	errCh := make(chan error, 1)
@@ -177,6 +198,31 @@ func loadPolicyEngine(logger *slog.Logger, policyFile string) (*policy.Engine, s
 	}
 	logger.Info("policy engine ready", "source", desc, "bytes", len(source))
 	return eng, desc, nil
+}
+
+// loadBudgetStore returns a budget.Store for the gateway. When
+// redisURL is set, the store is backed by Redis (multi-replica safe);
+// otherwise an in-memory store is used (single-replica, fine for dev).
+//
+// The Redis client is pinged at startup so a misconfigured URL fails
+// fast instead of hiding behind the first request.
+func loadBudgetStore(logger *slog.Logger, redisURL string) (budget.Store, string, error) {
+	if redisURL == "" {
+		logger.Info("budget store: in-memory (single-replica only)")
+		return budget.NewMemoryStore(), "memory", nil
+	}
+	opts, err := redis.ParseURL(redisURL)
+	if err != nil {
+		return nil, "", fmt.Errorf("redis parse url: %w", err)
+	}
+	client := redis.NewClient(opts)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := client.Ping(ctx).Err(); err != nil {
+		return nil, "", fmt.Errorf("redis ping: %w", err)
+	}
+	logger.Info("budget store: redis", "addr", opts.Addr)
+	return budget.NewRedisStore(client), "redis:" + opts.Addr, nil
 }
 
 func envOr(key, fallback string) string {

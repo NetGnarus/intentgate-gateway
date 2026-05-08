@@ -217,6 +217,26 @@ func TestCheckToolBlacklist(t *testing.T) {
 	}
 }
 
+func TestMaxCallsCaveatIsInformationalAtCapabilityLayer(t *testing.T) {
+	// max_calls is enforced by the budget package, not capability.
+	// At this layer it must pass; otherwise budgeted tokens couldn't
+	// even reach the budget check.
+	key := mustKey(t)
+	tok, err := Mint(key, MintOptions{
+		Subject: "x",
+		Caveats: []Caveat{{Type: CaveatMaxCalls, MaxCalls: 5}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tok.Verify(key); err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	if err := tok.Check(RequestContext{AgentID: "x", Tool: "read_invoice"}); err != nil {
+		t.Fatalf("max_calls caveat must pass at capability layer, got: %v", err)
+	}
+}
+
 func TestUnknownCaveatDeniesByDefault(t *testing.T) {
 	key := mustKey(t)
 	tok, _ := Mint(key, MintOptions{Subject: "x"})

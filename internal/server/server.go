@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/NetGnarus/intentgate-gateway/internal/budget"
 	"github.com/NetGnarus/intentgate-gateway/internal/extractor"
 	"github.com/NetGnarus/intentgate-gateway/internal/handlers"
 	"github.com/NetGnarus/intentgate-gateway/internal/policy"
@@ -34,6 +35,14 @@ type Config struct {
 	// Policy is the OPA-backed policy engine. nil means the policy
 	// check is skipped (dev convenience).
 	Policy *policy.Engine
+	// Budget is the per-token call counter store. nil means the
+	// budget check is skipped (dev convenience). Production deployments
+	// supply a Redis-backed implementation; dev deployments fall back
+	// to an in-memory one.
+	Budget budget.Store
+	// RequireBudget rejects calls without a verified capability token
+	// from reaching the budget stage. Default false (dev mode).
+	RequireBudget bool
 }
 
 // New constructs an *http.Server with all gateway routes and middleware.
@@ -66,6 +75,8 @@ func New(cfg Config) *http.Server {
 		Extractor:         cfg.Extractor,
 		RequireIntent:     cfg.RequireIntent,
 		Policy:            cfg.Policy,
+		Budget:            cfg.Budget,
+		RequireBudget:     cfg.RequireBudget,
 	}))
 
 	handler := chain(mux,

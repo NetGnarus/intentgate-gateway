@@ -69,6 +69,13 @@ const (
 	// CaveatAgentLock — request agent ID must equal Agent.
 	// Mint always prepends one of these to bind a token to its subject.
 	CaveatAgentLock = "agent_lock"
+	// CaveatMaxCalls — total tool-call count for this token must stay
+	// at or below MaxCalls. Enforcement requires persistent state and
+	// happens in the budget package, NOT in capability.Check; the
+	// capability layer treats this caveat as informational and accepts
+	// it without checking. The signed presence of the caveat in the
+	// chain ensures agents can't strip or alter the limit.
+	CaveatMaxCalls = "max_calls"
 )
 
 // Caveat is a structured restriction recorded in a token's chain.
@@ -79,10 +86,11 @@ const (
 // stable and inspectable. A future migration to typed caveats is
 // possible without changing the chain construction.
 type Caveat struct {
-	Type   string   `json:"t"`
-	Tools  []string `json:"tools,omitempty"`
-	Agent  string   `json:"agent,omitempty"`
-	Expiry int64    `json:"exp,omitempty"`
+	Type     string   `json:"t"`
+	Tools    []string `json:"tools,omitempty"`
+	Agent    string   `json:"agent,omitempty"`
+	Expiry   int64    `json:"exp,omitempty"`
+	MaxCalls int      `json:"max_calls,omitempty"`
 }
 
 // canonicalPayload returns the bytes that seed the HMAC chain. It

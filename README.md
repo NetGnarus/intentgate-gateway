@@ -15,19 +15,21 @@ separate, private repositories — see the
 
 ## Status
 
-`v0.1.0-dev` — **HTTP + MCP framing + capability + intent + policy.**
+`v0.1.0-dev` — **HTTP + MCP framing + full four-check pipeline.**
 
 The server boots and accepts requests on three endpoints:
 
 - `GET  /healthz` — liveness probe.
 - `POST /v1/tool-call` — simple flat JSON shape, kept for ad-hoc curl testing.
-- `POST /v1/mcp` — JSON-RPC 2.0 / Model Context Protocol. Runs three of the four checks before allowing the call:
+- `POST /v1/mcp` — JSON-RPC 2.0 / Model Context Protocol. Runs the full four-check pipeline:
   - **Capability** (Bearer token, Macaroon-style HMAC chain). Caveats are evaluated against the requested tool.
   - **Intent.** When `X-Intent-Prompt` is supplied and an extractor is configured, the gateway calls the [extractor service](../extractor/), gets a structured intent (`allowed_tools` / `forbidden_tools`), and verifies the requested tool is permitted.
   - **Policy.** OPA-backed Rego engine (embedded). Customer policies can express thresholds, time-of-day rules, agent-specific overrides, and arbitrary business logic. A starter policy is shipped; override via `INTENTGATE_POLICY_FILE`.
+  - **Budget.** Per-token call counters via a `max_calls` caveat. Backed by Redis in production (multi-replica safe) or an in-memory store in dev.
 
-One of four checks remains (budget). Calls passing all three current
-checks are allowed with a stub reason.
+All four data-plane checks are now live. Calls that pass every stage
+are allowed with a stub reason — the actual upstream-tool-server proxy
+arrives in a later session.
 
 ## Quick start
 
@@ -112,6 +114,7 @@ internal/mcp/         # JSON-RPC 2.0 envelope, MCP method types, error codes
 internal/capability/  # Macaroon-style HMAC capability tokens, caveats, codec
 internal/extractor/   # HTTP client for the intent extractor + LRU cache
 internal/policy/      # OPA Rego engine + embedded default_policy.rego
+internal/budget/      # Per-token call counters: MemoryStore + RedisStore
 pkg/                  # reserved for public packages (future SDK integration types)
 Dockerfile            # multi-stage: build in golang:1.22-alpine, run in distroless
 Makefile              # build / run / test / docker / smoke / mint / gen-key
@@ -141,6 +144,8 @@ runs as a non-root user.
 | `INTENTGATE_EXTRACTOR_URL`      | _unset_ | Base URL of the [intent extractor service](../extractor/). When unset, the intent check is disabled.     |
 | `INTENTGATE_REQUIRE_INTENT`     | `false` | When `true`, `/v1/mcp` rejects calls without an `X-Intent-Prompt` header.                                |
 | `INTENTGATE_POLICY_FILE`        | _unset_ | Path to a customer Rego policy file. When unset, the embedded `default_policy.rego` is used.             |
+| `INTENTGATE_REDIS_URL`          | _unset_ | Redis URL for the budget counter store, e.g. `redis://localhost:6379/0`. When unset, an in-memory store is used (single-replica only). |
+| `INTENTGATE_REQUIRE_BUDGET`     | `false` | When `true`, `/v1/mcp tools/call` requires a verified capability token before the budget stage runs.     |
 
 More configuration arrives with the intent extractor client, policy
 engine, and storage layers.
@@ -216,7 +221,7 @@ input.capability    object
 - [x] Capability tokens (HMAC-SHA256, Macaroon-style attenuation chain)
 - [x] Intent extractor client + intent check (second of four)
 - [x] Embedded OPA policy evaluation (third of four)
-- [ ] Budget and taint enforcement (Redis-backed)
+- [x] Budget enforcement (Redis-backed, fourth of four; taint TBD)
 - [ ] Audit log emission (OCSF / ECS)
 - [ ] Upstream proxying for `tools/list`, `initialize`, `ping`
 - [ ] Helm chart

@@ -82,6 +82,8 @@ func cmdMint(args []string) {
 		"comma-separated tool blacklist")
 	ttl := fs.Duration("ttl", 0,
 		"time-to-live (e.g. 1h, 30m). 0 = no expiry caveat")
+	maxCalls := fs.Int("max-calls", 0,
+		"maximum total tool-calls allowed for this token (0 = unlimited)")
 	issuer := fs.String("issuer", "",
 		"issuer name (default: intentgate)")
 	pretty := fs.Bool("pretty", false,
@@ -109,6 +111,12 @@ func cmdMint(args []string) {
 		caveats = append(caveats, capability.Caveat{
 			Type:  capability.CaveatToolBlacklist,
 			Tools: splitCSV(*forbidden),
+		})
+	}
+	if *maxCalls > 0 {
+		caveats = append(caveats, capability.Caveat{
+			Type:     capability.CaveatMaxCalls,
+			MaxCalls: *maxCalls,
 		})
 	}
 

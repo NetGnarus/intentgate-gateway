@@ -79,6 +79,14 @@ func evalCaveat(c Caveat, ctx RequestContext, now time.Time) error {
 		}
 		return nil
 
+	case CaveatMaxCalls:
+		// Informational at this layer. The budget package consults
+		// the persistent counter store and enforces the limit as the
+		// fourth pipeline check. We accept the caveat as valid here
+		// so that signed tokens carrying max_calls aren't rejected
+		// by the capability stage.
+		return nil
+
 	default:
 		return fmt.Errorf("unknown caveat type %q (deny by default)", c.Type)
 	}

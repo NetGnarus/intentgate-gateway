@@ -3,11 +3,13 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"time"
 
+	"github.com/NetGnarus/intentgate-gateway/internal/budget"
 	"github.com/NetGnarus/intentgate-gateway/internal/capability"
 	"github.com/NetGnarus/intentgate-gateway/internal/extractor"
 	"github.com/NetGnarus/intentgate-gateway/internal/mcp"
@@ -36,6 +38,15 @@ type MCPHandlerConfig struct {
 	// the four checks. May be nil only in dev mode (the policy check is
 	// skipped). main.go always supplies one in normal operation.
 	Policy *policy.Engine
+	// Budget is the per-token call counter store. When nil, the budget
+	// check is skipped (and tokens with max_calls caveats produce a
+	// startup-time error rather than a runtime one). When RequireBudget
+	// is true, missing tokens at this stage are rejected.
+	Budget budget.Store
+	// RequireBudget rejects /v1/mcp tools/call requests that don't
+	// have a verified capability token reaching the budget stage.
+	// Default false (dev mode allows missing tokens).
+	RequireBudget bool
 }
 
 type mcpHandler struct {
@@ -57,7 +68,9 @@ type mcpHandler struct {
 //     Returns CodeIntentFailed (-32011) on failure.
 //  5. Policy check: evaluate the request against the configured Rego
 //     policy bundle. Returns CodePolicyFailed (-32012) on deny.
-//  6. (Future) budget check.
+//  6. Budget check: increment the per-token counter, deny when any
+//     max_calls caveat in the verified token is exceeded. Returns
+//     CodeBudgetFailed (-32013) on deny.
 //  7. Return the stub allow response.
 func NewMCPHandler(cfg MCPHandlerConfig) http.Handler {
 	if cfg.Logger == nil {
@@ -168,6 +181,19 @@ func (h *mcpHandler) handleToolsCall(ctx context.Context, req *mcp.Request, r *h
 			"policy check failed", polResult.err.Error())
 	}
 
+	// Check 4: budget.
+	bdgResult := h.runBudgetCheck(ctx, capResult)
+	if bdgResult.err != nil {
+		h.cfg.Logger.Info("mcp tools/call blocked",
+			"tool", params.Name,
+			"check", "budget",
+			"agent", capResult.agentID,
+			"reason", bdgResult.err.Error(),
+		)
+		return mcp.NewErrorResponse(req.ID, mcp.CodeBudgetFailed,
+			"budget check failed", bdgResult.err.Error())
+	}
+
 	// Argument values may contain sensitive data — log only the keys.
 	argKeys := make([]string, 0, len(params.Arguments))
 	for k := range params.Arguments {
@@ -179,6 +205,7 @@ func (h *mcpHandler) handleToolsCall(ctx context.Context, req *mcp.Request, r *h
 		"capability", capResult.summary,
 		"intent", intResult.summary,
 		"policy", polResult.summary,
+		"budget", bdgResult.summary,
 		"arg_keys", argKeys,
 	)
 
@@ -206,7 +233,11 @@ func (h *mcpHandler) handleToolsCall(ctx context.Context, req *mcp.Request, r *h
 type capabilityCheckResult struct {
 	agentID string
 	summary string
-	err     error
+	// token is the verified token, retained so subsequent stages
+	// (intent, policy, budget) can read its caveats. nil when no token
+	// was supplied.
+	token *capability.Token
+	err   error
 }
 
 // intentCheckResult bundles what the intent stage learned.
@@ -219,6 +250,12 @@ type intentCheckResult struct {
 // policyCheckResult bundles what the policy stage learned.
 type policyCheckResult struct {
 	summary string // short description ("ok: <reason>", "skipped (no engine)", ...)
+	err     error
+}
+
+// budgetCheckResult bundles what the budget stage learned.
+type budgetCheckResult struct {
+	summary string // short description ("ok: 3/10 calls", "skipped", ...)
 	err     error
 }
 
@@ -250,9 +287,9 @@ func (h *mcpHandler) runCapabilityCheck(r *http.Request, tool string) capability
 		AgentID: tok.Subject,
 		Tool:    tool,
 	}); err != nil {
-		return capabilityCheckResult{agentID: tok.Subject, err: err}
+		return capabilityCheckResult{agentID: tok.Subject, token: tok, err: err}
 	}
-	return capabilityCheckResult{agentID: tok.Subject, summary: "ok"}
+	return capabilityCheckResult{agentID: tok.Subject, token: tok, summary: "ok"}
 }
 
 // runIntentCheck reads the X-Intent-Prompt header and asks the
@@ -344,12 +381,44 @@ func (h *mcpHandler) runPolicyCheck(
 	return policyCheckResult{summary: "ok"}
 }
 
+// runBudgetCheck increments the per-token call counter and verifies
+// the new total against any max_calls caveats present in the verified
+// token.
+//
+// Behavior table:
+//
+//   - No verified token, RequireBudget=false → skipped (dev mode).
+//   - No verified token, RequireBudget=true  → fail closed.
+//   - Token present, no max_calls caveat     → allow without touching the store.
+//   - Token present, max_calls exceeded      → deny with the strictest cap's reason.
+//   - Token present, store nil but caveat ex → fail closed (operator misconfig).
+func (h *mcpHandler) runBudgetCheck(ctx context.Context, cap capabilityCheckResult) budgetCheckResult {
+	if cap.token == nil {
+		if h.cfg.RequireBudget {
+			return budgetCheckResult{err: errMissingBudgetToken}
+		}
+		return budgetCheckResult{summary: "skipped (no token)"}
+	}
+	d, err := budget.Check(ctx, h.cfg.Budget, cap.token)
+	if err != nil {
+		return budgetCheckResult{err: err}
+	}
+	if !d.Allowed {
+		return budgetCheckResult{err: capError(d.Reason)}
+	}
+	if d.Used > 0 {
+		return budgetCheckResult{summary: fmt.Sprintf("ok: %d call(s)", d.Used)}
+	}
+	return budgetCheckResult{summary: d.Reason}
+}
+
 // errMissingCapability is the static error returned when a token is
 // required but absent.
 var (
 	errMissingCapability      = capError("capability token required (INTENTGATE_REQUIRE_CAPABILITY=true)")
 	errMissingIntent          = capError("intent prompt required (INTENTGATE_REQUIRE_INTENT=true)")
 	errExtractorNotConfigured = capError("intent prompt provided but no extractor URL is configured")
+	errMissingBudgetToken     = capError("budget enforcement requires a verified capability token")
 )
 
 // capError is a tiny error type so we don't pull in fmt for one string.

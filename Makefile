@@ -8,10 +8,11 @@ IMAGE   ?= intentgate/gateway:dev
 # expand correctly. With them PHONY, 'make build' always reruns 'go build',
 # which is fast and idempotent — no risk of stale binaries.
 .PHONY: build $(BIN) $(IGCTL) run test vet fmt tidy docker docker-run \
-        gen-key mint mint-readonly mint-strict mint-broad \
+        gen-key mint mint-readonly mint-strict mint-broad mint-budget \
         smoke smoke-cap smoke-cap-bad smoke-cap-strict \
         smoke-intent smoke-intent-block \
         smoke-policy-allow smoke-policy-block \
+        smoke-budget \
         igctl clean
 
 # Default target: produce both binaries.
@@ -207,6 +208,28 @@ smoke-policy-block:
 		-H 'X-Intent-Prompt: Pay vendor invoice from Globex' \
 		-d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"transfer_funds","arguments":{"amount_eur":50000}}}' \
 		| (jq . 2>/dev/null || cat); echo
+
+# Mint a token with a 2-call budget. Used by smoke-budget below.
+mint-budget: $(IGCTL)
+	@./$(IGCTL) mint \
+		--subject finance-copilot-v3 \
+		--max-calls 2 \
+		--ttl 1h
+
+# Budget-flow smoke. Mints a fresh 2-call token, then makes 3 read_invoice
+# calls. The first two should ALLOW with budget summary 1/2 and 2/2;
+# the third should BLOCK with code -32013 budget_failed.
+smoke-budget: $(IGCTL)
+	@TOKEN=$$(./$(IGCTL) mint --subject finance-copilot-v3 --max-calls 2 --ttl 1h); \
+	for i in 1 2 3; do \
+		echo "--- call $$i: read_invoice (max_calls=2)"; \
+		curl -sX POST http://localhost:8080/v1/mcp \
+			-H 'Content-Type: application/json' \
+			-H "Authorization: Bearer $$TOKEN" \
+			-H 'X-Intent-Prompt: Process today AP invoices' \
+			-d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_invoice","arguments":{"id":"123"}}}' \
+			| (jq . 2>/dev/null || cat); echo; \
+	done
 
 clean:
 	rm -rf bin/ out/ dist/
