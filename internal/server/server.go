@@ -85,7 +85,7 @@ func New(cfg Config) *http.Server {
 	}))
 
 	handler := chain(mux,
-		recoverer(logger),    // outermost: catches panics from any handler
+		recoverer(logger),     // outermost: catches panics from any handler
 		requestLogger(logger), // logs every request after it completes
 	)
 

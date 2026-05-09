@@ -5,7 +5,7 @@
 // reason — everything the SOC analyst needs to reconstruct what the
 // agent did and why the gateway responded the way it did.
 //
-// Event shape
+// # Event shape
 //
 // The Event struct is a lightweight OCSF-lite shape: a flat JSON
 // document the customer's SIEM can ingest without a custom mapper.
@@ -14,7 +14,7 @@
 // step. Mapping to full OCSF (with category_uid, class_uid, etc.)
 // can be done in a downstream parser if/when a customer needs it.
 //
-// Emitters
+// # Emitters
 //
 // Two implementations ship in v0.1:
 //
@@ -191,4 +191,3 @@ func FromTarget(target string) (Emitter, string, error) {
 		return nil, "", fmt.Errorf("unknown audit target %q (want stdout|none)", target)
 	}
 }
-

@@ -10,7 +10,7 @@
 // engine for an OPA sidecar is a single-file change behind this
 // package's [Engine] interface.
 //
-// Policy authoring
+// # Policy authoring
 //
 // Policies are written in Rego, OPA's declarative policy language. The
 // gateway expects the policy to define a top-level rule named
