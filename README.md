@@ -1,21 +1,40 @@
 # IntentGate Gateway
 
+[![CI](https://github.com/NetGnarus/intentgate-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/NetGnarus/intentgate-gateway/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/NetGnarus/intentgate-gateway.svg)](https://pkg.go.dev/github.com/NetGnarus/intentgate-gateway)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![Go 1.25](https://img.shields.io/badge/go-1.25-00ADD8.svg)](go.mod)
+[![Container](https://img.shields.io/badge/ghcr.io-intentgate--gateway-2188ff.svg)](https://github.com/NetGnarus/intentgate-gateway/pkgs/container/intentgate-gateway)
+
 A self-hosted authorization gateway for AI agents.
 
 The gateway sits between an AI agent and the tool servers it wants to call.
 It intercepts every tool call, evaluates it through a four-check pipeline
-(capability, intent, policy, budget), and either forwards the call upstream
-or blocks it.
+(**capability, intent, policy, budget**), and either forwards the call
+upstream or blocks it. Every decision emits a structured audit event.
 
-**License: Apache 2.0.** This repository is the open-source core of
-IntentGate. The advanced admin console, multi-tenant control plane, advanced
-audit service, and fine-tuned intent extractor are commercial products in
-separate, private repositories — see the
-[deployment architecture](../intentgate_pitch_kit_6.html) for the full picture.
+It is **self-hosted**: you run it inside your perimeter, on your
+Kubernetes cluster, on your VM, or in your laptop. No IntentGate-hosted
+services are involved. Agent prompts, tool arguments, and audit events
+never leave your network.
+
+This repository is the open-source core (Apache 2.0). The advanced admin
+console, multi-tenant control plane, advanced audit service, and
+fine-tuned intent extractor are commercial products in separate, private
+repositories.
+
+## Companion repositories
+
+| Repo | Purpose |
+| ---- | ------- |
+| [intentgate-gateway](https://github.com/NetGnarus/intentgate-gateway) | Go gateway with the four-check pipeline (this repo). |
+| [intentgate-extractor](https://github.com/NetGnarus/intentgate-extractor) | Python FastAPI service that turns a free-form prompt into a structured intent (`allowed_tools`, `forbidden_tools`, `summary`). Used by the gateway's intent check. |
+| [intentgate-sdk-python](https://github.com/NetGnarus/intentgate-sdk-python) | Python SDK for agents — three lines to call the gateway with typed exceptions per check. |
+| [intentgate-helm](https://github.com/NetGnarus/intentgate-helm) | Helm chart that deploys the gateway, extractor, and Redis to a Kubernetes cluster. |
 
 ## Status
 
-`v0.1.0-dev` — **HTTP + MCP framing + full four-check pipeline.**
+`v0.1.0` — **HTTP + MCP framing + full four-check pipeline + audit emission.**
 
 The server boots and accepts requests on three endpoints:
 
@@ -23,17 +42,17 @@ The server boots and accepts requests on three endpoints:
 - `POST /v1/tool-call` — simple flat JSON shape, kept for ad-hoc curl testing.
 - `POST /v1/mcp` — JSON-RPC 2.0 / Model Context Protocol. Runs the full four-check pipeline:
   - **Capability** (Bearer token, Macaroon-style HMAC chain). Caveats are evaluated against the requested tool.
-  - **Intent.** When `X-Intent-Prompt` is supplied and an extractor is configured, the gateway calls the [extractor service](../extractor/), gets a structured intent (`allowed_tools` / `forbidden_tools`), and verifies the requested tool is permitted.
+  - **Intent.** When `X-Intent-Prompt` is supplied and an extractor is configured, the gateway calls the [extractor service](https://github.com/NetGnarus/intentgate-extractor), gets a structured intent (`allowed_tools` / `forbidden_tools`), and verifies the requested tool is permitted.
   - **Policy.** OPA-backed Rego engine (embedded). Customer policies can express thresholds, time-of-day rules, agent-specific overrides, and arbitrary business logic. A starter policy is shipped; override via `INTENTGATE_POLICY_FILE`.
   - **Budget.** Per-token call counters via a `max_calls` caveat. Backed by Redis in production (multi-replica safe) or an in-memory store in dev.
 
 All four data-plane checks are now live. Calls that pass every stage
 are allowed with a stub reason — the actual upstream-tool-server proxy
-arrives in a later session.
+is the next milestone.
 
 ## Quick start
 
-Requires **Go 1.22+**.
+Requires **Go 1.25+**.
 
 ```sh
 make build
@@ -103,6 +122,35 @@ The MCP response wraps the gateway's decision in `result._intentgate`
 Methods other than `tools/call` currently return a JSON-RPC
 `MethodNotFound` (-32601) error.
 
+## Use it from an agent
+
+The [Python SDK](https://github.com/NetGnarus/intentgate-sdk-python)
+hides the HTTP plumbing and turns each check failure into a typed
+exception:
+
+```python
+from intentgate import Gateway, CapabilityError, IntentError, PolicyError, BudgetError
+
+gw = Gateway("http://localhost:8080", token=TOKEN)
+
+try:
+    result = gw.call(
+        tool="read_invoice",
+        arguments={"id": "123"},
+        intent_prompt="Process today's AP invoices",
+    )
+except CapabilityError as e:
+    ...   # token is missing, expired, tampered, or doesn't permit this tool
+except IntentError as e:
+    ...   # the requested tool doesn't fit the declared intent
+except PolicyError as e:
+    ...   # the OPA policy denied the call
+except BudgetError as e:
+    ...   # the token's max_calls budget is exhausted
+```
+
+A TypeScript SDK is on the v1.0 roadmap.
+
 ## Project layout
 
 ```
@@ -117,8 +165,9 @@ internal/policy/      # OPA Rego engine + embedded default_policy.rego
 internal/budget/      # Per-token call counters: MemoryStore + RedisStore
 internal/audit/       # OCSF-lite Event + Emitter (stdout / none)
 pkg/                  # reserved for public packages (future SDK integration types)
-Dockerfile            # multi-stage: build in golang:1.22-alpine, run in distroless
+Dockerfile            # multi-stage: build in golang:1.25-alpine, run in distroless
 Makefile              # build / run / test / docker / smoke / mint / gen-key
+.github/workflows/    # CI (test + build on PRs) and release (publish image to GHCR)
 ```
 
 The repository follows the standard Go layout: `cmd/` holds main packages,
@@ -127,6 +176,8 @@ holds packages we expose for external use.
 
 ## Docker
 
+Build locally:
+
 ```sh
 make docker
 make docker-run
@@ -134,6 +185,16 @@ make docker-run
 
 The runtime image is `gcr.io/distroless/static:nonroot`, ~2 MB, no shell,
 runs as a non-root user.
+
+Pull the official multi-arch image (linux/amd64, linux/arm64) from GHCR:
+
+```sh
+docker pull ghcr.io/netgnarus/intentgate-gateway:latest
+docker run --rm -p 8080:8080 ghcr.io/netgnarus/intentgate-gateway:latest
+```
+
+Tagged images (`:v0.1.0`, `:v0.1`, `:0.1.0`) are published automatically
+when a `vX.Y.Z` git tag is pushed — see `.github/workflows/release.yml`.
 
 ## Configuration
 
@@ -258,17 +319,31 @@ input.capability    object
   .subject
 ```
 
-## v0.1 roadmap
+## Roadmap
+
+**v0.1 — done.** A friendly design partner can `helm install`, point an
+agent at the gateway, and exercise the full four-check pipeline.
 
 - [x] HTTP skeleton, `/v1/tool-call` and `/healthz`
 - [x] MCP / JSON-RPC request parsing (`/v1/mcp`, `tools/call` only)
 - [x] Capability tokens (HMAC-SHA256, Macaroon-style attenuation chain)
-- [x] Intent extractor client + intent check (second of four)
-- [x] Embedded OPA policy evaluation (third of four)
-- [x] Budget enforcement (Redis-backed, fourth of four; taint TBD)
+- [x] Intent extractor client + intent check
+- [x] Embedded OPA policy evaluation
+- [x] Budget enforcement (Redis-backed)
 - [x] Audit log emission (OCSF-lite JSON to stdout)
-- [ ] Upstream proxying for `tools/list`, `initialize`, `ping`
-- [ ] Helm chart
+- [x] Python SDK ([intentgate-sdk-python](https://github.com/NetGnarus/intentgate-sdk-python))
+- [x] Helm chart ([intentgate-helm](https://github.com/NetGnarus/intentgate-helm))
+
+**v0.1 → v1.0 — next.** Production hardening based on design-partner
+deployments.
+
+- [ ] Upstream proxying for `tools/list`, `initialize`, `ping` and the actual `tools/call` forward
+- [ ] Token revocation list
+- [ ] Prometheus metrics + OpenTelemetry tracing
+- [ ] TypeScript SDK
+- [ ] Taint propagation (data-flow side of the budget check)
+- [ ] AI Act Annex IV evidence pack
+- [ ] Performance benchmarks under realistic agent traffic
 
 ## Development
 
@@ -279,8 +354,18 @@ make test   # go test -race ./...
 make tidy   # go mod tidy
 ```
 
+CI runs `vet`, `test`, and a Docker build on every PR — see
+`.github/workflows/ci.yml`.
+
 ## Contributing
 
-The gateway is Apache 2.0 and accepts community contributions. A formal
-CLA process will be set up before the first external PR — for now please
-open an issue to discuss any non-trivial change.
+The gateway is Apache 2.0 and welcomes community contributions. A formal
+DCO sign-off process and `CONTRIBUTING.md` are coming with the v0.1 →
+v1.0 polish pass. For now, please open an issue to discuss any
+non-trivial change before sending a PR.
+
+## Security
+
+If you find a security vulnerability, please **do not** open a public
+issue. Email security@netgnarus.com (or open a GitHub Security Advisory
+on this repo) and we'll respond within two business days.
