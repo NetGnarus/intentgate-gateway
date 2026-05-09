@@ -77,26 +77,22 @@ func TestEventJSONRoundTrip(t *testing.T) {
 		}
 	}
 
-	// Round-trip back through Unmarshal.
+	// Round-trip back through Unmarshal. Event has a []string field, so
+	// it's not comparable with == — we null the slice for the struct
+	// equality check and then compare the slice separately.
 	var got Event
 	if err := json.Unmarshal(raw, &got); err != nil {
 		t.Fatal(err)
 	}
-	if got != orig {
-		// Slices compare by reference; so test field-by-field for ArgKeys.
-		// Most fields can compare directly because they're all
-		// comparable types except the slice. We'll validate the slice
-		// separately and the rest with a struct equality after nilling.
-		gotCmp := got
-		origCmp := orig
-		gotCmp.ArgKeys = nil
-		origCmp.ArgKeys = nil
-		if gotCmp != origCmp {
-			t.Errorf("non-slice fields drift after round-trip:\n  got=%+v\n  orig=%+v", gotCmp, origCmp)
-		}
-		if !equalStringSlice(got.ArgKeys, orig.ArgKeys) {
-			t.Errorf("arg_keys drifted: got=%v orig=%v", got.ArgKeys, orig.ArgKeys)
-		}
+	gotCmp := got
+	origCmp := orig
+	gotCmp.ArgKeys = nil
+	origCmp.ArgKeys = nil
+	if gotCmp != origCmp {
+		t.Errorf("non-slice fields drift after round-trip:\n  got=%+v\n  orig=%+v", gotCmp, origCmp)
+	}
+	if !equalStringSlice(got.ArgKeys, orig.ArgKeys) {
+		t.Errorf("arg_keys drifted: got=%v orig=%v", got.ArgKeys, orig.ArgKeys)
 	}
 }
 
