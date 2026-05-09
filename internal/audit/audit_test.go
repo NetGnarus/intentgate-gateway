@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -78,21 +79,15 @@ func TestEventJSONRoundTrip(t *testing.T) {
 	}
 
 	// Round-trip back through Unmarshal. Event has a []string field, so
-	// it's not comparable with == — we null the slice for the struct
-	// equality check and then compare the slice separately.
+	// the type is not comparable with == (Go checks comparability
+	// statically by type, not by whether the slice value is nil).
+	// reflect.DeepEqual handles slices correctly.
 	var got Event
 	if err := json.Unmarshal(raw, &got); err != nil {
 		t.Fatal(err)
 	}
-	gotCmp := got
-	origCmp := orig
-	gotCmp.ArgKeys = nil
-	origCmp.ArgKeys = nil
-	if gotCmp != origCmp {
-		t.Errorf("non-slice fields drift after round-trip:\n  got=%+v\n  orig=%+v", gotCmp, origCmp)
-	}
-	if !equalStringSlice(got.ArgKeys, orig.ArgKeys) {
-		t.Errorf("arg_keys drifted: got=%v orig=%v", got.ArgKeys, orig.ArgKeys)
+	if !reflect.DeepEqual(got, orig) {
+		t.Errorf("round-trip drift:\n  got=%+v\n  orig=%+v", got, orig)
 	}
 }
 
@@ -209,18 +204,4 @@ func TestFromTarget(t *testing.T) {
 			}
 		})
 	}
-}
-
-// --- helpers ------------------------------------------------------------
-
-func equalStringSlice(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }
