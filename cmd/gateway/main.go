@@ -51,6 +51,16 @@
 //	                                endpoints (revoke, list-revocations).
 //	                                When unset, admin endpoints are
 //	                                disabled (404 / not registered).
+//	INTENTGATE_METRICS_ENABLED      "true" to register /metrics on the
+//	                                public port. Default off because
+//	                                exposing metrics on the same port
+//	                                as agent traffic is an info-
+//	                                disclosure risk for naive deploys.
+//	OTEL_EXPORTER_OTLP_ENDPOINT     standard OTel env var. When set,
+//	                                the gateway initializes an OTLP
+//	                                gRPC exporter and emits one span
+//	                                per HTTP request. Empty disables
+//	                                tracing entirely (no overhead).
 package main
 
 import (
@@ -70,11 +80,18 @@ import (
 	"github.com/NetGnarus/intentgate-gateway/internal/budget"
 	"github.com/NetGnarus/intentgate-gateway/internal/capability"
 	"github.com/NetGnarus/intentgate-gateway/internal/extractor"
+	"github.com/NetGnarus/intentgate-gateway/internal/metrics"
 	"github.com/NetGnarus/intentgate-gateway/internal/policy"
 	"github.com/NetGnarus/intentgate-gateway/internal/revocation"
 	"github.com/NetGnarus/intentgate-gateway/internal/server"
 	"github.com/NetGnarus/intentgate-gateway/internal/upstream"
 	"github.com/redis/go-redis/v9"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 )
 
 // version is overridden at build time via -ldflags="-X main.version=...".
@@ -98,6 +115,8 @@ func main() {
 	upstreamTimeoutMS := envOr("INTENTGATE_UPSTREAM_TIMEOUT_MS", "")
 	postgresURL := envOr("INTENTGATE_POSTGRES_URL", "")
 	adminToken := envOr("INTENTGATE_ADMIN_TOKEN", "")
+	metricsEnabled := envOr("INTENTGATE_METRICS_ENABLED", "") == "true"
+	otelEndpoint := envOr("OTEL_EXPORTER_OTLP_ENDPOINT", "")
 
 	masterKey, err := loadMasterKey(logger)
 	if err != nil {
@@ -146,6 +165,21 @@ func main() {
 		adminTokenDesc = "configured"
 	}
 
+	metricsHandle := metrics.New(metrics.Config{IncludeRuntimeMetrics: metricsEnabled})
+
+	otelShutdown, otelDesc, err := loadTracing(context.Background(), version, otelEndpoint)
+	if err != nil {
+		logger.Error("failed to initialize OTel tracing", "err", err)
+		os.Exit(1)
+	}
+	defer func() {
+		if otelShutdown != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = otelShutdown(ctx)
+		}
+	}()
+
 	logger.Info("intentgate gateway starting",
 		"addr", addr,
 		"version", version,
@@ -159,23 +193,28 @@ func main() {
 		"upstream", upstreamDesc,
 		"revocation_store", revocationDesc,
 		"admin_api", adminTokenDesc,
+		"metrics_endpoint", metricsEnabled,
+		"otel_tracing", otelDesc,
 	)
 
 	srv := server.New(server.Config{
-		Addr:              addr,
-		Logger:            logger,
-		Version:           version,
-		MasterKey:         masterKey,
-		RequireCapability: requireCap,
-		Extractor:         extractorClient,
-		RequireIntent:     requireIntent,
-		Policy:            policyEngine,
-		Budget:            budgetStore,
-		RequireBudget:     requireBudget,
-		Audit:             auditEmitter,
-		Upstream:          upstreamClient,
-		Revocation:        revocationStore,
-		AdminToken:        adminToken,
+		Addr:                  addr,
+		Logger:                logger,
+		Version:               version,
+		MasterKey:             masterKey,
+		RequireCapability:     requireCap,
+		Extractor:             extractorClient,
+		RequireIntent:         requireIntent,
+		Policy:                policyEngine,
+		Budget:                budgetStore,
+		RequireBudget:         requireBudget,
+		Audit:                 auditEmitter,
+		Upstream:              upstreamClient,
+		Revocation:            revocationStore,
+		AdminToken:            adminToken,
+		Metrics:               metricsHandle,
+		EnableMetricsEndpoint: metricsEnabled,
+		EnableOTelTracing:     otelEndpoint != "",
 	})
 
 	errCh := make(chan error, 1)
@@ -325,6 +364,45 @@ func loadUpstream(logger *slog.Logger, url, timeoutMS string) (*upstream.Client,
 		return nil, "", err
 	}
 	return c, fmt.Sprintf("%s (timeout %s)", url, timeout), nil
+}
+
+// loadTracing initializes the OpenTelemetry tracer provider when an
+// OTLP endpoint is configured. Returns a shutdown function the caller
+// must call on graceful exit so in-flight spans flush.
+//
+// We deliberately don't start a sampler / metric pipeline here — the
+// SDK defaults (always-on sampling, no metric pipeline) are fine for
+// v1. Operators with high-RPS deployments can add their own sampler
+// via standard OTEL_TRACES_SAMPLER env vars; the SDK reads them.
+func loadTracing(ctx context.Context, version, endpoint string) (func(context.Context) error, string, error) {
+	if endpoint == "" {
+		return nil, "disabled", nil
+	}
+
+	exp, err := otlptracegrpc.New(ctx,
+		otlptracegrpc.WithEndpoint(endpoint),
+		otlptracegrpc.WithInsecure(),
+	)
+	if err != nil {
+		return nil, "", fmt.Errorf("otlp exporter: %w", err)
+	}
+
+	res, err := resource.Merge(resource.Default(), resource.NewWithAttributes(
+		semconv.SchemaURL,
+		semconv.ServiceName("intentgate-gateway"),
+		semconv.ServiceVersion(version),
+	))
+	if err != nil {
+		return nil, "", fmt.Errorf("otel resource: %w", err)
+	}
+
+	tp := sdktrace.NewTracerProvider(
+		sdktrace.WithBatcher(exp),
+		sdktrace.WithResource(res),
+	)
+	otel.SetTracerProvider(tp)
+
+	return tp.Shutdown, fmt.Sprintf("enabled (otlp grpc: %s)", endpoint), nil
 }
 
 // loadRevocation constructs the revocation store. When postgresURL is

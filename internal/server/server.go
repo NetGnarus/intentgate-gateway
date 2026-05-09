@@ -10,9 +10,12 @@ import (
 	"github.com/NetGnarus/intentgate-gateway/internal/budget"
 	"github.com/NetGnarus/intentgate-gateway/internal/extractor"
 	"github.com/NetGnarus/intentgate-gateway/internal/handlers"
+	"github.com/NetGnarus/intentgate-gateway/internal/metrics"
 	"github.com/NetGnarus/intentgate-gateway/internal/policy"
 	"github.com/NetGnarus/intentgate-gateway/internal/revocation"
 	"github.com/NetGnarus/intentgate-gateway/internal/upstream"
+
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
 // Config configures a new gateway server.
@@ -60,6 +63,18 @@ type Config struct {
 	// AdminToken is the shared secret the /v1/admin/* endpoints check
 	// in constant time. When empty, admin endpoints are disabled.
 	AdminToken string
+	// Metrics is the Prometheus instrumentation. nil disables both the
+	// /metrics endpoint and per-handler observation calls (handlers
+	// guard against nil internally).
+	Metrics *metrics.Metrics
+	// EnableMetricsEndpoint registers GET /metrics serving the
+	// Metrics handler. Off by default so naive deployments don't
+	// expose internal metrics on the public port.
+	EnableMetricsEndpoint bool
+	// EnableOTelTracing wraps the HTTP handler with otelhttp so each
+	// request becomes a span. Configuration of the exporter is via
+	// standard OTEL_* env vars; this flag only toggles the middleware.
+	EnableOTelTracing bool
 }
 
 // New constructs an *http.Server with all gateway routes and middleware.
@@ -97,7 +112,16 @@ func New(cfg Config) *http.Server {
 		Audit:             cfg.Audit,
 		Upstream:          cfg.Upstream,
 		Revocation:        cfg.Revocation,
+		Metrics:           cfg.Metrics,
 	}))
+
+	// Prometheus scrape endpoint. Behind a flag because exposing
+	// internal metrics on the public API port is an info-disclosure
+	// risk for naive deployments. Operators who scrape via a
+	// sidecar / service mesh / private network flip this on.
+	if cfg.EnableMetricsEndpoint && cfg.Metrics != nil {
+		mux.Handle("GET /metrics", cfg.Metrics.Handler())
+	}
 
 	// Admin API. Wired in only when an admin token is configured;
 	// without one, every request would fail 401 anyway and exposing
@@ -115,9 +139,21 @@ func New(cfg Config) *http.Server {
 	}
 
 	handler := chain(mux,
-		recoverer(logger),     // outermost: catches panics from any handler
-		requestLogger(logger), // logs every request after it completes
+		recoverer(logger),      // outermost: catches panics from any handler
+		requestLogger(logger),  // logs every request after it completes
+		metricsMiddleware(cfg), // observe every request into prom histograms
 	)
+
+	if cfg.EnableOTelTracing {
+		// otelhttp creates a span per request. The route name comes
+		// from go-http-mux's pattern matching; we override it via
+		// otelhttp.WithSpanNameFormatter for cleaner span names.
+		handler = otelhttp.NewHandler(handler, "http.server",
+			otelhttp.WithSpanNameFormatter(func(_ string, r *http.Request) string {
+				return r.Method + " " + r.URL.Path
+			}),
+		)
+	}
 
 	return &http.Server{
 		Addr:              cfg.Addr,
@@ -187,4 +223,37 @@ type statusRecorder struct {
 func (s *statusRecorder) WriteHeader(code int) {
 	s.status = code
 	s.ResponseWriter.WriteHeader(code)
+}
+
+// metricsMiddleware records every request into the Prometheus
+// histograms / counters. Route is the URL path collapsed to a known
+// label set so we don't blow up cardinality on path-encoded data.
+//
+// When cfg.Metrics is nil, the middleware is a no-op.
+func metricsMiddleware(cfg Config) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if cfg.Metrics == nil {
+				next.ServeHTTP(w, r)
+				return
+			}
+			start := time.Now()
+			rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+			next.ServeHTTP(rec, r)
+			cfg.Metrics.ObserveHTTP(r.Method, routeLabel(r.URL.Path), rec.status, time.Since(start))
+		})
+	}
+}
+
+// routeLabel collapses an arbitrary request path into one of the
+// gateway's known routes. Anything else folds into "other" so we
+// never emit unbounded path-shaped labels.
+func routeLabel(path string) string {
+	switch path {
+	case "/healthz", "/v1/tool-call", "/v1/mcp", "/metrics",
+		"/v1/admin/revoke", "/v1/admin/revocations":
+		return path
+	default:
+		return "other"
+	}
 }

@@ -231,6 +231,8 @@ when a `vX.Y.Z` git tag is pushed — see `.github/workflows/release.yml`.
 | `INTENTGATE_UPSTREAM_TIMEOUT_MS`| `30000` | Per-call upstream timeout in milliseconds.                                                               |
 | `INTENTGATE_POSTGRES_URL`       | _unset_ | libpq DSN for a durable revocation store. Empty falls back to in-memory (single-replica only).           |
 | `INTENTGATE_ADMIN_TOKEN`        | _unset_ | Shared secret guarding `/v1/admin/*` endpoints (revoke, list-revocations). Empty disables admin API.     |
+| `INTENTGATE_METRICS_ENABLED`    | _unset_ | `true` to register `GET /metrics` on the public port. Off by default — exposing metrics on the public port is an info-disclosure risk for naive deploys. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT`   | _unset_ | Standard OTel env var. When set, the gateway emits one span per HTTP request via OTLP gRPC.              |
 
 More configuration arrives with the intent extractor client, policy
 engine, and storage layers.
@@ -316,6 +318,36 @@ Or list current revocations:
 curl -sH "Authorization: Bearer $INTENTGATE_ADMIN_TOKEN" \
   http://localhost:8080/v1/admin/revocations | jq .
 ```
+
+## Observability
+
+The gateway exposes Prometheus metrics on `GET /metrics` (when
+`INTENTGATE_METRICS_ENABLED=true`) and emits OpenTelemetry spans (when
+`OTEL_EXPORTER_OTLP_ENDPOINT` is set).
+
+**Metrics published** (all under the `intentgate_gateway_` namespace):
+
+| Metric | Type | Labels | Purpose |
+| ------ | ---- | ------ | ------- |
+| `http_requests_total` | counter | `method`, `route`, `status` (class) | Request rate, error rate. |
+| `http_request_duration_seconds` | histogram | `method`, `route` | End-to-end gateway latency. |
+| `check_decisions_total` | counter | `check`, `decision` | How often each of the four checks (plus `upstream`) allows / blocks / skips. |
+| `check_duration_seconds` | histogram | `check` | Per-check evaluation cost. |
+| `upstream_forward_total` | counter | `outcome` | Successful forwards vs the four failure modes. |
+| `upstream_forward_duration_seconds` | histogram | `outcome` | Upstream call latency by outcome. |
+| `revocation_lookups_total` | counter | `result` | Hot-path revocation store activity. |
+| `revocation_lookup_duration_seconds` | histogram | _(none)_ | Revocation store latency. |
+
+Cardinality is bounded by design: no labels by tool name, agent ID, or
+JTI. Operators who want per-tool slices should enrich at the audit
+layer (which has no cardinality constraints) and aggregate downstream.
+
+**Tracing.** Setting `OTEL_EXPORTER_OTLP_ENDPOINT` (e.g.
+`otel-collector.observability:4317`) makes the gateway emit one span
+per HTTP request. The full set of OpenTelemetry SDK env vars is
+honored (samplers, resource attributes, etc.) — see the OTel docs.
+A request span shows the four checks plus the upstream forward as
+nested attributes.
 
 ## Audit events
 
@@ -462,7 +494,8 @@ deployments.
 - [x] Upstream proxying for `tools/call` — forwards authorized calls to a configured downstream MCP server (`INTENTGATE_UPSTREAM_URL`)
 - [x] Upstream proxying for `tools/list`, `initialize`, `ping` — pure passthrough; local fallbacks when no upstream so a standalone gateway still handshakes cleanly
 - [x] Token revocation list — durable Postgres store + in-memory dev fallback; admin API at `/v1/admin/revoke`; `igctl revoke` CLI
-- [ ] Prometheus metrics + OpenTelemetry tracing
+- [x] Prometheus `/metrics` endpoint with per-check counters and histograms (`INTENTGATE_METRICS_ENABLED=true`)
+- [x] OpenTelemetry tracing via OTLP gRPC (`OTEL_EXPORTER_OTLP_ENDPOINT`)
 - [ ] TypeScript SDK
 - [ ] Taint propagation (data-flow side of the budget check)
 - [ ] AI Act Annex IV evidence pack

@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/NetGnarus/intentgate-gateway/internal/audit"
@@ -15,6 +16,7 @@ import (
 	"github.com/NetGnarus/intentgate-gateway/internal/capability"
 	"github.com/NetGnarus/intentgate-gateway/internal/extractor"
 	"github.com/NetGnarus/intentgate-gateway/internal/mcp"
+	"github.com/NetGnarus/intentgate-gateway/internal/metrics"
 	"github.com/NetGnarus/intentgate-gateway/internal/policy"
 	"github.com/NetGnarus/intentgate-gateway/internal/revocation"
 	"github.com/NetGnarus/intentgate-gateway/internal/upstream"
@@ -66,6 +68,10 @@ type MCPHandlerConfig struct {
 	// deployments always supply one (memory-backed for single-replica
 	// dev, Postgres-backed for multi-replica or auditable installs).
 	Revocation revocation.Store
+	// Metrics is the Prometheus instrumentation. nil disables all
+	// observation calls (the helpers nil-check internally so handlers
+	// don't need to).
+	Metrics *metrics.Metrics
 }
 
 type mcpHandler struct {
@@ -183,7 +189,9 @@ func (h *mcpHandler) handleToolsCall(ctx context.Context, req *mcp.Request, r *h
 	)
 
 	// Check 1: capability.
+	capStart := time.Now()
 	capResult = h.runCapabilityCheck(r, params.Name)
+	h.cfg.Metrics.ObserveCheck("capability", checkDecision(capResult.err, capResult.summary), time.Since(capStart))
 	if capResult.err != nil {
 		h.cfg.Logger.Info("mcp tools/call blocked",
 			"tool", params.Name, "check", "capability",
@@ -195,7 +203,9 @@ func (h *mcpHandler) handleToolsCall(ctx context.Context, req *mcp.Request, r *h
 	}
 
 	// Check 2: intent.
+	intStart := time.Now()
 	intResult = h.runIntentCheck(ctx, r, params.Name, capResult.agentID)
+	h.cfg.Metrics.ObserveCheck("intent", checkDecision(intResult.err, intResult.summary), time.Since(intStart))
 	if intResult.err != nil {
 		h.cfg.Logger.Info("mcp tools/call blocked",
 			"tool", params.Name, "check", "intent",
@@ -207,7 +217,9 @@ func (h *mcpHandler) handleToolsCall(ctx context.Context, req *mcp.Request, r *h
 	}
 
 	// Check 3: policy (OPA / Rego).
+	polStart := time.Now()
 	polResult := h.runPolicyCheck(ctx, params, capResult, intResult)
+	h.cfg.Metrics.ObserveCheck("policy", checkDecision(polResult.err, polResult.summary), time.Since(polStart))
 	if polResult.err != nil {
 		h.cfg.Logger.Info("mcp tools/call blocked",
 			"tool", params.Name, "check", "policy",
@@ -219,7 +231,9 @@ func (h *mcpHandler) handleToolsCall(ctx context.Context, req *mcp.Request, r *h
 	}
 
 	// Check 4: budget.
+	bdgStart := time.Now()
 	bdgResult := h.runBudgetCheck(ctx, capResult)
+	h.cfg.Metrics.ObserveCheck("budget", checkDecision(bdgResult.err, bdgResult.summary), time.Since(bdgStart))
 	if bdgResult.err != nil {
 		h.cfg.Logger.Info("mcp tools/call blocked",
 			"tool", params.Name, "check", "budget",
@@ -309,7 +323,9 @@ func (h *mcpHandler) forwardToUpstream(
 			"failed to encode upstream request", err.Error())
 	}
 
+	upStart := time.Now()
 	upResp, err := h.cfg.Upstream.Forward(ctx, body)
+	upDur := time.Since(upStart)
 	if err != nil {
 		var uerr *upstream.Error
 		if errors.As(err, &uerr) {
@@ -321,6 +337,8 @@ func (h *mcpHandler) forwardToUpstream(
 				"status", uerr.Status,
 				"reason", reason,
 			)
+			h.cfg.Metrics.ObserveUpstream(uerr.Kind.String(), upDur)
+			h.cfg.Metrics.ObserveCheck("upstream", "block", upDur)
 			h.emitAudit(ctx, r, params, cap, intent,
 				audit.DecisionBlock, audit.CheckUpstream, reason, start, uerr.Status)
 			return mcp.NewErrorResponse(req.ID, mcp.CodeInternalError,
@@ -331,11 +349,15 @@ func (h *mcpHandler) forwardToUpstream(
 				})
 		}
 		// Defensive: any non-typed error from Forward is treated as transport.
+		h.cfg.Metrics.ObserveUpstream("transport", upDur)
+		h.cfg.Metrics.ObserveCheck("upstream", "block", upDur)
 		h.emitAudit(ctx, r, params, cap, intent,
 			audit.DecisionBlock, audit.CheckUpstream, err.Error(), start, 0)
 		return mcp.NewErrorResponse(req.ID, mcp.CodeInternalError,
 			"upstream error", err.Error())
 	}
+	h.cfg.Metrics.ObserveUpstream("success", upDur)
+	h.cfg.Metrics.ObserveCheck("upstream", "allow", upDur)
 
 	// Successful forward. Inject _intentgate metadata into the result
 	// object so the caller can see the gateway's decision summary
@@ -550,8 +572,12 @@ func (h *mcpHandler) runCapabilityCheck(r *http.Request, tool string) capability
 	}
 
 	if h.cfg.Revocation != nil {
+		revStart := time.Now()
 		revoked, rerr := h.cfg.Revocation.IsRevoked(r.Context(), tok.ID)
-		if rerr != nil {
+		revDur := time.Since(revStart)
+		switch {
+		case rerr != nil:
+			h.cfg.Metrics.ObserveRevocation("error", revDur)
 			h.cfg.Logger.Error("revocation lookup failed; failing closed",
 				"jti", tok.ID, "err", rerr)
 			return capabilityCheckResult{
@@ -559,13 +585,15 @@ func (h *mcpHandler) runCapabilityCheck(r *http.Request, tool string) capability
 				token:   tok,
 				err:     capError("revocation store unavailable; token rejected (fail-closed)"),
 			}
-		}
-		if revoked {
+		case revoked:
+			h.cfg.Metrics.ObserveRevocation("revoked", revDur)
 			return capabilityCheckResult{
 				agentID: tok.Subject,
 				token:   tok,
 				err:     capError("token revoked"),
 			}
+		default:
+			h.cfg.Metrics.ObserveRevocation("not_revoked", revDur)
 		}
 	}
 
@@ -744,6 +772,20 @@ func (h *mcpHandler) emitAudit(
 	}
 
 	h.cfg.Audit.Emit(ctx, e)
+}
+
+// checkDecision maps a (err, summary) pair from one of the runX
+// helpers to the bounded decision label used by Prometheus. Anything
+// with a non-nil error is "block"; an empty summary is "skip"
+// (the check was disabled / not applicable); otherwise "allow".
+func checkDecision(err error, summary string) string {
+	if err != nil {
+		return "block"
+	}
+	if strings.HasPrefix(summary, "skipped") {
+		return "skip"
+	}
+	return "allow"
 }
 
 // errMissingCapability is the static error returned when a token is
