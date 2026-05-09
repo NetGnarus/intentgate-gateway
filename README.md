@@ -229,6 +229,8 @@ when a `vX.Y.Z` git tag is pushed — see `.github/workflows/release.yml`.
 | `INTENTGATE_AUDIT_TARGET`       | `stdout`| Where audit events go. `stdout` (default) emits one JSON event per line; `none` disables emission.       |
 | `INTENTGATE_UPSTREAM_URL`       | _unset_ | URL of the downstream MCP tool server. When unset, the gateway returns a stub allow for any authorized call (useful for SDK tests / smokes). |
 | `INTENTGATE_UPSTREAM_TIMEOUT_MS`| `30000` | Per-call upstream timeout in milliseconds.                                                               |
+| `INTENTGATE_POSTGRES_URL`       | _unset_ | libpq DSN for a durable revocation store. Empty falls back to in-memory (single-replica only).           |
+| `INTENTGATE_ADMIN_TOKEN`        | _unset_ | Shared secret guarding `/v1/admin/*` endpoints (revoke, list-revocations). Empty disables admin API.     |
 
 More configuration arrives with the intent extractor client, policy
 engine, and storage layers.
@@ -266,6 +268,54 @@ make smoke-cap-strict
 
 `igctl decode <token>` pretty-prints a token's contents (without
 verifying the signature) for debugging.
+
+## Token revocation
+
+Capability tokens are stateless: once minted they remain valid until
+their expiry caveat fires. **Revocation** is the operator's emergency
+stop — invalidate a token before its natural expiry without rotating
+the master key (which would invalidate every other outstanding token).
+
+Configure a revocation store via `INTENTGATE_POSTGRES_URL`:
+
+```sh
+export INTENTGATE_POSTGRES_URL="postgres://intentgate:secret@db:5432/intentgate"
+export INTENTGATE_ADMIN_TOKEN="$(openssl rand -hex 32)"
+./bin/gateway
+```
+
+The gateway runs an embedded migration at startup creating a single
+`revoked_tokens` table. When unset, an in-memory store is used (fine
+for dev; lost on restart, single-replica only).
+
+The capability check consults the store on every request after the
+HMAC chain verifies. A revoked token is rejected with the same
+`-32010 capability_failed` JSON-RPC code as any other failed token,
+with reason `token revoked`. A revocation-store outage **fails closed**
+(treats every token as revoked); a partial outage of revocation must
+not become a quiet authorization bypass.
+
+To revoke a token, find its JTI and call the admin API:
+
+```sh
+# Find the JTI of a token you've issued
+./bin/igctl decode "$TOKEN" | jq .jti
+# "01HXY..."
+
+# Revoke it
+./bin/igctl revoke \
+  --gateway http://localhost:8080 \
+  --admin-token "$INTENTGATE_ADMIN_TOKEN" \
+  --jti 01HXY... \
+  --reason "leaked in PR comment"
+```
+
+Or list current revocations:
+
+```sh
+curl -sH "Authorization: Bearer $INTENTGATE_ADMIN_TOKEN" \
+  http://localhost:8080/v1/admin/revocations | jq .
+```
 
 ## Audit events
 
@@ -411,7 +461,7 @@ deployments.
 
 - [x] Upstream proxying for `tools/call` — forwards authorized calls to a configured downstream MCP server (`INTENTGATE_UPSTREAM_URL`)
 - [x] Upstream proxying for `tools/list`, `initialize`, `ping` — pure passthrough; local fallbacks when no upstream so a standalone gateway still handshakes cleanly
-- [ ] Token revocation list
+- [x] Token revocation list — durable Postgres store + in-memory dev fallback; admin API at `/v1/admin/revoke`; `igctl revoke` CLI
 - [ ] Prometheus metrics + OpenTelemetry tracing
 - [ ] TypeScript SDK
 - [ ] Taint propagation (data-flow side of the budget check)

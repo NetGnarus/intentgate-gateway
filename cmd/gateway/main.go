@@ -41,6 +41,16 @@
 //	                                checks (useful for SDK tests, smokes).
 //	INTENTGATE_UPSTREAM_TIMEOUT_MS  per-call upstream timeout in
 //	                                milliseconds. Default 30000.
+//	INTENTGATE_POSTGRES_URL         libpq-style DSN for a Postgres-backed
+//	                                revocation store, e.g.
+//	                                "postgres://user:pass@host:5432/db".
+//	                                When unset, an in-memory revocation
+//	                                store is used (single-replica only,
+//	                                lost on restart).
+//	INTENTGATE_ADMIN_TOKEN          shared secret guarding /v1/admin/*
+//	                                endpoints (revoke, list-revocations).
+//	                                When unset, admin endpoints are
+//	                                disabled (404 / not registered).
 package main
 
 import (
@@ -61,6 +71,7 @@ import (
 	"github.com/NetGnarus/intentgate-gateway/internal/capability"
 	"github.com/NetGnarus/intentgate-gateway/internal/extractor"
 	"github.com/NetGnarus/intentgate-gateway/internal/policy"
+	"github.com/NetGnarus/intentgate-gateway/internal/revocation"
 	"github.com/NetGnarus/intentgate-gateway/internal/server"
 	"github.com/NetGnarus/intentgate-gateway/internal/upstream"
 	"github.com/redis/go-redis/v9"
@@ -85,6 +96,8 @@ func main() {
 	auditTarget := envOr("INTENTGATE_AUDIT_TARGET", "stdout")
 	upstreamURL := envOr("INTENTGATE_UPSTREAM_URL", "")
 	upstreamTimeoutMS := envOr("INTENTGATE_UPSTREAM_TIMEOUT_MS", "")
+	postgresURL := envOr("INTENTGATE_POSTGRES_URL", "")
+	adminToken := envOr("INTENTGATE_ADMIN_TOKEN", "")
 
 	masterKey, err := loadMasterKey(logger)
 	if err != nil {
@@ -122,6 +135,17 @@ func main() {
 		os.Exit(1)
 	}
 
+	revocationStore, revocationDesc, err := loadRevocation(context.Background(), logger, postgresURL)
+	if err != nil {
+		logger.Error("failed to initialize revocation store", "err", err)
+		os.Exit(1)
+	}
+
+	adminTokenDesc := "disabled"
+	if adminToken != "" {
+		adminTokenDesc = "configured"
+	}
+
 	logger.Info("intentgate gateway starting",
 		"addr", addr,
 		"version", version,
@@ -133,6 +157,8 @@ func main() {
 		"budget_store", budgetSource,
 		"audit_target", auditDesc,
 		"upstream", upstreamDesc,
+		"revocation_store", revocationDesc,
+		"admin_api", adminTokenDesc,
 	)
 
 	srv := server.New(server.Config{
@@ -148,6 +174,8 @@ func main() {
 		RequireBudget:     requireBudget,
 		Audit:             auditEmitter,
 		Upstream:          upstreamClient,
+		Revocation:        revocationStore,
+		AdminToken:        adminToken,
 	})
 
 	errCh := make(chan error, 1)
@@ -297,4 +325,27 @@ func loadUpstream(logger *slog.Logger, url, timeoutMS string) (*upstream.Client,
 		return nil, "", err
 	}
 	return c, fmt.Sprintf("%s (timeout %s)", url, timeout), nil
+}
+
+// loadRevocation constructs the revocation store. When postgresURL is
+// set, a PostgresStore is returned (with the embedded migration
+// applied). Otherwise an in-memory store is used.
+//
+// The Postgres store keeps its own connection pool and is intentionally
+// not wired into a graceful-shutdown path here — the connection pool
+// will close when the process exits, which is the right behavior for
+// this lightweight service. A future operator-facing graceful-shutdown
+// pass should call store.Close() to flush in-flight queries cleanly.
+func loadRevocation(ctx context.Context, logger *slog.Logger, postgresURL string) (revocation.Store, string, error) {
+	if postgresURL == "" {
+		logger.Info("revocation store: in-memory (single-replica only, lost on restart)",
+			"hint", "set INTENTGATE_POSTGRES_URL for durable, multi-replica-safe revocation")
+		return revocation.NewMemoryStore(), "memory", nil
+	}
+	store, err := revocation.NewPostgresStore(ctx, postgresURL)
+	if err != nil {
+		return nil, "", err
+	}
+	logger.Info("revocation store: postgres", "dsn_set", true)
+	return store, "postgres", nil
 }

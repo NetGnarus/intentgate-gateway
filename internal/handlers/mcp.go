@@ -16,6 +16,7 @@ import (
 	"github.com/NetGnarus/intentgate-gateway/internal/extractor"
 	"github.com/NetGnarus/intentgate-gateway/internal/mcp"
 	"github.com/NetGnarus/intentgate-gateway/internal/policy"
+	"github.com/NetGnarus/intentgate-gateway/internal/revocation"
 	"github.com/NetGnarus/intentgate-gateway/internal/upstream"
 )
 
@@ -59,6 +60,12 @@ type MCPHandlerConfig struct {
 	// (useful for SDK tests, smoke targets, and any deployment that
 	// hasn't wired a real upstream yet).
 	Upstream *upstream.Client
+	// Revocation is the store the capability check consults to reject
+	// tokens revoked after issuance. When nil, the revocation step is
+	// skipped (useful for tests and minimal dev installs). Production
+	// deployments always supply one (memory-backed for single-replica
+	// dev, Postgres-backed for multi-replica or auditable installs).
+	Revocation revocation.Store
 }
 
 type mcpHandler struct {
@@ -505,8 +512,20 @@ type budgetCheckResult struct {
 	err     error
 }
 
-// runCapabilityCheck verifies the Bearer token's HMAC chain and
-// evaluates its caveats against the requested tool.
+// runCapabilityCheck verifies the Bearer token's HMAC chain, consults
+// the revocation store, and evaluates the token's caveats against the
+// requested tool. Returns the first failure; on success, the verified
+// token (with subject filled in) is included in the result for later
+// stages.
+//
+// Revocation is checked after signature verification but before caveat
+// evaluation: if a genuine-but-revoked token is presented, the
+// resulting error says "token revoked" rather than "tool not allowed",
+// which is the more accurate audit story.
+//
+// A non-nil error from the revocation store fails closed (treats the
+// token as revoked). A partial outage of the revocation store must
+// not become a quiet authorization bypass.
 func (h *mcpHandler) runCapabilityCheck(r *http.Request, tool string) capabilityCheckResult {
 	encoded, err := capability.FromAuthorizationHeader(r.Header.Get("Authorization"))
 	if err != nil {
@@ -529,6 +548,27 @@ func (h *mcpHandler) runCapabilityCheck(r *http.Request, tool string) capability
 	if err := tok.Verify(h.cfg.MasterKey); err != nil {
 		return capabilityCheckResult{err: err}
 	}
+
+	if h.cfg.Revocation != nil {
+		revoked, rerr := h.cfg.Revocation.IsRevoked(r.Context(), tok.ID)
+		if rerr != nil {
+			h.cfg.Logger.Error("revocation lookup failed; failing closed",
+				"jti", tok.ID, "err", rerr)
+			return capabilityCheckResult{
+				agentID: tok.Subject,
+				token:   tok,
+				err:     capError("revocation store unavailable; token rejected (fail-closed)"),
+			}
+		}
+		if revoked {
+			return capabilityCheckResult{
+				agentID: tok.Subject,
+				token:   tok,
+				err:     capError("token revoked"),
+			}
+		}
+	}
+
 	if err := tok.Check(capability.RequestContext{
 		AgentID: tok.Subject,
 		Tool:    tool,

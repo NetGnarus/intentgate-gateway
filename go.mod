@@ -3,6 +3,7 @@ module github.com/NetGnarus/intentgate-gateway
 go 1.25.0
 
 require (
+	github.com/jackc/pgx/v5 v5.9.2
 	github.com/open-policy-agent/opa v1.16.1
 	github.com/redis/go-redis/v9 v9.19.0
 )
@@ -14,6 +15,9 @@ require (
 	github.com/gobwas/glob v0.2.3 // indirect
 	github.com/goccy/go-json v0.10.6 // indirect
 	github.com/google/uuid v1.6.0 // indirect
+	github.com/jackc/pgpassfile v1.0.0 // indirect
+	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
+	github.com/jackc/puddle/v2 v2.2.2 // indirect
 	github.com/lestrrat-go/blackmagic v1.0.4 // indirect
 	github.com/lestrrat-go/dsig v1.2.1 // indirect
 	github.com/lestrrat-go/dsig-secp256k1 v1.0.0 // indirect
@@ -36,5 +40,6 @@ require (
 	golang.org/x/crypto v0.50.0 // indirect
 	golang.org/x/sync v0.20.0 // indirect
 	golang.org/x/sys v0.43.0 // indirect
+	golang.org/x/text v0.36.0 // indirect
 	sigs.k8s.io/yaml v1.6.0 // indirect
 )

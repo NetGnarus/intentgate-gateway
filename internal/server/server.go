@@ -11,6 +11,7 @@ import (
 	"github.com/NetGnarus/intentgate-gateway/internal/extractor"
 	"github.com/NetGnarus/intentgate-gateway/internal/handlers"
 	"github.com/NetGnarus/intentgate-gateway/internal/policy"
+	"github.com/NetGnarus/intentgate-gateway/internal/revocation"
 	"github.com/NetGnarus/intentgate-gateway/internal/upstream"
 )
 
@@ -52,6 +53,13 @@ type Config struct {
 	// no upstream is configured and the gateway returns its stub allow
 	// for authorized calls. Production deployments always supply one.
 	Upstream *upstream.Client
+	// Revocation is the store the capability check consults to reject
+	// tokens revoked after issuance. nil means the revocation step is
+	// skipped (dev convenience). Production supplies a real store.
+	Revocation revocation.Store
+	// AdminToken is the shared secret the /v1/admin/* endpoints check
+	// in constant time. When empty, admin endpoints are disabled.
+	AdminToken string
 }
 
 // New constructs an *http.Server with all gateway routes and middleware.
@@ -88,7 +96,23 @@ func New(cfg Config) *http.Server {
 		RequireBudget:     cfg.RequireBudget,
 		Audit:             cfg.Audit,
 		Upstream:          cfg.Upstream,
+		Revocation:        cfg.Revocation,
 	}))
+
+	// Admin API. Wired in only when an admin token is configured;
+	// without one, every request would fail 401 anyway and exposing
+	// the routes adds no value. With one, the operator (or admin UI)
+	// can revoke tokens and inspect the revocation list.
+	if cfg.AdminToken != "" {
+		adminCfg := handlers.AdminConfig{
+			Logger:     logger,
+			AdminToken: cfg.AdminToken,
+			Revocation: cfg.Revocation,
+			Audit:      cfg.Audit,
+		}
+		mux.Handle("POST /v1/admin/revoke", handlers.NewAdminRevokeHandler(adminCfg))
+		mux.Handle("GET /v1/admin/revocations", handlers.NewAdminRevocationsListHandler(adminCfg))
+	}
 
 	handler := chain(mux,
 		recoverer(logger),     // outermost: catches panics from any handler
