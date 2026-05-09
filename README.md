@@ -121,8 +121,24 @@ The MCP response wraps the gateway's decision in `result._intentgate`
 }
 ```
 
-Methods other than `tools/call` currently return a JSON-RPC
-`MethodNotFound` (-32601) error.
+Three additional MCP methods are accepted as **pure passthroughs**
+(no four-check pipeline, no audit event):
+
+- `initialize` — JSON-RPC handshake. Forwarded to the upstream when
+  `INTENTGATE_UPSTREAM_URL` is set; falls back to a minimal local
+  response (advertising `serverInfo.name = "intentgate"`) so a
+  standalone gateway still completes a clean MCP handshake.
+- `tools/list` — tool discovery. Forwarded to the upstream when set;
+  returns `{"tools": []}` otherwise.
+- `ping` — keepalive. Forwarded to the upstream when set; returns
+  `{}` otherwise.
+
+These don't carry tool names so the four checks (capability, intent,
+policy, budget) don't apply. Audit events are reserved for `tools/call`
+authorization decisions; flooding the audit channel with handshake
+noise would dilute SOC signal.
+
+Other methods return JSON-RPC `MethodNotFound` (-32601).
 
 ## Use it from an agent
 
@@ -394,7 +410,7 @@ agent at the gateway, and exercise the full four-check pipeline.
 deployments.
 
 - [x] Upstream proxying for `tools/call` — forwards authorized calls to a configured downstream MCP server (`INTENTGATE_UPSTREAM_URL`)
-- [ ] Upstream proxying for `tools/list`, `initialize`, `ping` (no auth applies — pure passthrough)
+- [x] Upstream proxying for `tools/list`, `initialize`, `ping` — pure passthrough; local fallbacks when no upstream so a standalone gateway still handshakes cleanly
 - [ ] Token revocation list
 - [ ] Prometheus metrics + OpenTelemetry tracing
 - [ ] TypeScript SDK

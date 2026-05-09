@@ -128,6 +128,18 @@ func (h *mcpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		h.write(w, resp)
 
+	case mcp.MethodToolsList, mcp.MethodInitialize, mcp.MethodPing:
+		// Discovery + lifecycle methods: pure passthrough to the upstream
+		// when configured, minimal local fallback otherwise. No
+		// four-check pipeline (no tool name to authorize) and no audit
+		// event (audit is for authorization decisions, not handshake).
+		resp := h.handlePassthrough(r.Context(), &req, body)
+		if notification {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		h.write(w, resp)
+
 	default:
 		h.cfg.Logger.Info("mcp method not implemented",
 			"method", req.Method,
@@ -346,6 +358,100 @@ func (h *mcpHandler) forwardToUpstream(
 		audit.DecisionAllow, audit.CheckUpstream, "forwarded", start, upResp.Status)
 
 	return &parsed
+}
+
+// handlePassthrough handles MCP discovery and lifecycle methods —
+// tools/list, initialize, ping — that don't fit the four-check
+// authorization pipeline (no tool name to evaluate). When an upstream
+// is configured, the request is forwarded verbatim and the upstream's
+// response is returned unchanged. When no upstream is configured, a
+// minimal local response keeps an MCP handshake working against a
+// standalone gateway:
+//
+//   - initialize  → advertises protocolVersion + serverInfo
+//   - tools/list  → empty list (no upstream means no real tools)
+//   - ping        → empty success
+//
+// No _intentgate metadata is injected (these aren't authorization
+// decisions) and no audit event is emitted (audit is reserved for
+// tools/call decisions; flooding it with handshake noise would dilute
+// signal-to-noise for SOC analysts).
+func (h *mcpHandler) handlePassthrough(ctx context.Context, req *mcp.Request, body []byte) *mcp.Response {
+	if h.cfg.Upstream != nil {
+		upResp, err := h.cfg.Upstream.Forward(ctx, body)
+		if err != nil {
+			var uerr *upstream.Error
+			if errors.As(err, &uerr) {
+				h.cfg.Logger.Warn("upstream passthrough failed",
+					"method", req.Method,
+					"kind", uerr.Kind.String(),
+					"status", uerr.Status,
+					"err", uerr.Error(),
+				)
+				return mcp.NewErrorResponse(req.ID, mcp.CodeInternalError,
+					"upstream "+uerr.Kind.String(),
+					map[string]any{
+						"upstream_status": uerr.Status,
+						"detail":          uerr.Error(),
+					})
+			}
+			return mcp.NewErrorResponse(req.ID, mcp.CodeInternalError,
+				"upstream error", err.Error())
+		}
+
+		var parsed mcp.Response
+		if err := json.Unmarshal(upResp.Body, &parsed); err != nil {
+			h.cfg.Logger.Error("upstream returned non-JSON-RPC body",
+				"method", req.Method, "err", err)
+			return mcp.NewErrorResponse(req.ID, mcp.CodeInternalError,
+				"upstream returned non-JSON-RPC body", err.Error())
+		}
+		return &parsed
+	}
+
+	// No upstream configured — return a minimal local response so an
+	// MCP handshake against a stub-mode gateway still completes cleanly.
+	switch req.Method {
+	case mcp.MethodInitialize:
+		resp, err := mcp.NewResultResponse(req.ID, mcp.InitializeResult{
+			ProtocolVersion: "2025-03-26",
+			ServerInfo: mcp.ServerInfo{
+				Name:    "intentgate",
+				Version: "0.2",
+			},
+			Capabilities: map[string]any{
+				"tools": map[string]any{},
+			},
+		})
+		if err != nil {
+			return mcp.NewErrorResponse(req.ID, mcp.CodeInternalError,
+				"failed to encode initialize result", err.Error())
+		}
+		return resp
+
+	case mcp.MethodToolsList:
+		resp, err := mcp.NewResultResponse(req.ID, map[string]any{
+			"tools": []any{},
+		})
+		if err != nil {
+			return mcp.NewErrorResponse(req.ID, mcp.CodeInternalError,
+				"failed to encode tools/list result", err.Error())
+		}
+		return resp
+
+	case mcp.MethodPing:
+		resp, err := mcp.NewResultResponse(req.ID, map[string]any{})
+		if err != nil {
+			return mcp.NewErrorResponse(req.ID, mcp.CodeInternalError,
+				"failed to encode ping result", err.Error())
+		}
+		return resp
+	}
+
+	// Unreachable: ServeHTTP only dispatches the three methods above to
+	// this handler. Defensive fallback in case the dispatch is widened.
+	return mcp.NewErrorResponse(req.ID, mcp.CodeMethodNotFound,
+		"method not implemented in passthrough: "+req.Method, nil)
 }
 
 // injectIntentGateMetadata adds (or replaces) the "_intentgate"

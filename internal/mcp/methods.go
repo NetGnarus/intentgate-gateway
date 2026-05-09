@@ -71,3 +71,24 @@ func ParseToolCallParams(raw json.RawMessage) (*ToolCallParams, error) {
 	}
 	return &p, nil
 }
+
+// ServerInfo identifies the MCP server in an initialize response. The
+// gateway uses this when no upstream is configured so a stub-mode
+// handshake still produces a valid initialize result.
+type ServerInfo struct {
+	Name    string `json:"name"`
+	Version string `json:"version"`
+}
+
+// InitializeResult is the result object for a JSON-RPC initialize
+// request. Returned by the gateway only when no upstream is configured;
+// otherwise the upstream's initialize result is forwarded unchanged.
+//
+// ProtocolVersion follows the MCP spec's date-stamped versioning. The
+// Capabilities map is intentionally typed as any so future MCP
+// capability fields don't require gateway changes.
+type InitializeResult struct {
+	ProtocolVersion string         `json:"protocolVersion"`
+	ServerInfo      ServerInfo     `json:"serverInfo"`
+	Capabilities    map[string]any `json:"capabilities"`
+}
