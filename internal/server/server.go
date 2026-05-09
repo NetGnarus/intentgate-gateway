@@ -11,6 +11,7 @@ import (
 	"github.com/NetGnarus/intentgate-gateway/internal/extractor"
 	"github.com/NetGnarus/intentgate-gateway/internal/handlers"
 	"github.com/NetGnarus/intentgate-gateway/internal/policy"
+	"github.com/NetGnarus/intentgate-gateway/internal/upstream"
 )
 
 // Config configures a new gateway server.
@@ -47,6 +48,10 @@ type Config struct {
 	// Audit is the emitter for one-event-per-decision audit records.
 	// nil falls back to a NullEmitter (no events emitted).
 	Audit audit.Emitter
+	// Upstream is the configured downstream MCP tool server. nil means
+	// no upstream is configured and the gateway returns its stub allow
+	// for authorized calls. Production deployments always supply one.
+	Upstream *upstream.Client
 }
 
 // New constructs an *http.Server with all gateway routes and middleware.
@@ -82,6 +87,7 @@ func New(cfg Config) *http.Server {
 		Budget:            cfg.Budget,
 		RequireBudget:     cfg.RequireBudget,
 		Audit:             cfg.Audit,
+		Upstream:          cfg.Upstream,
 	}))
 
 	handler := chain(mux,

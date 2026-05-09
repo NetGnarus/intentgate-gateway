@@ -47,8 +47,13 @@ const (
 )
 
 // Check identifies which stage produced the decision. Empty for an
-// allow that passed every stage; one of the four named values for a
-// block.
+// allow that passed every stage; one of the named values otherwise.
+//
+// CheckUpstream is set for events about the post-pipeline forward to
+// the configured upstream tool server. An allow + CheckUpstream means
+// "the gateway authorized the call AND successfully forwarded it"; a
+// block + CheckUpstream means "the gateway authorized the call but
+// could not deliver it" (timeout, transport error, upstream 5xx).
 type Check string
 
 const (
@@ -57,6 +62,7 @@ const (
 	CheckIntent     Check = "intent"
 	CheckPolicy     Check = "policy"
 	CheckBudget     Check = "budget"
+	CheckUpstream   Check = "upstream"
 )
 
 // Event is the on-the-wire audit record.
@@ -96,6 +102,12 @@ type Event struct {
 
 	// RemoteIP is the agent's source address as seen by the gateway.
 	RemoteIP string `json:"remote_ip,omitempty"`
+
+	// UpstreamStatus is the HTTP status code returned by the configured
+	// upstream tool server, when a forward was attempted. Zero when the
+	// gateway was in stub mode (no upstream configured) or when the
+	// failure happened before any HTTP response (transport, timeout).
+	UpstreamStatus int `json:"upstream_status,omitempty"`
 }
 
 // NewEvent constructs an Event with the timestamp, event name, and

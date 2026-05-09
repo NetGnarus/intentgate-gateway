@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -15,6 +16,7 @@ import (
 	"github.com/NetGnarus/intentgate-gateway/internal/extractor"
 	"github.com/NetGnarus/intentgate-gateway/internal/mcp"
 	"github.com/NetGnarus/intentgate-gateway/internal/policy"
+	"github.com/NetGnarus/intentgate-gateway/internal/upstream"
 )
 
 // MCPHandlerConfig configures the /v1/mcp handler.
@@ -52,6 +54,11 @@ type MCPHandlerConfig struct {
 	// When nil, a NullEmitter is substituted so the handler always has
 	// a safe target.
 	Audit audit.Emitter
+	// Upstream forwards authorized tools/call requests to a downstream
+	// MCP tool server. When nil, the handler returns a stub allow result
+	// (useful for SDK tests, smoke targets, and any deployment that
+	// hasn't wired a real upstream yet).
+	Upstream *upstream.Client
 }
 
 type mcpHandler struct {
@@ -163,7 +170,7 @@ func (h *mcpHandler) handleToolsCall(ctx context.Context, req *mcp.Request, r *h
 			"tool", params.Name, "check", "capability",
 			"reason", capResult.err.Error())
 		h.emitAudit(ctx, r, params, capResult, intResult,
-			audit.DecisionBlock, audit.CheckCapability, capResult.err.Error(), start)
+			audit.DecisionBlock, audit.CheckCapability, capResult.err.Error(), start, 0)
 		return mcp.NewErrorResponse(req.ID, mcp.CodeCapabilityFailed,
 			"capability check failed", capResult.err.Error())
 	}
@@ -175,7 +182,7 @@ func (h *mcpHandler) handleToolsCall(ctx context.Context, req *mcp.Request, r *h
 			"tool", params.Name, "check", "intent",
 			"agent", capResult.agentID, "reason", intResult.err.Error())
 		h.emitAudit(ctx, r, params, capResult, intResult,
-			audit.DecisionBlock, audit.CheckIntent, intResult.err.Error(), start)
+			audit.DecisionBlock, audit.CheckIntent, intResult.err.Error(), start, 0)
 		return mcp.NewErrorResponse(req.ID, mcp.CodeIntentFailed,
 			"intent check failed", intResult.err.Error())
 	}
@@ -187,7 +194,7 @@ func (h *mcpHandler) handleToolsCall(ctx context.Context, req *mcp.Request, r *h
 			"tool", params.Name, "check", "policy",
 			"agent", capResult.agentID, "reason", polResult.err.Error())
 		h.emitAudit(ctx, r, params, capResult, intResult,
-			audit.DecisionBlock, audit.CheckPolicy, polResult.err.Error(), start)
+			audit.DecisionBlock, audit.CheckPolicy, polResult.err.Error(), start, 0)
 		return mcp.NewErrorResponse(req.ID, mcp.CodePolicyFailed,
 			"policy check failed", polResult.err.Error())
 	}
@@ -199,7 +206,7 @@ func (h *mcpHandler) handleToolsCall(ctx context.Context, req *mcp.Request, r *h
 			"tool", params.Name, "check", "budget",
 			"agent", capResult.agentID, "reason", bdgResult.err.Error())
 		h.emitAudit(ctx, r, params, capResult, intResult,
-			audit.DecisionBlock, audit.CheckBudget, bdgResult.err.Error(), start)
+			audit.DecisionBlock, audit.CheckBudget, bdgResult.err.Error(), start, 0)
 		return mcp.NewErrorResponse(req.ID, mcp.CodeBudgetFailed,
 			"budget check failed", bdgResult.err.Error())
 	}
@@ -209,7 +216,7 @@ func (h *mcpHandler) handleToolsCall(ctx context.Context, req *mcp.Request, r *h
 	for k := range params.Arguments {
 		argKeys = append(argKeys, k)
 	}
-	h.cfg.Logger.Info("mcp tools/call",
+	h.cfg.Logger.Info("mcp tools/call authorized",
 		"tool", params.Name,
 		"agent", capResult.agentID,
 		"capability", capResult.summary,
@@ -218,18 +225,25 @@ func (h *mcpHandler) handleToolsCall(ctx context.Context, req *mcp.Request, r *h
 		"budget", bdgResult.summary,
 		"arg_keys", argKeys,
 	)
+
+	// All four checks passed. Either forward to the configured upstream
+	// or return the stub allow.
+	if h.cfg.Upstream != nil {
+		return h.forwardToUpstream(ctx, r, req, params, capResult, intResult, start)
+	}
+
 	h.emitAudit(ctx, r, params, capResult, intResult,
-		audit.DecisionAllow, audit.CheckNone, "all four checks passed", start)
+		audit.DecisionAllow, audit.CheckNone, "all four checks passed (stub upstream)", start, 0)
 
 	result := mcp.ToolCallResult{
 		Content: []mcp.ContentBlock{{
 			Type: "text",
-			Text: "stub: pipeline not implemented; allow",
+			Text: "stub: no upstream configured; gateway authorized this call",
 		}},
 		IsError: false,
 		IntentGate: &mcp.IntentGateMetadata{
 			Decision:  "allow",
-			Reason:    "stub: pipeline not implemented",
+			Reason:    "stub: no upstream configured",
 			LatencyMS: time.Since(start).Milliseconds(),
 		},
 	}
@@ -239,6 +253,120 @@ func (h *mcpHandler) handleToolsCall(ctx context.Context, req *mcp.Request, r *h
 			"failed to encode result", err.Error())
 	}
 	return resp
+}
+
+// forwardToUpstream re-serializes the validated request, sends it to
+// the configured upstream MCP server, and translates the upstream
+// response (or failure) back to the caller.
+//
+// Successful forwards inject the gateway's _intentgate metadata into
+// the upstream's result object. Operational failures (timeout,
+// transport, non-2xx) collapse into a JSON-RPC error with the
+// gateway's CodeInternalError plus a structured data field, AND emit
+// an audit event with check=upstream so SOC analysts can distinguish
+// "blocked by gateway" from "couldn't reach upstream".
+//
+// Upstream-side JSON-RPC errors (a 200 OK carrying an error object —
+// e.g. tool says "db unavailable") are NOT operational failures here:
+// the upstream answered, the answer just says no. The body is
+// returned to the caller unchanged.
+func (h *mcpHandler) forwardToUpstream(
+	ctx context.Context,
+	r *http.Request,
+	req *mcp.Request,
+	params *mcp.ToolCallParams,
+	cap capabilityCheckResult,
+	intent intentCheckResult,
+	start time.Time,
+) *mcp.Response {
+	// Re-serialize the validated request so we forward exactly the
+	// envelope the gateway accepted (preserves id and params).
+	body, err := json.Marshal(req)
+	if err != nil {
+		h.emitAudit(ctx, r, params, cap, intent,
+			audit.DecisionBlock, audit.CheckUpstream,
+			"failed to re-serialize request: "+err.Error(), start, 0)
+		return mcp.NewErrorResponse(req.ID, mcp.CodeInternalError,
+			"failed to encode upstream request", err.Error())
+	}
+
+	upResp, err := h.cfg.Upstream.Forward(ctx, body)
+	if err != nil {
+		var uerr *upstream.Error
+		if errors.As(err, &uerr) {
+			reason := uerr.Error()
+			h.cfg.Logger.Warn("upstream forward failed",
+				"tool", params.Name,
+				"agent", cap.agentID,
+				"kind", uerr.Kind.String(),
+				"status", uerr.Status,
+				"reason", reason,
+			)
+			h.emitAudit(ctx, r, params, cap, intent,
+				audit.DecisionBlock, audit.CheckUpstream, reason, start, uerr.Status)
+			return mcp.NewErrorResponse(req.ID, mcp.CodeInternalError,
+				"upstream "+uerr.Kind.String(),
+				map[string]any{
+					"upstream_status": uerr.Status,
+					"detail":          reason,
+				})
+		}
+		// Defensive: any non-typed error from Forward is treated as transport.
+		h.emitAudit(ctx, r, params, cap, intent,
+			audit.DecisionBlock, audit.CheckUpstream, err.Error(), start, 0)
+		return mcp.NewErrorResponse(req.ID, mcp.CodeInternalError,
+			"upstream error", err.Error())
+	}
+
+	// Successful forward. Inject _intentgate metadata into the result
+	// object so the caller can see the gateway's decision summary
+	// alongside the tool's response.
+	var parsed mcp.Response
+	if err := json.Unmarshal(upResp.Body, &parsed); err != nil {
+		h.cfg.Logger.Error("upstream returned non-JSON-RPC body",
+			"tool", params.Name,
+			"err", err,
+		)
+		h.emitAudit(ctx, r, params, cap, intent,
+			audit.DecisionBlock, audit.CheckUpstream,
+			"upstream returned non-JSON-RPC body: "+err.Error(), start, upResp.Status)
+		return mcp.NewErrorResponse(req.ID, mcp.CodeInternalError,
+			"upstream returned non-JSON-RPC body", err.Error())
+	}
+
+	if parsed.Result != nil {
+		parsed.Result = injectIntentGateMetadata(parsed.Result, mcp.IntentGateMetadata{
+			Decision:  "allow",
+			Reason:    "forwarded",
+			LatencyMS: time.Since(start).Milliseconds(),
+		})
+	}
+
+	h.emitAudit(ctx, r, params, cap, intent,
+		audit.DecisionAllow, audit.CheckUpstream, "forwarded", start, upResp.Status)
+
+	return &parsed
+}
+
+// injectIntentGateMetadata adds (or replaces) the "_intentgate"
+// vendor-extension field on the upstream's result object. If the
+// result isn't a JSON object (unusual but legal), the original bytes
+// are returned unchanged.
+func injectIntentGateMetadata(result json.RawMessage, meta mcp.IntentGateMetadata) json.RawMessage {
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(result, &obj); err != nil {
+		return result
+	}
+	encoded, err := json.Marshal(meta)
+	if err != nil {
+		return result
+	}
+	obj["_intentgate"] = encoded
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return result
+	}
+	return out
 }
 
 // capabilityCheckResult bundles what the capability stage learned.
@@ -442,6 +570,7 @@ func (h *mcpHandler) emitAudit(
 	check audit.Check,
 	reason string,
 	start time.Time,
+	upstreamStatus int,
 ) {
 	if h.cfg.Audit == nil {
 		return
@@ -459,6 +588,7 @@ func (h *mcpHandler) emitAudit(
 	e.ArgKeys = argKeys
 	e.LatencyMS = time.Since(start).Milliseconds()
 	e.RemoteIP = r.RemoteAddr
+	e.UpstreamStatus = upstreamStatus
 
 	if cap.token != nil {
 		e.CapabilityTokenID = cap.token.ID

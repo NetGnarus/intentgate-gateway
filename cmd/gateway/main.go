@@ -34,6 +34,13 @@
 //	                                at the budget stage.
 //	INTENTGATE_AUDIT_TARGET         where to emit audit events. Recognized
 //	                                values: "stdout" (default), "none".
+//	INTENTGATE_UPSTREAM_URL         URL of the downstream MCP tool server
+//	                                authorized calls are forwarded to. When
+//	                                unset, the gateway returns a stub allow
+//	                                for any call that passes the four
+//	                                checks (useful for SDK tests, smokes).
+//	INTENTGATE_UPSTREAM_TIMEOUT_MS  per-call upstream timeout in
+//	                                milliseconds. Default 30000.
 package main
 
 import (
@@ -45,6 +52,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -54,6 +62,7 @@ import (
 	"github.com/NetGnarus/intentgate-gateway/internal/extractor"
 	"github.com/NetGnarus/intentgate-gateway/internal/policy"
 	"github.com/NetGnarus/intentgate-gateway/internal/server"
+	"github.com/NetGnarus/intentgate-gateway/internal/upstream"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -74,6 +83,8 @@ func main() {
 	policyFile := envOr("INTENTGATE_POLICY_FILE", "")
 	redisURL := envOr("INTENTGATE_REDIS_URL", "")
 	auditTarget := envOr("INTENTGATE_AUDIT_TARGET", "stdout")
+	upstreamURL := envOr("INTENTGATE_UPSTREAM_URL", "")
+	upstreamTimeoutMS := envOr("INTENTGATE_UPSTREAM_TIMEOUT_MS", "")
 
 	masterKey, err := loadMasterKey(logger)
 	if err != nil {
@@ -105,6 +116,12 @@ func main() {
 		os.Exit(1)
 	}
 
+	upstreamClient, upstreamDesc, err := loadUpstream(logger, upstreamURL, upstreamTimeoutMS)
+	if err != nil {
+		logger.Error("failed to configure upstream", "err", err)
+		os.Exit(1)
+	}
+
 	logger.Info("intentgate gateway starting",
 		"addr", addr,
 		"version", version,
@@ -115,6 +132,7 @@ func main() {
 		"policy_source", policySource,
 		"budget_store", budgetSource,
 		"audit_target", auditDesc,
+		"upstream", upstreamDesc,
 	)
 
 	srv := server.New(server.Config{
@@ -129,6 +147,7 @@ func main() {
 		Budget:            budgetStore,
 		RequireBudget:     requireBudget,
 		Audit:             auditEmitter,
+		Upstream:          upstreamClient,
 	})
 
 	errCh := make(chan error, 1)
@@ -242,4 +261,40 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// loadUpstream constructs the upstream MCP client from environment.
+// Returns (nil, "stub (none)", nil) when INTENTGATE_UPSTREAM_URL is
+// unset — that's the dev-friendly path where the gateway returns its
+// own stub allow for any call passing the four checks.
+//
+// When the URL is set, the timeout is read from
+// INTENTGATE_UPSTREAM_TIMEOUT_MS (default 30000), the URL is validated
+// at startup so a misconfigured deployment fails fast, and the
+// human-readable description used in the startup log line includes the
+// URL and timeout for operator visibility.
+func loadUpstream(logger *slog.Logger, url, timeoutMS string) (*upstream.Client, string, error) {
+	if url == "" {
+		logger.Info("upstream not configured: returning stub allow for authorized calls",
+			"hint", "set INTENTGATE_UPSTREAM_URL to forward to a real MCP tool server")
+		return nil, "stub (none)", nil
+	}
+
+	timeout := upstream.DefaultTimeout
+	if timeoutMS != "" {
+		ms, err := strconv.Atoi(timeoutMS)
+		if err != nil {
+			return nil, "", fmt.Errorf("INTENTGATE_UPSTREAM_TIMEOUT_MS: %w", err)
+		}
+		if ms <= 0 {
+			return nil, "", fmt.Errorf("INTENTGATE_UPSTREAM_TIMEOUT_MS must be positive, got %d", ms)
+		}
+		timeout = time.Duration(ms) * time.Millisecond
+	}
+
+	c, err := upstream.New(upstream.Config{URL: url, Timeout: timeout})
+	if err != nil {
+		return nil, "", err
+	}
+	return c, fmt.Sprintf("%s (timeout %s)", url, timeout), nil
 }

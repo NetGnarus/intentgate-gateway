@@ -46,9 +46,11 @@ The server boots and accepts requests on three endpoints:
   - **Policy.** OPA-backed Rego engine (embedded). Customer policies can express thresholds, time-of-day rules, agent-specific overrides, and arbitrary business logic. A starter policy is shipped; override via `INTENTGATE_POLICY_FILE`.
   - **Budget.** Per-token call counters via a `max_calls` caveat. Backed by Redis in production (multi-replica safe) or an in-memory store in dev.
 
-All four data-plane checks are now live. Calls that pass every stage
-are allowed with a stub reason — the actual upstream-tool-server proxy
-is the next milestone.
+All four data-plane checks are live. Calls that pass every stage are
+either **forwarded to the configured upstream MCP tool server** (when
+`INTENTGATE_UPSTREAM_URL` is set) or returned with a stub allow (when
+the gateway is run standalone for SDK tests / smoke targets). See the
+"Upstream forwarding" section below.
 
 ## Quick start
 
@@ -209,6 +211,8 @@ when a `vX.Y.Z` git tag is pushed — see `.github/workflows/release.yml`.
 | `INTENTGATE_REDIS_URL`          | _unset_ | Redis URL for the budget counter store, e.g. `redis://localhost:6379/0`. When unset, an in-memory store is used (single-replica only). |
 | `INTENTGATE_REQUIRE_BUDGET`     | `false` | When `true`, `/v1/mcp tools/call` requires a verified capability token before the budget stage runs.     |
 | `INTENTGATE_AUDIT_TARGET`       | `stdout`| Where audit events go. `stdout` (default) emits one JSON event per line; `none` disables emission.       |
+| `INTENTGATE_UPSTREAM_URL`       | _unset_ | URL of the downstream MCP tool server. When unset, the gateway returns a stub allow for any authorized call (useful for SDK tests / smokes). |
+| `INTENTGATE_UPSTREAM_TIMEOUT_MS`| `30000` | Per-call upstream timeout in milliseconds.                                                               |
 
 More configuration arrives with the intent extractor client, policy
 engine, and storage layers.
@@ -289,6 +293,58 @@ isolate audit lines:
 In production, pipe stdout through a log shipper (vector, fluent-bit,
 promtail) into your SIEM.
 
+## Upstream forwarding
+
+When `INTENTGATE_UPSTREAM_URL` points at a downstream MCP tool server,
+the gateway forwards every authorized `tools/call` to that server,
+preserving the JSON-RPC `id` and `params`. The upstream's response is
+returned to the agent unchanged, with the gateway's per-call decision
+metadata merged into `result._intentgate` so callers can see the
+gateway's verdict alongside the tool's output:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "content": [{"type": "text", "text": "invoice 123 has 2 line items"}],
+    "isError": false,
+    "_intentgate": {
+      "decision":   "allow",
+      "reason":     "forwarded",
+      "latency_ms": 8
+    }
+  }
+}
+```
+
+Operational failure modes (timeout, transport error, upstream non-2xx)
+return JSON-RPC `CodeInternalError` to the agent **and** emit an audit
+event with `check: "upstream"` and `decision: "block"`, distinguishing
+"gateway authorized but couldn't deliver" from "gateway blocked at one
+of the four checks". JSON-RPC errors returned by the upstream itself
+(a 200 OK carrying an error object — for example, "tool says no") are
+NOT considered failures: the gateway successfully delivered the call,
+so the audit event records `decision: "allow"` with the upstream's
+HTTP status and the upstream's body is passed through unchanged.
+
+When `INTENTGATE_UPSTREAM_URL` is unset, the gateway returns its own
+stub allow for any authorized call:
+
+```json
+{
+  "result": {
+    "content": [{"type": "text", "text": "stub: no upstream configured; gateway authorized this call"}],
+    "isError": false,
+    "_intentgate": {"decision": "allow", "reason": "stub: no upstream configured", "latency_ms": 0}
+  }
+}
+```
+
+This is useful for the SDK's test suite, the gateway's smoke targets,
+and any deployment validating the auth pipeline before wiring a real
+upstream.
+
 ## Policy authoring
 
 The default policy lives at `internal/policy/default_policy.rego` and
@@ -337,7 +393,8 @@ agent at the gateway, and exercise the full four-check pipeline.
 **v0.1 → v1.0 — next.** Production hardening based on design-partner
 deployments.
 
-- [ ] Upstream proxying for `tools/list`, `initialize`, `ping` and the actual `tools/call` forward
+- [x] Upstream proxying for `tools/call` — forwards authorized calls to a configured downstream MCP server (`INTENTGATE_UPSTREAM_URL`)
+- [ ] Upstream proxying for `tools/list`, `initialize`, `ping` (no auth applies — pure passthrough)
 - [ ] Token revocation list
 - [ ] Prometheus metrics + OpenTelemetry tracing
 - [ ] TypeScript SDK
