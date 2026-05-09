@@ -131,11 +131,13 @@ func New(cfg Config) *http.Server {
 		adminCfg := handlers.AdminConfig{
 			Logger:     logger,
 			AdminToken: cfg.AdminToken,
+			MasterKey:  cfg.MasterKey,
 			Revocation: cfg.Revocation,
 			Audit:      cfg.Audit,
 		}
 		mux.Handle("POST /v1/admin/revoke", handlers.NewAdminRevokeHandler(adminCfg))
 		mux.Handle("GET /v1/admin/revocations", handlers.NewAdminRevocationsListHandler(adminCfg))
+		mux.Handle("POST /v1/admin/mint", handlers.NewAdminMintHandler(adminCfg))
 	}
 
 	handler := chain(mux,
@@ -251,7 +253,7 @@ func metricsMiddleware(cfg Config) func(http.Handler) http.Handler {
 func routeLabel(path string) string {
 	switch path {
 	case "/healthz", "/v1/tool-call", "/v1/mcp", "/metrics",
-		"/v1/admin/revoke", "/v1/admin/revocations":
+		"/v1/admin/revoke", "/v1/admin/revocations", "/v1/admin/mint":
 		return path
 	default:
 		return "other"

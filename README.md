@@ -230,7 +230,7 @@ when a `vX.Y.Z` git tag is pushed — see `.github/workflows/release.yml`.
 | `INTENTGATE_UPSTREAM_URL`       | _unset_ | URL of the downstream MCP tool server. When unset, the gateway returns a stub allow for any authorized call (useful for SDK tests / smokes). |
 | `INTENTGATE_UPSTREAM_TIMEOUT_MS`| `30000` | Per-call upstream timeout in milliseconds.                                                               |
 | `INTENTGATE_POSTGRES_URL`       | _unset_ | libpq DSN for a durable revocation store. Empty falls back to in-memory (single-replica only).           |
-| `INTENTGATE_ADMIN_TOKEN`        | _unset_ | Shared secret guarding `/v1/admin/*` endpoints (revoke, list-revocations). Empty disables admin API.     |
+| `INTENTGATE_ADMIN_TOKEN`        | _unset_ | Shared secret guarding `/v1/admin/*` endpoints (mint, revoke, list-revocations). Empty disables admin API. |
 | `INTENTGATE_METRICS_ENABLED`    | _unset_ | `true` to register `GET /metrics` on the public port. Off by default — exposing metrics on the public port is an info-disclosure risk for naive deploys. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT`   | _unset_ | Standard OTel env var. When set, the gateway emits one span per HTTP request via OTLP gRPC.              |
 
@@ -318,6 +318,41 @@ Or list current revocations:
 curl -sH "Authorization: Bearer $INTENTGATE_ADMIN_TOKEN" \
   http://localhost:8080/v1/admin/revocations | jq .
 ```
+
+### Minting tokens via the admin API
+
+`POST /v1/admin/mint` issues a fresh capability token signed under the
+gateway's master key. It is the operator-facing path for handing a
+brand-new agent its first credential — equivalent to `igctl mint`, but
+exposed over HTTP so the admin UI can drive it.
+
+```sh
+curl -sH "Authorization: Bearer $INTENTGATE_ADMIN_TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{
+           "subject":     "finance-copilot-v3",
+           "ttl_seconds": 3600,
+           "tools":       ["read_invoice", "list_invoices"],
+           "max_calls":   100
+         }' \
+     http://localhost:8080/v1/admin/mint | jq .
+```
+
+Response:
+
+```json
+{
+  "token":      "eyJ2IjoxLCJqdGkiOiI...",
+  "jti":        "AbC1234...",
+  "subject":    "finance-copilot-v3",
+  "expires_at": "2026-05-09T16:00:00Z"
+}
+```
+
+The endpoint is unavailable when `INTENTGATE_MASTER_KEY` is unset
+(returns `503`); without a key the gateway can't sign anything. Every
+mint emits an audit event (`tool: "admin/mint"`, decision `allow`,
+including the JTI and subject) so SOC has a record of who issued what.
 
 ## Observability
 
@@ -494,6 +529,7 @@ deployments.
 - [x] Upstream proxying for `tools/call` — forwards authorized calls to a configured downstream MCP server (`INTENTGATE_UPSTREAM_URL`)
 - [x] Upstream proxying for `tools/list`, `initialize`, `ping` — pure passthrough; local fallbacks when no upstream so a standalone gateway still handshakes cleanly
 - [x] Token revocation list — durable Postgres store + in-memory dev fallback; admin API at `/v1/admin/revoke`; `igctl revoke` CLI
+- [x] Mint over admin API — `POST /v1/admin/mint` issues a fresh capability token under the gateway's master key (subject lock + optional TTL, tool whitelist, max-call cap), audit-logged like every other admin action
 - [x] Prometheus `/metrics` endpoint with per-check counters and histograms (`INTENTGATE_METRICS_ENABLED=true`)
 - [x] OpenTelemetry tracing via OTLP gRPC (`OTEL_EXPORTER_OTLP_ENDPOINT`)
 - [ ] TypeScript SDK
