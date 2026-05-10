@@ -76,28 +76,37 @@ func (s *PostgresStore) Close() {
 	}
 }
 
-// IsRevoked returns true if the JTI has a row in revoked_tokens.
-// One indexed primary-key lookup; the cheapest query Postgres can do.
-func (s *PostgresStore) IsRevoked(ctx context.Context, jti string) (bool, error) {
-	const q = `SELECT EXISTS(SELECT 1 FROM revoked_tokens WHERE jti = $1)`
+// IsRevoked returns true if a row exists for (jti, tenant) — the
+// caller's own tenant revoked this token — or for (jti, "") — the
+// superadmin revoked it globally. One indexed lookup against the
+// composite primary key.
+func (s *PostgresStore) IsRevoked(ctx context.Context, jti, tenant string) (bool, error) {
+	const q = `
+		SELECT EXISTS(
+			SELECT 1 FROM revoked_tokens
+			WHERE jti = $1 AND tenant IN ($2, '')
+		)
+	`
 	var exists bool
-	if err := s.pool.QueryRow(ctx, q, jti).Scan(&exists); err != nil {
+	if err := s.pool.QueryRow(ctx, q, jti, tenant).Scan(&exists); err != nil {
 		return false, fmt.Errorf("revocation: query: %w", err)
 	}
 	return exists, nil
 }
 
-// Revoke is idempotent. ON CONFLICT updates the reason but keeps the
-// original revoked_at AND the original tenant — the audit story is
-// "when was this first revoked, by whom", not "who touched the note
-// most recently".
+// Revoke is idempotent per (jti, tenant). ON CONFLICT updates the
+// reason but keeps the original revoked_at — the audit story is
+// "when was this first revoked", not "who touched the note most
+// recently". Different tenants revoking the same JTI insert
+// independent rows under the composite key; neither overwrites the
+// other, which is what closes the cross-tenant DoS hole.
 func (s *PostgresStore) Revoke(ctx context.Context, jti, reason, tenant string) error {
 	const q = `
 		INSERT INTO revoked_tokens (jti, reason, tenant)
 		VALUES ($1, $2, $3)
-		ON CONFLICT (jti) DO UPDATE SET reason = EXCLUDED.reason
+		ON CONFLICT (jti, tenant) DO UPDATE SET reason = EXCLUDED.reason
 	`
-	if _, err := s.pool.Exec(ctx, q, jti, reason, nullableString(tenant)); err != nil {
+	if _, err := s.pool.Exec(ctx, q, jti, reason, tenant); err != nil {
 		return fmt.Errorf("revocation: insert: %w", err)
 	}
 	return nil
@@ -107,8 +116,8 @@ func (s *PostgresStore) Revoke(ctx context.Context, jti, reason, tenant string) 
 //
 // tenant=="" returns ALL rows (superadmin view). A non-empty tenant
 // filters to rows whose tenant column matches exactly. Rows with
-// NULL tenant (legacy or superadmin-issued) are NOT visible to
-// per-tenant admins.
+// empty tenant (superadmin-issued; "" on the wire, NOT NULL in
+// storage from 1.0.1+) are NOT visible to per-tenant admins.
 func (s *PostgresStore) List(ctx context.Context, tenant string, limit, offset int) ([]RevokedToken, error) {
 	if limit <= 0 {
 		limit = 100
@@ -141,15 +150,9 @@ func (s *PostgresStore) List(ctx context.Context, tenant string, limit, offset i
 
 	out := make([]RevokedToken, 0, limit)
 	for rows.Next() {
-		var (
-			rt    RevokedToken
-			tnant *string
-		)
-		if err := rows.Scan(&rt.JTI, &rt.RevokedAt, &rt.Reason, &tnant); err != nil {
+		var rt RevokedToken
+		if err := rows.Scan(&rt.JTI, &rt.RevokedAt, &rt.Reason, &rt.Tenant); err != nil {
 			return nil, fmt.Errorf("revocation: scan: %w", err)
-		}
-		if tnant != nil {
-			rt.Tenant = *tnant
 		}
 		out = append(out, rt)
 	}
@@ -157,12 +160,4 @@ func (s *PostgresStore) List(ctx context.Context, tenant string, limit, offset i
 		return nil, fmt.Errorf("revocation: rows iter: %w", err)
 	}
 	return out, nil
-}
-
-// nullableString turns "" into nil so the database stores NULL.
-func nullableString(s string) any {
-	if s == "" {
-		return nil
-	}
-	return s
 }

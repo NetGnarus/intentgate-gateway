@@ -790,7 +790,11 @@ func (h *mcpHandler) runCapabilityCheck(r *http.Request, tool string) capability
 
 	if h.cfg.Revocation != nil {
 		revStart := time.Now()
-		revoked, rerr := h.cfg.Revocation.IsRevoked(r.Context(), tok.ID)
+		// Pass the verified token's tenant so the revocation lookup
+		// is scoped: a per-tenant admin's revocation only affects
+		// their own tenant; a superadmin revocation (tenant="") still
+		// applies globally because the store matches both rows.
+		revoked, rerr := h.cfg.Revocation.IsRevoked(r.Context(), tok.ID, tok.Tenant)
 		revDur := time.Since(revStart)
 		switch {
 		case rerr != nil:

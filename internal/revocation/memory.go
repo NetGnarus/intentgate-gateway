@@ -11,39 +11,68 @@ import (
 // gateway restart, not shared across replicas, fine for dev and
 // single-node installs that accept the trade-off.
 //
+// Storage layout: outer map keyed by JTI, inner map keyed by tenant
+// (with "" reserved for superadmin / global revocations). This
+// matches the Postgres composite primary key (jti, tenant) so the
+// two backends agree on how cross-tenant revocations isolate.
+//
 // Safe for concurrent use.
 type MemoryStore struct {
 	mu      sync.RWMutex
-	entries map[string]RevokedToken
+	entries map[string]map[string]RevokedToken
 }
 
 // NewMemoryStore returns an empty in-memory revocation store.
 func NewMemoryStore() *MemoryStore {
-	return &MemoryStore{entries: make(map[string]RevokedToken)}
+	return &MemoryStore{entries: make(map[string]map[string]RevokedToken)}
 }
 
-// IsRevoked is O(1).
-func (s *MemoryStore) IsRevoked(_ context.Context, jti string) (bool, error) {
+// IsRevoked returns true when either:
+//   - A row exists for (jti, tenant) — the caller's own tenant
+//     revoked this token.
+//   - A row exists for (jti, "")     — the superadmin revoked this
+//     token globally; affects every tenant.
+//
+// O(1) on both lookups.
+func (s *MemoryStore) IsRevoked(_ context.Context, jti, tenant string) (bool, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	_, ok := s.entries[jti]
-	return ok, nil
+	byTenant, ok := s.entries[jti]
+	if !ok {
+		return false, nil
+	}
+	if _, ok := byTenant[tenant]; ok {
+		return true, nil
+	}
+	if tenant != "" {
+		if _, ok := byTenant[""]; ok {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
-// Revoke is idempotent. Re-revoking with a different reason updates the
-// stored reason but keeps the original RevokedAt timestamp — operators
-// adding context to an existing revocation expect the original time
-// to stick. Tenant is recorded on first insert and not overwritten —
-// the original revoker's tenant is the authoritative attribution.
+// Revoke is idempotent per (jti, tenant). Re-revoking with a
+// different reason updates the stored reason but keeps the original
+// RevokedAt timestamp — operators adding context to an existing
+// revocation expect the original time to stick.
+//
+// Different tenants revoking the same JTI store independent rows;
+// neither overwrites the other.
 func (s *MemoryStore) Revoke(_ context.Context, jti, reason, tenant string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if existing, ok := s.entries[jti]; ok {
+	byTenant, ok := s.entries[jti]
+	if !ok {
+		byTenant = make(map[string]RevokedToken)
+		s.entries[jti] = byTenant
+	}
+	if existing, ok := byTenant[tenant]; ok {
 		existing.Reason = reason
-		s.entries[jti] = existing
+		byTenant[tenant] = existing
 		return nil
 	}
-	s.entries[jti] = RevokedToken{
+	byTenant[tenant] = RevokedToken{
 		JTI:       jti,
 		RevokedAt: time.Now().UTC(),
 		Reason:    reason,
@@ -55,18 +84,21 @@ func (s *MemoryStore) Revoke(_ context.Context, jti, reason, tenant string) erro
 // List returns revocations sorted most-recent-first.
 //
 // tenant=="" returns ALL rows (superadmin view). A non-empty tenant
-// returns only that tenant's rows; rows with empty tenant (legacy /
-// superadmin-issued) are NOT visible to per-tenant admins.
+// returns only that tenant's rows; superadmin-issued rows (stored
+// with empty tenant) are NOT visible to per-tenant admins. This
+// matches the behavior every prior version of the chart documented.
 func (s *MemoryStore) List(_ context.Context, tenant string, limit, offset int) ([]RevokedToken, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	all := make([]RevokedToken, 0, len(s.entries))
-	for _, e := range s.entries {
-		if tenant != "" && e.Tenant != tenant {
-			continue
+	all := make([]RevokedToken, 0)
+	for _, byTenant := range s.entries {
+		for rowTenant, e := range byTenant {
+			if tenant != "" && rowTenant != tenant {
+				continue
+			}
+			all = append(all, e)
 		}
-		all = append(all, e)
 	}
 	sort.Slice(all, func(i, j int) bool {
 		return all[i].RevokedAt.After(all[j].RevokedAt)

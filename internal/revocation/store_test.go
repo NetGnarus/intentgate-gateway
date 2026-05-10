@@ -14,8 +14,10 @@ func runStoreContract(t *testing.T, s Store) {
 	t.Helper()
 	ctx := context.Background()
 
-	// Initially revoked? No.
-	if revoked, err := s.IsRevoked(ctx, "fresh-jti"); err != nil || revoked {
+	// Initially revoked? No. Use the empty tenant ("" = superadmin
+	// scope) for the simple cases; a later subtest covers the
+	// per-tenant scoping invariants explicitly.
+	if revoked, err := s.IsRevoked(ctx, "fresh-jti", ""); err != nil || revoked {
 		t.Fatalf("fresh JTI: revoked=%v err=%v; want false, nil", revoked, err)
 	}
 
@@ -27,12 +29,12 @@ func runStoreContract(t *testing.T, s Store) {
 		t.Fatalf("Revoke 2 (idempotent): %v", err)
 	}
 
-	if revoked, err := s.IsRevoked(ctx, "tok1"); err != nil || !revoked {
+	if revoked, err := s.IsRevoked(ctx, "tok1", ""); err != nil || !revoked {
 		t.Fatalf("tok1: revoked=%v err=%v; want true, nil", revoked, err)
 	}
 
 	// A different JTI is unaffected.
-	if revoked, err := s.IsRevoked(ctx, "tok2"); err != nil || revoked {
+	if revoked, err := s.IsRevoked(ctx, "tok2", ""); err != nil || revoked {
 		t.Fatalf("tok2: revoked=%v err=%v; want false, nil", revoked, err)
 	}
 
@@ -105,8 +107,92 @@ func runStoreContract(t *testing.T, s Store) {
 	}
 }
 
+// runTenantScopingContract exercises the cross-tenant isolation
+// guarantees added in gateway 1.0.1: a per-tenant admin's revocation
+// only affects their own tenant on the hot path, while a superadmin
+// revocation (tenant="") still applies globally. Closes the
+// cross-tenant denial-of-service vector that existed in 1.0.
+func runTenantScopingContract(t *testing.T, s Store) {
+	t.Helper()
+	ctx := context.Background()
+
+	// The adversarial setup: an "attacker" tenant (acme) tries to
+	// revoke a JTI that belongs to a "victim" tenant (globex). Pre-
+	// 1.0.1, this would have caused globex's hot path to deny the
+	// token. We assert the opposite: globex is unaffected.
+	if err := s.Revoke(ctx, "victim-jti", "adversarial revoke", "acme"); err != nil {
+		t.Fatalf("acme adversarial revoke: %v", err)
+	}
+	revokedForGlobex, err := s.IsRevoked(ctx, "victim-jti", "globex")
+	if err != nil {
+		t.Fatalf("IsRevoked(victim, globex): %v", err)
+	}
+	if revokedForGlobex {
+		t.Error("cross-tenant DoS hole still open: acme revoke affected globex hot path")
+	}
+	// Acme itself does see its own revocation row, naturally.
+	revokedForAcme, err := s.IsRevoked(ctx, "victim-jti", "acme")
+	if err != nil {
+		t.Fatalf("IsRevoked(victim, acme): %v", err)
+	}
+	if !revokedForAcme {
+		t.Error("acme's own revocation row not honored on its own hot path")
+	}
+
+	// Legitimate same-tenant revoke: globex revokes its own JTI and
+	// the hot path picks it up. Crucially, this works even though
+	// acme already wrote a row for the same JTI under the attacker's
+	// tenant — different (jti, tenant) keys, no collision.
+	if err := s.Revoke(ctx, "victim-jti", "legitimate revoke", "globex"); err != nil {
+		t.Fatalf("globex legitimate revoke: %v", err)
+	}
+	revokedForGlobex, err = s.IsRevoked(ctx, "victim-jti", "globex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !revokedForGlobex {
+		t.Error("globex's legitimate revoke didn't take effect")
+	}
+
+	// Superadmin scope still propagates globally. A revoke with
+	// tenant="" must affect every tenant's hot path; this is the
+	// emergency stop the operator pulls when the token holder is
+	// unknown or the breach is cross-tenant.
+	if err := s.Revoke(ctx, "global-jti", "data leak", ""); err != nil {
+		t.Fatalf("superadmin revoke: %v", err)
+	}
+	for _, tenant := range []string{"acme", "globex", "default"} {
+		revoked, err := s.IsRevoked(ctx, "global-jti", tenant)
+		if err != nil {
+			t.Fatalf("IsRevoked(global-jti, %s): %v", tenant, err)
+		}
+		if !revoked {
+			t.Errorf("superadmin revoke didn't propagate to tenant=%s", tenant)
+		}
+	}
+
+	// Same-tenant idempotency is preserved: re-revoking with a
+	// different reason updates the reason, doesn't error.
+	if err := s.Revoke(ctx, "victim-jti", "updated reason", "globex"); err != nil {
+		t.Fatalf("globex re-revoke: %v", err)
+	}
+	all, err := s.List(ctx, "globex", 100, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, rt := range all {
+		if rt.JTI == "victim-jti" && rt.Reason != "updated reason" {
+			t.Errorf("globex re-revoke reason: got %q want %q", rt.Reason, "updated reason")
+		}
+	}
+}
+
 func TestMemoryStore_Contract(t *testing.T) {
 	runStoreContract(t, NewMemoryStore())
+}
+
+func TestMemoryStore_TenantScoping(t *testing.T) {
+	runTenantScopingContract(t, NewMemoryStore())
 }
 
 // TestPostgresStore_Contract runs the contract against a live
@@ -133,9 +219,10 @@ func TestPostgresStore_Contract(t *testing.T) {
 	defer store.Close()
 
 	// Clean any leftover state from previous runs.
-	if _, err := store.pool.Exec(ctx, "DELETE FROM revoked_tokens WHERE jti IN ('fresh-jti','tok1','tok2','tok3')"); err != nil {
+	if _, err := store.pool.Exec(ctx, "DELETE FROM revoked_tokens WHERE jti IN ('fresh-jti','tok1','tok2','tok3','victim-jti','global-jti')"); err != nil {
 		t.Fatalf("cleanup: %v", err)
 	}
 
 	runStoreContract(t, store)
+	runTenantScopingContract(t, store)
 }

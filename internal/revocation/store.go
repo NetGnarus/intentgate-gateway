@@ -33,6 +33,16 @@
 // within Postgres's comfort zone. If a deployment outgrows it, the
 // natural next step is a write-through cache in front of the store —
 // out of scope for v1.
+//
+// # Tenancy
+//
+// Revocations are tenant-scoped on both write and read paths
+// (gateway 1.0.1+). A per-tenant admin's revocation only affects
+// tokens issued under their tenant; a superadmin revocation
+// (tenant="") still applies globally. This closes the cross-tenant
+// denial-of-service vector that existed in 1.0, where any per-tenant
+// admin could revoke any JTI and the tenant-blind hot path would
+// honor it across every tenant.
 package revocation
 
 import (
@@ -55,9 +65,10 @@ type RevokedToken struct {
 	// Reason is operator-supplied context. May be empty.
 	Reason string `json:"reason,omitempty"`
 	// Tenant scopes the revocation. Per-tenant admins set this on
-	// revoke; superadmin-revoked rows carry empty tenant. Per-tenant
-	// list queries filter on this field; superadmin queries see
-	// every row. Empty string normalizes to NULL on Postgres.
+	// revoke; superadmin-revoked rows carry empty tenant ("") which
+	// is the canonical "applies to every tenant" marker on the hot
+	// path. Per-tenant list queries filter on this field; superadmin
+	// queries see every row.
 	Tenant string `json:"tenant,omitempty"`
 }
 
@@ -67,20 +78,26 @@ type RevokedToken struct {
 // gateway's hot path and called under any number of concurrent
 // in-flight requests.
 type Store interface {
-	// IsRevoked returns true if the JTI has been revoked. Network or
-	// disk errors are surfaced; a non-nil error from IsRevoked means
-	// the caller could not determine the answer. Production callers
-	// should fail closed (treat error as revoked) — a partial outage
-	// of the revocation store should not become a quiet authorization
-	// bypass.
-	IsRevoked(ctx context.Context, jti string) (bool, error)
+	// IsRevoked returns true if the JTI has been revoked for the
+	// caller's tenant. Matches a row whose tenant is either tenant
+	// (per-tenant revocation) or "" (superadmin revocation; applies
+	// globally). Pass the verified token's tenant — never a string
+	// derived from request input that hasn't been crypto-checked, or
+	// the tenancy guarantee evaporates.
+	//
+	// Network or disk errors are surfaced; a non-nil error from
+	// IsRevoked means the caller could not determine the answer.
+	// Production callers should fail closed (treat error as revoked)
+	// — a partial outage of the revocation store should not become a
+	// quiet authorization bypass.
+	IsRevoked(ctx context.Context, jti, tenant string) (bool, error)
 
 	// Revoke records a revocation. Idempotent: revoking an already-
-	// revoked JTI is not an error. Reason may be empty. Tenant is
-	// stored for attribution and admin-list scoping, NOT for
-	// hot-path enforcement — IsRevoked is tenant-blind because a
-	// revoked JTI is revoked everywhere. JTIs are 16-byte random,
-	// so cross-tenant collisions are not a real concern.
+	// revoked (jti, tenant) pair is not an error. Reason may be
+	// empty. Tenant participates in the storage key, so different
+	// tenants' revocations of the same JTI are independent rows that
+	// don't overwrite each other — the cross-tenant DoS vector that
+	// existed in 1.0 is closed at this layer.
 	Revoke(ctx context.Context, jti, reason, tenant string) error
 
 	// List returns recent revocations, most-recent first. limit caps
