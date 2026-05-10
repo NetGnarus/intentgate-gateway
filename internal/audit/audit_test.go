@@ -24,7 +24,7 @@ func TestNewEventPopulatesDefaults(t *testing.T) {
 	if e.EventName != "intentgate.tool_call" {
 		t.Errorf("event name: %v", e.EventName)
 	}
-	if e.SchemaVersion != "2" {
+	if e.SchemaVersion != "3" {
 		t.Errorf("schema version: %v", e.SchemaVersion)
 	}
 	// Timestamp must parse back to within one second of now.

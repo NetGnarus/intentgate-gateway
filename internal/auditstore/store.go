@@ -64,13 +64,17 @@ type QueryFilter struct {
 	// or both may be the zero value.
 	From time.Time
 	To   time.Time
-	// AgentID, Tool, Decision, Check, CapabilityTokenID are equality
-	// filters when non-empty.
+	// AgentID, Tool, Decision, Check, CapabilityTokenID, Tenant are
+	// equality filters when non-empty.
 	AgentID           string
 	Tool              string
 	Decision          string
 	Check             string
 	CapabilityTokenID string
+	// Tenant scopes the query to a single trust domain. Empty matches
+	// all tenants (admin / superuser view); set to "default" for
+	// single-tenant deployments that opt into explicit filtering.
+	Tenant string
 	// Limit caps the page size. Implementations MUST cap further at
 	// their own internal maximum (1000) to avoid pathological queries.
 	// Zero is treated as the implementation default.

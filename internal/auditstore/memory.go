@@ -162,5 +162,8 @@ func matchesFilter(e audit.Event, f QueryFilter) bool {
 	if f.CapabilityTokenID != "" && e.CapabilityTokenID != f.CapabilityTokenID {
 		return false
 	}
+	if f.Tenant != "" && e.Tenant != f.Tenant {
+		return false
+	}
 	return true
 }

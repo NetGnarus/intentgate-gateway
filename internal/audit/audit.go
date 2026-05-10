@@ -83,6 +83,12 @@ type Event struct {
 	Check    Check    `json:"check,omitempty"`
 	Reason   string   `json:"reason,omitempty"`
 
+	// Tenant is the trust-domain namespace this event was authorized
+	// under. Read from the verified capability token; never from the
+	// untrusted request. SOC analysts in multi-tenant deployments
+	// filter on this field to scope a query.
+	Tenant string `json:"tenant,omitempty"`
+
 	// Actor (the AI agent making the call).
 	AgentID   string `json:"agent_id,omitempty"`
 	SessionID string `json:"session_id,omitempty"`
@@ -139,11 +145,14 @@ type Event struct {
 //	      for delegation visibility. Field-add is backwards compatible
 //	      for SIEM mappings — old fields unchanged, new fields
 //	      omitempty when zero.
+//	"3" — gateway 0.9+: adds `tenant` for multi-tenant deployments.
+//	      Backwards-compatible field-add; single-tenant deployments
+//	      always emit `tenant=default`.
 func NewEvent(d Decision, tool string) Event {
 	return Event{
 		Timestamp:     time.Now().UTC().Format(time.RFC3339Nano),
 		EventName:     "intentgate.tool_call",
-		SchemaVersion: "2",
+		SchemaVersion: "3",
 		Decision:      d,
 		Tool:          tool,
 	}

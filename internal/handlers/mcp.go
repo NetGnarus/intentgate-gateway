@@ -708,6 +708,7 @@ func (h *mcpHandler) emitApprovalAudit(
 		e.CapabilityTokenID = cap.token.ID
 		e.RootCapabilityTokenID = cap.token.RootID
 		e.CaveatCount = cap.token.CaveatCount()
+		e.Tenant = cap.token.Tenant
 	}
 	if intent.intent != nil {
 		e.IntentSummary = intent.intent.Summary
@@ -993,6 +994,7 @@ func (h *mcpHandler) emitAudit(
 		e.CapabilityTokenID = cap.token.ID
 		e.RootCapabilityTokenID = cap.token.RootID
 		e.CaveatCount = cap.token.CaveatCount()
+		e.Tenant = cap.token.Tenant
 	}
 	if intent.intent != nil {
 		e.IntentSummary = intent.intent.Summary

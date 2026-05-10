@@ -131,6 +131,37 @@ func TestMemoryStoreRingOverflow(t *testing.T) {
 	}
 }
 
+func TestMemoryStoreFiltersByTenant(t *testing.T) {
+	ctx := context.Background()
+	s := NewMemoryStore(100)
+	now := time.Now().UTC()
+
+	mk := func(tenant string) audit.Event {
+		e := newTestEvent(now, audit.DecisionAllow, "x", "agent")
+		e.Tenant = tenant
+		return e
+	}
+	for i := 0; i < 3; i++ {
+		_ = s.Insert(ctx, mk("acme"))
+	}
+	for i := 0; i < 2; i++ {
+		_ = s.Insert(ctx, mk("globex"))
+	}
+	_ = s.Insert(ctx, mk("default"))
+
+	out, err := s.Query(ctx, QueryFilter{Tenant: "acme"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out) != 3 {
+		t.Errorf("want 3 acme rows, got %d", len(out))
+	}
+	all, _ := s.Query(ctx, QueryFilter{})
+	if len(all) != 6 {
+		t.Errorf("unfiltered want 6, got %d", len(all))
+	}
+}
+
 func TestMemoryStoreCount(t *testing.T) {
 	ctx := context.Background()
 	s := NewMemoryStore(10)

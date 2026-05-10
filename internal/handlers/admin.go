@@ -199,6 +199,7 @@ func NewAdminMintHandler(cfg AdminConfig) http.Handler {
 		var body struct {
 			Subject    string   `json:"subject"`
 			Issuer     string   `json:"issuer"`
+			Tenant     string   `json:"tenant"`
 			TTLSeconds int64    `json:"ttl_seconds"`
 			Tools      []string `json:"tools"`
 			MaxCalls   int      `json:"max_calls"`
@@ -224,6 +225,7 @@ func NewAdminMintHandler(cfg AdminConfig) http.Handler {
 
 		opts := capability.MintOptions{
 			Issuer:  strings.TrimSpace(body.Issuer),
+			Tenant:  strings.TrimSpace(body.Tenant),
 			Subject: body.Subject,
 		}
 		if body.TTLSeconds > 0 {
@@ -273,6 +275,7 @@ func NewAdminMintHandler(cfg AdminConfig) http.Handler {
 		ev.CapabilityTokenID = tok.ID
 		ev.RootCapabilityTokenID = tok.RootID
 		ev.CaveatCount = tok.CaveatCount()
+		ev.Tenant = tok.Tenant
 		ev.AgentID = body.Subject
 		ev.RemoteIP = r.RemoteAddr
 		cfg.Audit.Emit(r.Context(), ev)
@@ -341,6 +344,7 @@ func NewAdminAuditQueryHandler(cfg AdminConfig) http.Handler {
 			Decision:          q.Get("decision"),
 			Check:             q.Get("check"),
 			CapabilityTokenID: q.Get("jti"),
+			Tenant:            q.Get("tenant"),
 			Limit:             parseIntParam(r, "limit", 100, 1, 1000),
 			Offset:            parseIntParam(r, "offset", 0, 0, 1<<31-1),
 		}

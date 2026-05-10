@@ -102,7 +102,7 @@ func (s *PostgresStore) Insert(ctx context.Context, e audit.Event) error {
 			tool, arg_keys,
 			capability_token_id, intent_summary,
 			latency_ms, remote_ip, upstream_status,
-			root_capability_token_id, caveat_count
+			root_capability_token_id, caveat_count, tenant
 		) VALUES (
 			$1, $2, $3,
 			$4, $5, $6,
@@ -110,7 +110,7 @@ func (s *PostgresStore) Insert(ctx context.Context, e audit.Event) error {
 			$9, $10,
 			$11, $12,
 			$13, $14, $15,
-			$16, $17
+			$16, $17, $18
 		)
 	`
 	if _, err := s.pool.Exec(ctx, q,
@@ -121,6 +121,7 @@ func (s *PostgresStore) Insert(ctx context.Context, e audit.Event) error {
 		e.CapabilityTokenID, e.IntentSummary,
 		e.LatencyMS, e.RemoteIP, e.UpstreamStatus,
 		nullableString(e.RootCapabilityTokenID), nullableInt(e.CaveatCount),
+		nullableString(e.Tenant),
 	); err != nil {
 		return fmt.Errorf("auditstore: insert: %w", err)
 	}
@@ -167,7 +168,7 @@ func (s *PostgresStore) Query(ctx context.Context, f QueryFilter) ([]audit.Event
 			tool, arg_keys,
 			capability_token_id, intent_summary,
 			latency_ms, remote_ip, upstream_status,
-			root_capability_token_id, caveat_count
+			root_capability_token_id, caveat_count, tenant
 		FROM audit_events
 	` + where + `
 		ORDER BY ts DESC
@@ -190,6 +191,7 @@ func (s *PostgresStore) Query(ctx context.Context, f QueryFilter) ([]audit.Event
 			check       string
 			rootJTI     *string
 			caveatCount *int
+			tenant      *string
 		)
 		if err := rows.Scan(
 			&ts, &ev.EventName, &ev.SchemaVersion,
@@ -198,7 +200,7 @@ func (s *PostgresStore) Query(ctx context.Context, f QueryFilter) ([]audit.Event
 			&ev.Tool, &argKeysJSON,
 			&ev.CapabilityTokenID, &ev.IntentSummary,
 			&ev.LatencyMS, &ev.RemoteIP, &ev.UpstreamStatus,
-			&rootJTI, &caveatCount,
+			&rootJTI, &caveatCount, &tenant,
 		); err != nil {
 			return nil, fmt.Errorf("auditstore: scan: %w", err)
 		}
@@ -207,6 +209,9 @@ func (s *PostgresStore) Query(ctx context.Context, f QueryFilter) ([]audit.Event
 		}
 		if caveatCount != nil {
 			ev.CaveatCount = *caveatCount
+		}
+		if tenant != nil {
+			ev.Tenant = *tenant
 		}
 		ev.Timestamp = ts.UTC().Format(time.RFC3339Nano)
 		ev.Decision = audit.Decision(decision)
@@ -266,6 +271,10 @@ func buildWhere(f QueryFilter) (string, []any) {
 	if f.CapabilityTokenID != "" {
 		args = append(args, f.CapabilityTokenID)
 		clauses = append(clauses, "capability_token_id = "+placeholder(len(args)))
+	}
+	if f.Tenant != "" {
+		args = append(args, f.Tenant)
+		clauses = append(clauses, "tenant = "+placeholder(len(args)))
 	}
 	if len(clauses) == 0 {
 		return "", args

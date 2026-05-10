@@ -42,9 +42,16 @@ import (
 // v2 (gateway 0.7+) adds [Token.RootID] so attenuated children carry a
 // distinct ID per hop while still anchoring back to the chain root.
 // v1 tokens (gateway 0.1–0.6) have no RootID and are NOT accepted by
-// v2 verifiers. There is no in-flight migration: redeploy the gateway
-// at v0.7, re-mint outstanding tokens, hand them out fresh.
-const SchemaVersion = 2
+// v2 verifiers.
+//
+// v3 (gateway 0.9+) adds [Token.Tenant] so a single deployment can
+// authorize traffic from multiple isolated trust domains (org →
+// project → agent in the pitch's hierarchy). The tenant claim is
+// signed in the canonicalPayload, so an attacker cannot pivot a
+// stolen token from tenant A to tenant B without the master key.
+// v2 tokens are NOT accepted by v3 verifiers. There is no in-flight
+// migration: redeploy the gateway at v0.9, re-mint outstanding tokens.
+const SchemaVersion = 3
 
 // Token is the on-wire and in-memory representation of a capability.
 //
@@ -61,16 +68,28 @@ const SchemaVersion = 2
 // (Attenuate output) RootID == parent.RootID and ID is a fresh
 // time-prefixed random.
 type Token struct {
-	Version   int      `json:"v"`
-	ID        string   `json:"jti"`
-	RootID    string   `json:"root_jti"`
-	Issuer    string   `json:"iss"`
+	Version int    `json:"v"`
+	ID      string `json:"jti"`
+	RootID  string `json:"root_jti"`
+	Issuer  string `json:"iss"`
+	// Tenant is the trust-domain namespace this token authorizes
+	// traffic for ("acme", "tenant-a", "default"). Signed in the
+	// canonicalPayload so a stolen token cannot pivot tenants.
+	// Mint defaults this to "default" when the caller doesn't set
+	// one — single-tenant deployments stay simple while multi-tenant
+	// deployments get isolation.
+	Tenant    string   `json:"tenant"`
 	Subject   string   `json:"sub"`
 	IssuedAt  int64    `json:"iat"`
 	NotBefore int64    `json:"nbf,omitempty"`
 	Caveats   []Caveat `json:"cav,omitempty"`
 	Signature string   `json:"sig"`
 }
+
+// DefaultTenant is the value Mint stamps when MintOptions.Tenant is
+// empty. Single-tenant deployments live entirely in this namespace
+// without explicit configuration.
+const DefaultTenant = "default"
 
 // Caveat type identifiers. New types must be added here AND handled in
 // the evaluator (see check.go); unknown types are denied by default.
@@ -119,6 +138,7 @@ func (t *Token) canonicalPayload() ([]byte, error) {
 		ID        string `json:"jti"`
 		RootID    string `json:"root_jti"`
 		Issuer    string `json:"iss"`
+		Tenant    string `json:"tenant"`
 		Subject   string `json:"sub"`
 		IssuedAt  int64  `json:"iat"`
 		NotBefore int64  `json:"nbf,omitempty"`
@@ -127,6 +147,7 @@ func (t *Token) canonicalPayload() ([]byte, error) {
 		ID:        t.ID,
 		RootID:    t.RootID,
 		Issuer:    t.Issuer,
+		Tenant:    t.Tenant,
 		Subject:   t.Subject,
 		IssuedAt:  t.IssuedAt,
 		NotBefore: t.NotBefore,
@@ -158,6 +179,9 @@ func (t *Token) Validate() error {
 	}
 	if t.RootID == "" {
 		return errors.New("token root id (root_jti) is required")
+	}
+	if t.Tenant == "" {
+		return errors.New("token tenant is required")
 	}
 	return nil
 }

@@ -50,7 +50,12 @@ CREATE TABLE IF NOT EXISTS audit_events (
     -- signal. Both NULL-default so the migration is no-op on
     -- already-deployed tables and old rows simply read NULL.
     root_capability_token_id TEXT,
-    caveat_count             INTEGER
+    caveat_count             INTEGER,
+
+    -- Multi-tenant scoping (audit schema_version 3, gateway 0.9+).
+    -- NULL-default so existing rows read NULL; new rows always carry
+    -- a tenant (defaults to 'default' on the gateway side).
+    tenant                   TEXT
 );
 
 -- Idempotent ALTERs: existing 0.5/0.6 deployments whose audit_events
@@ -60,6 +65,14 @@ ALTER TABLE audit_events
     ADD COLUMN IF NOT EXISTS root_capability_token_id TEXT;
 ALTER TABLE audit_events
     ADD COLUMN IF NOT EXISTS caveat_count INTEGER;
+ALTER TABLE audit_events
+    ADD COLUMN IF NOT EXISTS tenant TEXT;
+
+-- Per-tenant timeline. Multi-tenant deployments filter on this
+-- frequently: "show me all decisions in tenant=acme last hour".
+CREATE INDEX IF NOT EXISTS audit_events_tenant_ts_idx
+    ON audit_events (tenant, ts DESC)
+    WHERE tenant IS NOT NULL;
 
 -- Most queries are "events for an agent in a window" or "blocks in a
 -- window"; both filter on ts. Descending so LIMIT N grabs the newest

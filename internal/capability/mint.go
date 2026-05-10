@@ -15,6 +15,12 @@ import (
 type MintOptions struct {
 	// Issuer identifies who minted this token (default: "intentgate").
 	Issuer string
+	// Tenant is the trust-domain namespace this token authorizes
+	// traffic for ("acme", "tenant-a"). Empty defaults to
+	// [DefaultTenant] so single-tenant deployments don't have to
+	// think about it. Multi-tenant operators set this on every Mint
+	// to anchor the token in a specific tenancy.
+	Tenant string
 	// Subject is the agent ID this token is bound to. Required.
 	Subject string
 	// NotBefore, if non-zero, is enforced via the iat/nbf timestamps.
@@ -50,6 +56,11 @@ func Mint(masterKey []byte, opts MintOptions) (*Token, error) {
 		return nil, err
 	}
 
+	tenant := opts.Tenant
+	if tenant == "" {
+		tenant = DefaultTenant
+	}
+
 	now := time.Now().UTC().Unix()
 	t := &Token{
 		Version: SchemaVersion,
@@ -59,6 +70,7 @@ func Mint(masterKey []byte, opts MintOptions) (*Token, error) {
 		// this RootID intact, so audit + revocation can correlate.
 		RootID:   id,
 		Issuer:   issuer,
+		Tenant:   tenant,
 		Subject:  opts.Subject,
 		IssuedAt: now,
 	}
@@ -117,6 +129,9 @@ func Attenuate(parent *Token, c Caveat) (*Token, error) {
 	}
 	if parent.RootID == "" {
 		return nil, errors.New("parent token has no root id (was it minted by gateway < v0.7?)")
+	}
+	if parent.Tenant == "" {
+		return nil, errors.New("parent token has no tenant (was it minted by gateway < v0.9?)")
 	}
 	parentSig, err := base64.RawURLEncoding.DecodeString(parent.Signature)
 	if err != nil {

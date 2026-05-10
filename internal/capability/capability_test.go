@@ -46,6 +46,10 @@ func TestMintProducesValidToken(t *testing.T) {
 	if !tok.IsRoot() {
 		t.Errorf("freshly minted token should be IsRoot()")
 	}
+	// Tenant defaults to "default" when MintOptions.Tenant is empty.
+	if tok.Tenant != DefaultTenant {
+		t.Errorf("tenant=%q want %q", tok.Tenant, DefaultTenant)
+	}
 	// Mint should auto-prepend an agent_lock caveat.
 	if len(tok.Caveats) == 0 || tok.Caveats[0].Type != CaveatAgentLock {
 		t.Errorf("first caveat should be agent_lock, got %+v", tok.Caveats)
@@ -207,6 +211,45 @@ func TestVerifyDetectsRootIDTamper(t *testing.T) {
 	tok.RootID = "spoofed-root"
 	if err := tok.Verify(key); err == nil {
 		t.Fatal("expected verify failure on tampered RootID")
+	}
+}
+
+func TestMintAcceptsCustomTenant(t *testing.T) {
+	key := mustKey(t)
+	tok, err := Mint(key, MintOptions{Subject: "x", Tenant: "acme"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok.Tenant != "acme" {
+		t.Errorf("tenant=%q want acme", tok.Tenant)
+	}
+	if err := tok.Verify(key); err != nil {
+		t.Errorf("custom-tenant token failed verify: %v", err)
+	}
+}
+
+func TestVerifyDetectsTenantTamper(t *testing.T) {
+	key := mustKey(t)
+	tok, _ := Mint(key, MintOptions{Subject: "x", Tenant: "acme"})
+	// Attacker tries to pivot the token to a different tenant.
+	tok.Tenant = "victim-corp"
+	if err := tok.Verify(key); err == nil {
+		t.Fatal("expected verify failure on cross-tenant pivot")
+	}
+}
+
+func TestAttenuatePreservesTenant(t *testing.T) {
+	key := mustKey(t)
+	parent, _ := Mint(key, MintOptions{Subject: "x", Tenant: "acme"})
+	child, err := Attenuate(parent, Caveat{Type: CaveatToolWhitelist, Tools: []string{"a"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if child.Tenant != "acme" {
+		t.Errorf("child.Tenant=%q want acme", child.Tenant)
+	}
+	if err := child.Verify(key); err != nil {
+		t.Errorf("attenuated token failed verify: %v", err)
 	}
 }
 
