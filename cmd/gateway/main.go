@@ -34,6 +34,12 @@
 //	                                at the budget stage.
 //	INTENTGATE_AUDIT_TARGET         where to emit audit events. Recognized
 //	                                values: "stdout" (default), "none".
+//	INTENTGATE_AUDIT_PERSIST        "true" to also persist every audit
+//	                                event into the configured Postgres
+//	                                (uses INTENTGATE_POSTGRES_URL). When
+//	                                set, GET /v1/admin/audit becomes
+//	                                queryable. Default off so existing
+//	                                stdout-only deployments are unchanged.
 //	INTENTGATE_UPSTREAM_URL         URL of the downstream MCP tool server
 //	                                authorized calls are forwarded to. When
 //	                                unset, the gateway returns a stub allow
@@ -77,6 +83,7 @@ import (
 	"time"
 
 	"github.com/NetGnarus/intentgate-gateway/internal/audit"
+	"github.com/NetGnarus/intentgate-gateway/internal/auditstore"
 	"github.com/NetGnarus/intentgate-gateway/internal/budget"
 	"github.com/NetGnarus/intentgate-gateway/internal/capability"
 	"github.com/NetGnarus/intentgate-gateway/internal/extractor"
@@ -111,6 +118,7 @@ func main() {
 	policyFile := envOr("INTENTGATE_POLICY_FILE", "")
 	redisURL := envOr("INTENTGATE_REDIS_URL", "")
 	auditTarget := envOr("INTENTGATE_AUDIT_TARGET", "stdout")
+	auditPersist := envOr("INTENTGATE_AUDIT_PERSIST", "") == "true"
 	upstreamURL := envOr("INTENTGATE_UPSTREAM_URL", "")
 	upstreamTimeoutMS := envOr("INTENTGATE_UPSTREAM_TIMEOUT_MS", "")
 	postgresURL := envOr("INTENTGATE_POSTGRES_URL", "")
@@ -147,6 +155,31 @@ func main() {
 		logger.Error("invalid INTENTGATE_AUDIT_TARGET", "err", err)
 		os.Exit(1)
 	}
+
+	// Optional Postgres-backed audit persistence. Layered as a fan-out
+	// on top of whatever auditTarget produced so existing stdout-only
+	// deployments keep their log-shipper pipelines unchanged.
+	auditStore, auditStoreEmitter, auditStoreDesc, err := loadAuditStore(
+		context.Background(), logger, postgresURL, auditPersist,
+	)
+	if err != nil {
+		logger.Error("failed to initialize audit store", "err", err)
+		os.Exit(1)
+	}
+	if auditStoreEmitter != nil {
+		auditEmitter = audit.NewFanOut(auditEmitter, auditStoreEmitter)
+		auditDesc = auditDesc + "+" + auditStoreDesc
+	}
+	defer func() {
+		if auditStoreEmitter != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = auditStoreEmitter.Stop(ctx)
+		}
+		if auditStore != nil {
+			_ = auditStore.Close()
+		}
+	}()
 
 	upstreamClient, upstreamDesc, err := loadUpstream(logger, upstreamURL, upstreamTimeoutMS)
 	if err != nil {
@@ -209,6 +242,7 @@ func main() {
 		Budget:                budgetStore,
 		RequireBudget:         requireBudget,
 		Audit:                 auditEmitter,
+		AuditStore:            auditStore,
 		Upstream:              upstreamClient,
 		Revocation:            revocationStore,
 		AdminToken:            adminToken,
@@ -403,6 +437,34 @@ func loadTracing(ctx context.Context, version, endpoint string) (func(context.Co
 	otel.SetTracerProvider(tp)
 
 	return tp.Shutdown, fmt.Sprintf("enabled (otlp grpc: %s)", endpoint), nil
+}
+
+// loadAuditStore constructs the optional Postgres-backed audit store
+// and its async emitter. Returns (nil, nil, "disabled", nil) when
+// audit persistence isn't enabled or no Postgres URL is configured —
+// the gateway runs fine with stdout-only audit, and we don't want to
+// half-enable persistence (which would silently degrade the
+// /v1/admin/audit endpoint to "always empty").
+func loadAuditStore(ctx context.Context, logger *slog.Logger, postgresURL string, persist bool) (auditstore.Store, *auditstore.Emitter, string, error) {
+	if !persist {
+		return nil, nil, "disabled", nil
+	}
+	if postgresURL == "" {
+		// Persist=true without a DSN is operator error: a misconfigured
+		// gateway will look "audit-persistent" in dashboards but lose
+		// every event. Refuse to start.
+		return nil, nil, "", fmt.Errorf("INTENTGATE_AUDIT_PERSIST=true requires INTENTGATE_POSTGRES_URL")
+	}
+	store, err := auditstore.NewPostgresStore(ctx, postgresURL)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	em := auditstore.NewEmitter(auditstore.EmitterConfig{
+		Store:  store,
+		Logger: logger,
+	})
+	logger.Info("audit store: postgres", "persist", true)
+	return store, em, "postgres", nil
 }
 
 // loadRevocation constructs the revocation store. When postgresURL is

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/NetGnarus/intentgate-gateway/internal/audit"
+	"github.com/NetGnarus/intentgate-gateway/internal/auditstore"
 	"github.com/NetGnarus/intentgate-gateway/internal/budget"
 	"github.com/NetGnarus/intentgate-gateway/internal/extractor"
 	"github.com/NetGnarus/intentgate-gateway/internal/handlers"
@@ -52,6 +53,11 @@ type Config struct {
 	// Audit is the emitter for one-event-per-decision audit records.
 	// nil falls back to a NullEmitter (no events emitted).
 	Audit audit.Emitter
+	// AuditStore is the queryable backing store the admin audit
+	// endpoint reads from. nil means audit persistence is disabled
+	// (the route is not registered, so /v1/admin/audit returns 404 on
+	// older / lighter deployments).
+	AuditStore auditstore.Store
 	// Upstream is the configured downstream MCP tool server. nil means
 	// no upstream is configured and the gateway returns its stub allow
 	// for authorized calls. Production deployments always supply one.
@@ -138,6 +144,14 @@ func New(cfg Config) *http.Server {
 		mux.Handle("POST /v1/admin/revoke", handlers.NewAdminRevokeHandler(adminCfg))
 		mux.Handle("GET /v1/admin/revocations", handlers.NewAdminRevocationsListHandler(adminCfg))
 		mux.Handle("POST /v1/admin/mint", handlers.NewAdminMintHandler(adminCfg))
+		// Audit query is registered only when an AuditStore is wired
+		// in. Older deployments running stdout-only audit get a 404,
+		// which is what the console keys off to fall back to its
+		// upload-based flow.
+		if cfg.AuditStore != nil {
+			adminCfg.AuditStore = cfg.AuditStore
+			mux.Handle("GET /v1/admin/audit", handlers.NewAdminAuditQueryHandler(adminCfg))
+		}
 	}
 
 	handler := chain(mux,
@@ -253,7 +267,8 @@ func metricsMiddleware(cfg Config) func(http.Handler) http.Handler {
 func routeLabel(path string) string {
 	switch path {
 	case "/healthz", "/v1/tool-call", "/v1/mcp", "/metrics",
-		"/v1/admin/revoke", "/v1/admin/revocations", "/v1/admin/mint":
+		"/v1/admin/revoke", "/v1/admin/revocations", "/v1/admin/mint",
+		"/v1/admin/audit":
 		return path
 	default:
 		return "other"

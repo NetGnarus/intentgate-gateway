@@ -185,6 +185,44 @@ func NewNullEmitter() NullEmitter { return NullEmitter{} }
 // Emit on NullEmitter is a no-op.
 func (NullEmitter) Emit(context.Context, Event) {}
 
+// FanOutEmitter calls Emit on each underlying emitter in order. Used
+// to send the same event to multiple sinks (e.g. stdout AND a
+// Postgres-backed store) without entangling either implementation
+// with the other's failure modes.
+//
+// The fan-out is synchronous and best-effort: each underlying Emit is
+// called in turn, no error is bubbled up (the [Emitter] contract is
+// fire-and-forget). Underlying emitters that need async semantics
+// must implement them internally — see auditstore.NewEmitter for the
+// canonical async-with-drop pattern.
+//
+// A nil or empty FanOutEmitter is a no-op.
+type FanOutEmitter struct {
+	emitters []Emitter
+}
+
+// NewFanOut returns an emitter that forwards to each non-nil emitter
+// in the argument list. Order is preserved.
+func NewFanOut(emitters ...Emitter) *FanOutEmitter {
+	out := make([]Emitter, 0, len(emitters))
+	for _, e := range emitters {
+		if e != nil {
+			out = append(out, e)
+		}
+	}
+	return &FanOutEmitter{emitters: out}
+}
+
+// Emit dispatches to every underlying emitter.
+func (f *FanOutEmitter) Emit(ctx context.Context, e Event) {
+	if f == nil {
+		return
+	}
+	for _, em := range f.emitters {
+		em.Emit(ctx, e)
+	}
+}
+
 // FromTarget constructs an emitter from an INTENTGATE_AUDIT_TARGET
 // string. Recognized targets:
 //

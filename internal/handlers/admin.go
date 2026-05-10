@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/NetGnarus/intentgate-gateway/internal/audit"
+	"github.com/NetGnarus/intentgate-gateway/internal/auditstore"
 	"github.com/NetGnarus/intentgate-gateway/internal/capability"
 	"github.com/NetGnarus/intentgate-gateway/internal/revocation"
 )
@@ -38,6 +39,10 @@ type AdminConfig struct {
 	MasterKey  []byte
 	Revocation revocation.Store
 	Audit      audit.Emitter
+	// AuditStore is the queryable audit store consulted by the
+	// /v1/admin/audit endpoint. Optional; when nil, that endpoint is
+	// not registered.
+	AuditStore auditstore.Store
 }
 
 // NewAdminRevokeHandler returns the POST /v1/admin/revoke handler.
@@ -271,6 +276,103 @@ func NewAdminMintHandler(cfg AdminConfig) http.Handler {
 			"subject":    body.Subject,
 			"expires_at": expiresAt,
 		})
+	})
+}
+
+// NewAdminAuditQueryHandler returns the GET /v1/admin/audit handler.
+//
+// Query params (all optional):
+//
+//	from        ISO-8601 timestamp, inclusive lower bound on event ts
+//	to          ISO-8601 timestamp, inclusive upper bound
+//	agent_id    exact-match filter
+//	tool        exact-match filter
+//	decision    "allow" or "block"
+//	check       "capability" / "intent" / "policy" / "budget" / "upstream"
+//	jti         capability_token_id exact-match filter
+//	limit       page size, default 100, max 1000
+//	offset      pagination offset, default 0
+//	count       "true" to additionally return the total count (a
+//	            potentially expensive COUNT(*) on large tables)
+//
+// Body:
+//
+//	{
+//	  "events": [ ... audit.Event records ... ],
+//	  "limit":  100,
+//	  "offset": 0,
+//	  "total":  4321   // only present when count=true
+//	}
+//
+// Returns 401 on missing/invalid admin token, 503 when the audit store
+// errors, 400 on unparseable from/to timestamps.
+func NewAdminAuditQueryHandler(cfg AdminConfig) http.Handler {
+	if cfg.Logger == nil {
+		cfg.Logger = slog.Default()
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		if !checkAdminToken(r, cfg.AdminToken) {
+			adminError(w, http.StatusUnauthorized, "invalid or missing admin token")
+			return
+		}
+		if cfg.AuditStore == nil {
+			adminError(w, http.StatusServiceUnavailable, "audit store not configured")
+			return
+		}
+
+		q := r.URL.Query()
+		filter := auditstore.QueryFilter{
+			AgentID:           q.Get("agent_id"),
+			Tool:              q.Get("tool"),
+			Decision:          q.Get("decision"),
+			Check:             q.Get("check"),
+			CapabilityTokenID: q.Get("jti"),
+			Limit:             parseIntParam(r, "limit", 100, 1, 1000),
+			Offset:            parseIntParam(r, "offset", 0, 0, 1<<31-1),
+		}
+		if from := q.Get("from"); from != "" {
+			t, err := time.Parse(time.RFC3339, from)
+			if err != nil {
+				adminError(w, http.StatusBadRequest, "invalid 'from' timestamp: "+err.Error())
+				return
+			}
+			filter.From = t.UTC()
+		}
+		if to := q.Get("to"); to != "" {
+			t, err := time.Parse(time.RFC3339, to)
+			if err != nil {
+				adminError(w, http.StatusBadRequest, "invalid 'to' timestamp: "+err.Error())
+				return
+			}
+			filter.To = t.UTC()
+		}
+
+		events, err := cfg.AuditStore.Query(r.Context(), filter)
+		if err != nil {
+			cfg.Logger.Error("audit query failed", "err", err)
+			adminError(w, http.StatusServiceUnavailable, "store error: "+err.Error())
+			return
+		}
+
+		resp := map[string]any{
+			"events": events,
+			"limit":  filter.Limit,
+			"offset": filter.Offset,
+		}
+		if q.Get("count") == "true" {
+			n, err := cfg.AuditStore.Count(r.Context(), filter)
+			if err != nil {
+				// Don't fail the whole response; tag the count as
+				// unknown so the UI degrades gracefully.
+				cfg.Logger.Warn("audit count failed", "err", err)
+				resp["total"] = -1
+			} else {
+				resp["total"] = n
+			}
+		}
+		_ = json.NewEncoder(w).Encode(resp)
 	})
 }
 
