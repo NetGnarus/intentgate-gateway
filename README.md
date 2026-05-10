@@ -8,6 +8,8 @@
 
 A self-hosted authorization gateway for AI agents.
 
+> **Performance** (single-replica, in-memory dev install): **2,000 RPS at p50 = 0.77 ms, p99 = 1.50 ms, 100% success**. Full numbers and reproducer in [`BENCHMARKS.md`](BENCHMARKS.md); rerun with `./scripts/bench.sh` against any IntentGate gateway you can reach.
+
 The gateway sits between an AI agent and the tool servers it wants to call.
 It intercepts every tool call, evaluates it through a four-check pipeline
 (**capability, intent, policy, budget**), and either forwards the call
@@ -535,7 +537,7 @@ deployments.
 - [ ] TypeScript SDK
 - [ ] Taint propagation (data-flow side of the budget check)
 - [ ] AI Act Annex IV evidence pack
-- [ ] Performance benchmarks under realistic agent traffic
+- [x] Performance benchmarks — `scripts/bench.sh` sweeps request rates with vegeta, breaks latency down by check stage from `/metrics`, writes a self-contained `BENCHMARKS.md` in one command. Re-run any time the pipeline changes.
 
 ## Development
 
