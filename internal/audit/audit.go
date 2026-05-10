@@ -96,6 +96,18 @@ type Event struct {
 	// Resource (the tool the agent was trying to invoke).
 	Tool    string   `json:"tool"`
 	ArgKeys []string `json:"arg_keys,omitempty"`
+	// ArgValues is the redacted view of the call's argument values,
+	// populated only when the gateway is configured with
+	// INTENTGATE_AUDIT_PERSIST_ARG_VALUES=scalars (or =raw). Default
+	// is to leave this empty so the audit log preserves its strict
+	// keys-only privacy posture. When populated, the map mirrors
+	// ArgKeys: every key in ArgValues appears in ArgKeys.
+	// See audit.RedactionMode and audit.RedactArgs for the per-mode
+	// rules — in particular: under "scalars" mode (the recommended
+	// opt-in), numbers, booleans, and nulls survive; strings,
+	// arrays-of-strings, and string-valued nested map entries are
+	// replaced with null.
+	ArgValues map[string]any `json:"arg_values,omitempty"`
 
 	// Capability token identity (the jti). Helpful for correlating an
 	// incident back to the issuance event.
@@ -148,11 +160,18 @@ type Event struct {
 //	"3" — gateway 0.9+: adds `tenant` for multi-tenant deployments.
 //	      Backwards-compatible field-add; single-tenant deployments
 //	      always emit `tenant=default`.
+//	"4" — gateway 1.3+: adds optional `arg_values` carrying a redacted
+//	      view of the tool call's arguments. Omitempty when the operator
+//	      hasn't opted in via INTENTGATE_AUDIT_PERSIST_ARG_VALUES, so
+//	      v3 SIEM mappings keep working unchanged. The schema_version
+//	      bump signals to dry-run consumers that ArgValues may be
+//	      populated; older events still read NULL and dry-run falls
+//	      back to keys-only replay.
 func NewEvent(d Decision, tool string) Event {
 	return Event{
 		Timestamp:     time.Now().UTC().Format(time.RFC3339Nano),
 		EventName:     "intentgate.tool_call",
-		SchemaVersion: "3",
+		SchemaVersion: "4",
 		Decision:      d,
 		Tool:          tool,
 	}

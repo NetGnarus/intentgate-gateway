@@ -102,6 +102,15 @@ type Config struct {
 	// request becomes a span. Configuration of the exporter is via
 	// standard OTEL_* env vars; this flag only toggles the middleware.
 	EnableOTelTracing bool
+	// ArgRedaction controls whether and how the gateway persists a
+	// redacted view of tool-call argument values onto each audit
+	// event. Default RedactOff preserves the strict keys-only
+	// privacy posture used through v1.2. Operators flip this to
+	// RedactScalars (numbers + bools + nulls survive; strings drop)
+	// when they want faithful dry-run replay of value-threshold
+	// policies. Read from INTENTGATE_AUDIT_PERSIST_ARG_VALUES at
+	// startup; see audit.ParseRedactionMode.
+	ArgRedaction audit.RedactionMode
 }
 
 // New constructs an *http.Server with all gateway routes and middleware.
@@ -142,6 +151,7 @@ func New(cfg Config) *http.Server {
 		Metrics:           cfg.Metrics,
 		Approvals:         cfg.Approvals,
 		ApprovalTimeout:   cfg.ApprovalTimeout,
+		ArgRedaction:      cfg.ArgRedaction,
 	}))
 
 	// Prometheus scrape endpoint. Behind a flag because exposing

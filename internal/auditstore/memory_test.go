@@ -45,6 +45,35 @@ func TestMemoryStoreRoundTrip(t *testing.T) {
 	}
 }
 
+func TestMemoryStoreRoundTripsArgValues(t *testing.T) {
+	ctx := context.Background()
+	s := NewMemoryStore(10)
+
+	e := newTestEvent(time.Now().UTC(), audit.DecisionAllow, "transfer_funds", "fin-bot")
+	e.ArgKeys = []string{"amount_eur", "recipient"}
+	e.ArgValues = map[string]any{
+		"amount_eur": 1500,
+		"recipient":  nil, // string redacted by RedactScalars
+	}
+	if err := s.Insert(ctx, e); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	out, err := s.Query(ctx, QueryFilter{})
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if len(out) != 1 {
+		t.Fatalf("want 1 event, got %d", len(out))
+	}
+	if out[0].ArgValues["amount_eur"] != 1500 {
+		t.Errorf("ArgValues[amount_eur] = %v, want 1500", out[0].ArgValues["amount_eur"])
+	}
+	if out[0].ArgValues["recipient"] != nil {
+		t.Errorf("ArgValues[recipient] = %v, want nil", out[0].ArgValues["recipient"])
+	}
+}
+
 func TestMemoryStoreFilters(t *testing.T) {
 	ctx := context.Background()
 	s := NewMemoryStore(100)

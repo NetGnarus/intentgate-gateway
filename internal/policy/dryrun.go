@@ -180,15 +180,20 @@ func DryRun(ctx context.Context, regoSource string, events []audit.Event, opts D
 	}
 
 	// Static pre-scan: does the candidate policy reference argument
-	// VALUES (input.args.<key>)? If so, those rules will silently fail
-	// to match during dry-run — OPA treats `to_number(nil) > N` etc.
-	// as undefined, which makes the rule no-op rather than error out.
-	// That's a footgun: a threshold rule appears to never fire, which
-	// looks like "policy is safe to deploy" when really it's "I
-	// couldn't test this rule." We warn unconditionally when any
-	// such access is present. Real runtime errors (division by zero,
-	// builtin misuse) still surface per-event as policy_error.
+	// VALUES (input.args.<key>)? If so, the dry-run outcome depends
+	// on whether the audit events being replayed carry ArgValues:
+	//
+	//   - audit schema v4 with RedactScalars: numeric / bool rules
+	//     replay faithfully; string-keyed rules silently no-op.
+	//   - audit schema v3 or v4 with RedactOff: every value rule
+	//     silently no-ops (OPA treats input.args.<key> as undefined).
+	//
+	// We sample `ArgValues` presence across the actual replayed events
+	// (below) to decide whether to warn at all, and what to warn
+	// about. The pre-scan just records that value access is in the
+	// source so we know to track it.
 	sourceReferencesArgValues := argValueAccessRe.MatchString(regoSource)
+	eventsWithArgValues := 0
 
 	for _, ev := range events {
 		select {
@@ -222,6 +227,9 @@ func DryRun(ctx context.Context, regoSource string, events []audit.Event, opts D
 		}
 
 		out.Summary.EventsEvaluated++
+		if len(ev.ArgValues) > 0 {
+			eventsWithArgValues++
+		}
 		bumpCrossTab(&out.Summary, ev.Decision, candidate)
 
 		if !candidatesMatch(ev.Decision, candidate) && len(out.Samples) < maxSamples {
@@ -247,12 +255,37 @@ func DryRun(ctx context.Context, regoSource string, events []audit.Event, opts D
 	sortSamplesNewestFirst(out.Samples)
 
 	if sourceReferencesArgValues {
-		out.Warnings = append(out.Warnings,
-			"the candidate policy references argument values (input.args.<key>). "+
-				"Audit events store argument keys but not values (by design, to avoid persisting PII), "+
-				"so OPA treats those references as undefined during replay and the rule silently no-ops "+
-				"— rather than firing or producing an error. Value-dependent rules (e.g. amount thresholds) "+
-				"will work correctly on live traffic; you just cannot validate them via dry-run today.")
+		switch {
+		case eventsWithArgValues == 0 && out.Summary.EventsEvaluated > 0:
+			// No event in this window carries arg_values — the
+			// gateway is on schema v3 or has RedactOff. Loudest
+			// warning: nothing was actually replayed for value rules.
+			out.Warnings = append(out.Warnings,
+				"the candidate policy references argument values (input.args.<key>), but "+
+					"no replayed event carries arg_values. Either the gateway is on audit schema v3 "+
+					"or INTENTGATE_AUDIT_PERSIST_ARG_VALUES is unset. "+
+					"OPA treats those references as undefined during replay, so value-dependent rules "+
+					"silently no-op. Set INTENTGATE_AUDIT_PERSIST_ARG_VALUES=scalars on the gateway "+
+					"(numbers and booleans survive; strings are redacted to null) and re-run to validate.")
+		case eventsWithArgValues > 0 && eventsWithArgValues < out.Summary.EventsEvaluated:
+			// Partial coverage — typical during a rolling upgrade.
+			// Quieter warning: explain what's faithful and what isn't.
+			out.Warnings = append(out.Warnings,
+				"the candidate policy references argument values (input.args.<key>); "+
+					"some replayed events carry arg_values (faithful replay for numbers/bools) "+
+					"and some do not (older audit rows; rules will silently no-op on those). "+
+					"This usually means a recent INTENTGATE_AUDIT_PERSIST_ARG_VALUES=scalars rollout — "+
+					"widen the time range once the buffer fills with new events to validate the rule cleanly.")
+		case eventsWithArgValues > 0:
+			// Full coverage. One-line nudge that strings are still
+			// out of scope so the operator doesn't trust a string-
+			// equality rule that silently no-ops.
+			out.Warnings = append(out.Warnings,
+				"the candidate policy references argument values (input.args.<key>). Numbers, "+
+					"booleans, and nulls replay faithfully under INTENTGATE_AUDIT_PERSIST_ARG_VALUES=scalars; "+
+					"string values are redacted to null and any string-equality / regex / contains rules "+
+					"against argument strings will silently no-op during dry-run.")
+		}
 	}
 	if out.Summary.EventsEvaluated == 0 {
 		out.Warnings = append(out.Warnings,
@@ -264,14 +297,40 @@ func DryRun(ctx context.Context, regoSource string, events []audit.Event, opts D
 }
 
 // inputFromEvent rebuilds a [policy.Input] from the persisted fields
-// of an audit event. ArgKeys → args[key] = nil (keys present, values
-// unknown). Intent gets a summary-only fill (the other intent fields
-// aren't on the audit event today). Capability subject/issuer aren't
-// on the audit event either; we omit them.
+// of an audit event. Two modes, decided per-event by whether the
+// audit row carries a redacted-values map:
+//
+//   - **ArgValues populated (audit schema v4 + scalars/raw redaction
+//     mode):** the map is used directly. Numeric thresholds and bool
+//     flags replay faithfully because numbers/bools survive redaction;
+//     string equality still no-ops (strings are redacted to nil) but
+//     that's documented.
+//   - **ArgValues empty (audit schema v3 or earlier, OR v4 with
+//     RedactOff):** fall back to the keys-only map (args[key] = nil)
+//     used since v1.2. Threshold rules silently no-op; the static
+//     pre-scan warning fires.
+//
+// Mixed-deployment safety: a cluster mid-rollout will have v3 rows
+// from before the upgrade and v4 rows after. Each event picks the
+// right mode based on its own data, no operator coordination needed.
+//
+// Intent gets a summary-only fill (the other intent fields aren't on
+// the audit event today). Capability subject/issuer aren't on the
+// audit event either; we omit them.
 func inputFromEvent(e audit.Event) Input {
-	args := make(map[string]any, len(e.ArgKeys))
-	for _, k := range e.ArgKeys {
-		args[k] = nil
+	var args map[string]any
+	if len(e.ArgValues) > 0 {
+		// ArgValues already includes the right keys (the redaction
+		// helper preserves keys verbatim). Use directly so threshold
+		// rules see real numbers.
+		args = e.ArgValues
+	} else {
+		// Keys-only fallback. Keep the existing v1.2 semantics: every
+		// key is present, every value is nil.
+		args = make(map[string]any, len(e.ArgKeys))
+		for _, k := range e.ArgKeys {
+			args[k] = nil
+		}
 	}
 	var intent *InputIntent
 	if e.IntentSummary != "" {

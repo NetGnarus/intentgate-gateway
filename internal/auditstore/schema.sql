@@ -55,7 +55,16 @@ CREATE TABLE IF NOT EXISTS audit_events (
     -- Multi-tenant scoping (audit schema_version 3, gateway 0.9+).
     -- NULL-default so existing rows read NULL; new rows always carry
     -- a tenant (defaults to 'default' on the gateway side).
-    tenant                   TEXT
+    tenant                   TEXT,
+
+    -- Redacted argument values (audit schema_version 4, gateway 1.3+).
+    -- Populated only when the gateway is configured with
+    -- INTENTGATE_AUDIT_PERSIST_ARG_VALUES=scalars (or =raw).
+    -- JSONB so dry-run + the compliance pack can read it back into
+    -- map[string]any without a separate join, and so SIEM exporters
+    -- can ship it verbatim. NULL on every row written by a gateway
+    -- not opted into the feature, which is the v1.0-1.2 default.
+    arg_values               JSONB
 );
 
 -- Idempotent ALTERs: existing 0.5/0.6 deployments whose audit_events
@@ -67,6 +76,8 @@ ALTER TABLE audit_events
     ADD COLUMN IF NOT EXISTS caveat_count INTEGER;
 ALTER TABLE audit_events
     ADD COLUMN IF NOT EXISTS tenant TEXT;
+ALTER TABLE audit_events
+    ADD COLUMN IF NOT EXISTS arg_values JSONB;
 
 -- Per-tenant timeline. Multi-tenant deployments filter on this
 -- frequently: "show me all decisions in tenant=acme last hour".

@@ -140,6 +140,84 @@ func TestDryRunNoArgValueWarningWhenSourceClean(t *testing.T) {
 	}
 }
 
+func TestDryRunUsesArgValuesWhenPresent(t *testing.T) {
+	t.Parallel()
+	// Two events under audit schema v4 with scalar redaction enabled.
+	// Both crossed the 10000 EUR threshold; the candidate policy
+	// should now correctly evaluate the threshold and flip them to
+	// block.
+	ev := makeEvent("2026-05-10T10:00:00Z", "transfer_funds", "fin-bot",
+		audit.DecisionAllow, audit.CheckNone, []string{"amount_eur", "recipient"})
+	ev.ArgValues = map[string]any{
+		"amount_eur": 25000,
+		"recipient":  nil, // string redacted
+	}
+	out, err := DryRun(context.Background(), regoNeedsArgValue, []audit.Event{ev}, DryRunOptions{})
+	if err != nil {
+		t.Fatalf("DryRun returned error: %v", err)
+	}
+	if out.Summary.CandidateBlock != 1 || out.Summary.AllowToBlock != 1 {
+		t.Errorf("threshold rule should have fired with ArgValues populated; got summary=%+v",
+			out.Summary)
+	}
+	// Full-coverage path: warning should NOT loudly say "no events
+	// carry arg_values" — it should be the quieter "strings redacted"
+	// reminder.
+	for _, w := range out.Warnings {
+		if strings.Contains(w, "no replayed event carries arg_values") {
+			t.Errorf("got the no-coverage warning when full coverage was present: %q", w)
+		}
+	}
+}
+
+func TestDryRunWarnsLoudlyWhenNoEventHasArgValues(t *testing.T) {
+	t.Parallel()
+	// Old schema-v3 event: ArgKeys but no ArgValues. The candidate
+	// references input.args.amount_eur. Warning text must point at
+	// the env-var nudge so the operator knows the next move.
+	ev := makeEvent("2026-05-10T10:00:00Z", "transfer_funds", "fin-bot",
+		audit.DecisionAllow, audit.CheckNone, []string{"amount_eur"})
+	out, err := DryRun(context.Background(), regoNeedsArgValue, []audit.Event{ev}, DryRunOptions{})
+	if err != nil {
+		t.Fatalf("DryRun returned error: %v", err)
+	}
+	found := false
+	for _, w := range out.Warnings {
+		if strings.Contains(w, "INTENTGATE_AUDIT_PERSIST_ARG_VALUES=scalars") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected env-var nudge in warnings; got %v", out.Warnings)
+	}
+}
+
+func TestDryRunWarnsAboutPartialCoverage(t *testing.T) {
+	t.Parallel()
+	// Mixed schema: one event with ArgValues, one without. The dry-
+	// run should warn about partial coverage so the operator knows
+	// to widen the window after the rollout settles.
+	evOld := makeEvent("2026-05-10T10:00:00Z", "transfer_funds", "fin-bot",
+		audit.DecisionAllow, audit.CheckNone, []string{"amount_eur"})
+	evNew := makeEvent("2026-05-10T10:00:01Z", "transfer_funds", "fin-bot",
+		audit.DecisionAllow, audit.CheckNone, []string{"amount_eur"})
+	evNew.ArgValues = map[string]any{"amount_eur": 25000}
+
+	out, err := DryRun(context.Background(), regoNeedsArgValue, []audit.Event{evOld, evNew}, DryRunOptions{})
+	if err != nil {
+		t.Fatalf("DryRun returned error: %v", err)
+	}
+	found := false
+	for _, w := range out.Warnings {
+		if strings.Contains(w, "rolling upgrade") || strings.Contains(w, "widen the time range") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected partial-coverage warning; got %v", out.Warnings)
+	}
+}
+
 func TestDryRunWarnsOnEmptyEvents(t *testing.T) {
 	t.Parallel()
 	out, err := DryRun(context.Background(), regoBlockTransfer, nil, DryRunOptions{})

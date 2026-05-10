@@ -165,6 +165,12 @@ func main() {
 	redisURL := envOr("INTENTGATE_REDIS_URL", "")
 	auditTarget := envOr("INTENTGATE_AUDIT_TARGET", "stdout")
 	auditPersist := envOr("INTENTGATE_AUDIT_PERSIST", "") == "true"
+	auditArgValuesRaw := envOr("INTENTGATE_AUDIT_PERSIST_ARG_VALUES", "")
+	argRedaction, argRedactionErr := audit.ParseRedactionMode(auditArgValuesRaw)
+	if argRedactionErr != nil {
+		logger.Error("invalid INTENTGATE_AUDIT_PERSIST_ARG_VALUES", "err", argRedactionErr)
+		os.Exit(1)
+	}
 	splunkURL := envOr("INTENTGATE_SIEM_SPLUNK_URL", "")
 	splunkToken := envOr("INTENTGATE_SIEM_SPLUNK_TOKEN", "")
 	splunkIndex := envOr("INTENTGATE_SIEM_SPLUNK_INDEX", "")
@@ -372,6 +378,7 @@ func main() {
 		Revocation:            revocationStore,
 		Approvals:             approvalsStore,
 		ApprovalTimeout:       approvalTimeout,
+		ArgRedaction:          argRedaction,
 		TenantAdmins:          tenantAdmins,
 		AdminToken:            adminToken,
 		Metrics:               metricsHandle,

@@ -83,6 +83,14 @@ type MCPHandlerConfig struct {
 	// back to 5 minutes — operators with on-call humans can lower
 	// this; deployments with offline reviewers should raise it.
 	ApprovalTimeout time.Duration
+	// ArgRedaction controls whether the gateway persists a redacted
+	// view of tool-call argument values onto each audit event (see
+	// [audit.RedactionMode]). Default RedactOff preserves the strict
+	// keys-only privacy posture; RedactScalars opts into faithful
+	// dry-run replay of numeric / boolean threshold rules without
+	// ever logging free-form text. Read from
+	// INTENTGATE_AUDIT_PERSIST_ARG_VALUES at startup.
+	ArgRedaction audit.RedactionMode
 }
 
 type mcpHandler struct {
@@ -700,6 +708,7 @@ func (h *mcpHandler) emitApprovalAudit(
 	e.Reason = reason
 	e.AgentID = cap.agentID
 	e.ArgKeys = argKeys
+	e.ArgValues = audit.RedactArgs(params.Arguments, h.cfg.ArgRedaction)
 	e.LatencyMS = time.Since(start).Milliseconds()
 	e.RemoteIP = r.RemoteAddr
 	e.PendingID = pendingID
@@ -991,6 +1000,7 @@ func (h *mcpHandler) emitAudit(
 	e.Reason = reason
 	e.AgentID = cap.agentID
 	e.ArgKeys = argKeys
+	e.ArgValues = audit.RedactArgs(params.Arguments, h.cfg.ArgRedaction)
 	e.LatencyMS = time.Since(start).Milliseconds()
 	e.RemoteIP = r.RemoteAddr
 	e.UpstreamStatus = upstreamStatus

@@ -93,6 +93,16 @@ func (s *PostgresStore) Insert(ctx context.Context, e audit.Event) error {
 			return fmt.Errorf("auditstore: marshal arg_keys: %w", err)
 		}
 	}
+	// arg_values is JSONB on the wire — pass nil when the map is
+	// empty so we store SQL NULL rather than the literal "{}", which
+	// the dry-run consumer reads as "redaction was disabled."
+	var argValuesJSON []byte
+	if len(e.ArgValues) > 0 {
+		argValuesJSON, err = json.Marshal(e.ArgValues)
+		if err != nil {
+			return fmt.Errorf("auditstore: marshal arg_values: %w", err)
+		}
+	}
 
 	const q = `
 		INSERT INTO audit_events (
@@ -102,7 +112,8 @@ func (s *PostgresStore) Insert(ctx context.Context, e audit.Event) error {
 			tool, arg_keys,
 			capability_token_id, intent_summary,
 			latency_ms, remote_ip, upstream_status,
-			root_capability_token_id, caveat_count, tenant
+			root_capability_token_id, caveat_count, tenant,
+			arg_values
 		) VALUES (
 			$1, $2, $3,
 			$4, $5, $6,
@@ -110,7 +121,8 @@ func (s *PostgresStore) Insert(ctx context.Context, e audit.Event) error {
 			$9, $10,
 			$11, $12,
 			$13, $14, $15,
-			$16, $17, $18
+			$16, $17, $18,
+			$19
 		)
 	`
 	if _, err := s.pool.Exec(ctx, q,
@@ -122,6 +134,7 @@ func (s *PostgresStore) Insert(ctx context.Context, e audit.Event) error {
 		e.LatencyMS, e.RemoteIP, e.UpstreamStatus,
 		nullableString(e.RootCapabilityTokenID), nullableInt(e.CaveatCount),
 		nullableString(e.Tenant),
+		argValuesJSON,
 	); err != nil {
 		return fmt.Errorf("auditstore: insert: %w", err)
 	}
@@ -168,7 +181,8 @@ func (s *PostgresStore) Query(ctx context.Context, f QueryFilter) ([]audit.Event
 			tool, arg_keys,
 			capability_token_id, intent_summary,
 			latency_ms, remote_ip, upstream_status,
-			root_capability_token_id, caveat_count, tenant
+			root_capability_token_id, caveat_count, tenant,
+			arg_values
 		FROM audit_events
 	` + where + `
 		ORDER BY ts DESC
@@ -184,14 +198,15 @@ func (s *PostgresStore) Query(ctx context.Context, f QueryFilter) ([]audit.Event
 	out := make([]audit.Event, 0, limit)
 	for rows.Next() {
 		var (
-			ts          time.Time
-			argKeysJSON []byte
-			ev          audit.Event
-			decision    string
-			check       string
-			rootJTI     *string
-			caveatCount *int
-			tenant      *string
+			ts            time.Time
+			argKeysJSON   []byte
+			argValuesJSON []byte
+			ev            audit.Event
+			decision      string
+			check         string
+			rootJTI       *string
+			caveatCount   *int
+			tenant        *string
 		)
 		if err := rows.Scan(
 			&ts, &ev.EventName, &ev.SchemaVersion,
@@ -201,6 +216,7 @@ func (s *PostgresStore) Query(ctx context.Context, f QueryFilter) ([]audit.Event
 			&ev.CapabilityTokenID, &ev.IntentSummary,
 			&ev.LatencyMS, &ev.RemoteIP, &ev.UpstreamStatus,
 			&rootJTI, &caveatCount, &tenant,
+			&argValuesJSON,
 		); err != nil {
 			return nil, fmt.Errorf("auditstore: scan: %w", err)
 		}
@@ -218,6 +234,9 @@ func (s *PostgresStore) Query(ctx context.Context, f QueryFilter) ([]audit.Event
 		ev.Check = audit.Check(check)
 		if len(argKeysJSON) > 0 {
 			_ = json.Unmarshal(argKeysJSON, &ev.ArgKeys)
+		}
+		if len(argValuesJSON) > 0 {
+			_ = json.Unmarshal(argValuesJSON, &ev.ArgValues)
 		}
 		out = append(out, ev)
 	}
