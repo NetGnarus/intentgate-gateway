@@ -267,6 +267,8 @@ func NewAdminMintHandler(cfg AdminConfig) http.Handler {
 		ev.Check = audit.CheckCapability
 		ev.Reason = "token minted for subject=" + body.Subject
 		ev.CapabilityTokenID = tok.ID
+		ev.RootCapabilityTokenID = tok.RootID
+		ev.CaveatCount = tok.CaveatCount()
 		ev.AgentID = body.Subject
 		ev.RemoteIP = r.RemoteAddr
 		cfg.Audit.Emit(r.Context(), ev)

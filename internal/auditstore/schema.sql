@@ -42,8 +42,24 @@ CREATE TABLE IF NOT EXISTS audit_events (
     -- Operational telemetry.
     latency_ms           BIGINT NOT NULL DEFAULT 0,
     remote_ip            TEXT NOT NULL DEFAULT '',
-    upstream_status      INTEGER NOT NULL DEFAULT 0
+    upstream_status      INTEGER NOT NULL DEFAULT 0,
+
+    -- Delegation telemetry (audit schema_version 2, gateway 0.7+).
+    -- root_capability_token_id correlates events from a delegation
+    -- chain. caveat_count is a coarse "how attenuated is this token"
+    -- signal. Both NULL-default so the migration is no-op on
+    -- already-deployed tables and old rows simply read NULL.
+    root_capability_token_id TEXT,
+    caveat_count             INTEGER
 );
+
+-- Idempotent ALTERs: existing 0.5/0.6 deployments whose audit_events
+-- table predates these columns get them added on next start. New
+-- deployments hit no-ops.
+ALTER TABLE audit_events
+    ADD COLUMN IF NOT EXISTS root_capability_token_id TEXT;
+ALTER TABLE audit_events
+    ADD COLUMN IF NOT EXISTS caveat_count INTEGER;
 
 -- Most queries are "events for an agent in a window" or "blocks in a
 -- window"; both filter on ts. Descending so LIMIT N grabs the newest

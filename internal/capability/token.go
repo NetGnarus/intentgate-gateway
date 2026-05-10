@@ -38,7 +38,13 @@ import (
 
 // SchemaVersion is the wire-format version of a capability token. The
 // gateway accepts only this version; older tokens must be re-minted.
-const SchemaVersion = 1
+//
+// v2 (gateway 0.7+) adds [Token.RootID] so attenuated children carry a
+// distinct ID per hop while still anchoring back to the chain root.
+// v1 tokens (gateway 0.1–0.6) have no RootID and are NOT accepted by
+// v2 verifiers. There is no in-flight migration: redeploy the gateway
+// at v0.7, re-mint outstanding tokens, hand them out fresh.
+const SchemaVersion = 2
 
 // Token is the on-wire and in-memory representation of a capability.
 //
@@ -46,9 +52,18 @@ const SchemaVersion = 1
 // emits struct fields in declaration order, and the HMAC chain commits
 // to those bytes. Reordering fields will silently invalidate every
 // pre-existing token.
+//
+// Identity model. Every hop in a delegation chain has its own [ID]
+// (jti) so revocation, audit citations, and budget counters can address
+// a single hop without affecting siblings. [RootID] anchors back to the
+// original Mint — the SOC analyst uses it to reconstruct the full tree.
+// On root tokens (Mint output) RootID == ID. On attenuated children
+// (Attenuate output) RootID == parent.RootID and ID is a fresh
+// time-prefixed random.
 type Token struct {
 	Version   int      `json:"v"`
 	ID        string   `json:"jti"`
+	RootID    string   `json:"root_jti"`
 	Issuer    string   `json:"iss"`
 	Subject   string   `json:"sub"`
 	IssuedAt  int64    `json:"iat"`
@@ -95,10 +110,14 @@ type Caveat struct {
 
 // canonicalPayload returns the bytes that seed the HMAC chain. It
 // excludes Caveats and Signature; those are absorbed by the chain.
+//
+// CAUTION: changing this struct's field order or set of fields is a
+// breaking wire-format change. Bump SchemaVersion if you do.
 func (t *Token) canonicalPayload() ([]byte, error) {
 	body := struct {
 		Version   int    `json:"v"`
 		ID        string `json:"jti"`
+		RootID    string `json:"root_jti"`
 		Issuer    string `json:"iss"`
 		Subject   string `json:"sub"`
 		IssuedAt  int64  `json:"iat"`
@@ -106,6 +125,7 @@ func (t *Token) canonicalPayload() ([]byte, error) {
 	}{
 		Version:   t.Version,
 		ID:        t.ID,
+		RootID:    t.RootID,
 		Issuer:    t.Issuer,
 		Subject:   t.Subject,
 		IssuedAt:  t.IssuedAt,
@@ -136,5 +156,24 @@ func (t *Token) Validate() error {
 	if t.IssuedAt == 0 {
 		return errors.New("token issued-at (iat) is required")
 	}
+	if t.RootID == "" {
+		return errors.New("token root id (root_jti) is required")
+	}
 	return nil
+}
+
+// IsRoot reports whether this token is a root (Mint output) — true when
+// the per-hop ID equals the chain RootID. Attenuated children always
+// fail this test.
+func (t *Token) IsRoot() bool {
+	return t.RootID != "" && t.RootID == t.ID
+}
+
+// CaveatCount returns the number of caveats currently on the chain.
+// Used as a coarse-grained "is this token more constrained than that
+// one?" signal in audit telemetry — not a security claim. The SOC
+// analyst correlates (RootID, ID, CaveatCount) across audit events to
+// reconstruct a delegation tree.
+func (t *Token) CaveatCount() int {
+	return len(t.Caveats)
 }

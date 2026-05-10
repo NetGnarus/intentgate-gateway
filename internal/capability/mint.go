@@ -52,8 +52,12 @@ func Mint(masterKey []byte, opts MintOptions) (*Token, error) {
 
 	now := time.Now().UTC().Unix()
 	t := &Token{
-		Version:  SchemaVersion,
-		ID:       id,
+		Version: SchemaVersion,
+		ID:      id,
+		// Root token: the per-hop ID anchors the whole chain.
+		// Attenuate later replaces ID with a fresh value but keeps
+		// this RootID intact, so audit + revocation can correlate.
+		RootID:   id,
 		Issuer:   issuer,
 		Subject:  opts.Subject,
 		IssuedAt: now,
@@ -86,6 +90,14 @@ func Mint(masterKey []byte, opts MintOptions) (*Token, error) {
 // more restrictive child. It does NOT need the master key — that is the
 // defining property of Macaroon-style chained-HMAC delegation.
 //
+// The child shares the parent's JTI (and therefore RootID) — the chain
+// of caveats IS the per-hop identity. Macaroons works the same way:
+// per-hop revocation is layered as a discharge caveat in a future
+// session, not a separate ID. For audit visibility, the gateway logs
+// CaveatCount alongside JTI so a SOC analyst can correlate "events
+// with same jti but different caveat counts traversed different
+// delegation paths."
+//
 // The new signature is derived as HMAC(parent.Signature, caveatBytes).
 // Because the parent's signature is itself the HMAC chain ending at
 // the parent's last caveat, this hops the chain forward exactly one
@@ -95,10 +107,16 @@ func Mint(masterKey []byte, opts MintOptions) (*Token, error) {
 // Attenuate makes no semantic check that the new caveat is "narrower"
 // than what the parent permitted. That is policy, not crypto. The
 // cryptographic invariant is only that the chain is well-formed and
-// signed under the master key transitively.
+// signed under the master key transitively. The rest follows from
+// caveat evaluation: if a child appends a tool_allow that's broader
+// than the parent's, the gateway still rejects the call because the
+// PARENT's narrower tool_allow caveat fires first.
 func Attenuate(parent *Token, c Caveat) (*Token, error) {
 	if parent == nil {
 		return nil, errors.New("parent token is nil")
+	}
+	if parent.RootID == "" {
+		return nil, errors.New("parent token has no root id (was it minted by gateway < v0.7?)")
 	}
 	parentSig, err := base64.RawURLEncoding.DecodeString(parent.Signature)
 	if err != nil {

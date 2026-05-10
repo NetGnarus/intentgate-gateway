@@ -39,6 +39,13 @@ func TestMintProducesValidToken(t *testing.T) {
 	if tok.IssuedAt == 0 {
 		t.Errorf("expected non-zero iat")
 	}
+	// Root tokens have RootID == ID and IsRoot() reports true.
+	if tok.RootID != tok.ID {
+		t.Errorf("root token: RootID=%q ID=%q (should match)", tok.RootID, tok.ID)
+	}
+	if !tok.IsRoot() {
+		t.Errorf("freshly minted token should be IsRoot()")
+	}
 	// Mint should auto-prepend an agent_lock caveat.
 	if len(tok.Caveats) == 0 || tok.Caveats[0].Type != CaveatAgentLock {
 		t.Errorf("first caveat should be agent_lock, got %+v", tok.Caveats)
@@ -146,6 +153,70 @@ func TestAttenuateChainsMultipleSteps(t *testing.T) {
 	if len(step2.Caveats) != len(root.Caveats)+2 {
 		t.Errorf("expected 2 extra caveats, got chain length %d (root had %d)",
 			len(step2.Caveats), len(root.Caveats))
+	}
+}
+
+func TestAttenuatePreservesRootID(t *testing.T) {
+	key := mustKey(t)
+	root, _ := Mint(key, MintOptions{Subject: "x"})
+	if !root.IsRoot() {
+		t.Fatal("Mint output should be IsRoot()")
+	}
+	child, err := Attenuate(root, Caveat{Type: CaveatToolWhitelist, Tools: []string{"a"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if child.RootID != root.RootID {
+		t.Errorf("child.RootID=%q parent.RootID=%q (should match)", child.RootID, root.RootID)
+	}
+}
+
+// TestAttenuateNarrowingRejectsBroaderTool verifies the central
+// security property of Macaroon-style delegation: a child cannot widen
+// its parent's tool whitelist. The chain commits to BOTH the parent's
+// narrow caveat and the child's broader one, so caveat evaluation
+// (which fails on the FIRST violation) blocks the call regardless of
+// what the attenuating party tried to claim.
+func TestAttenuateNarrowingRejectsBroaderTool(t *testing.T) {
+	key := mustKey(t)
+	parent, _ := Mint(key, MintOptions{
+		Subject: "x",
+		Caveats: []Caveat{{Type: CaveatToolWhitelist, Tools: []string{"a"}}},
+	})
+	// Malicious attenuator tries to "widen" by adding a broader allow.
+	child, err := Attenuate(parent, Caveat{
+		Type:  CaveatToolWhitelist,
+		Tools: []string{"a", "b", "c"}, // broader than parent's [a]
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Verify still passes — the chain is well-formed.
+	if err := child.Verify(key); err != nil {
+		t.Fatalf("child verify: %v", err)
+	}
+	// But Check rejects a call to b: the parent's narrower caveat fires first.
+	if err := child.Check(RequestContext{AgentID: "x", Tool: "b"}); err == nil {
+		t.Errorf("expected Check to reject tool=b (parent caveat allows only [a])")
+	}
+}
+
+func TestVerifyDetectsRootIDTamper(t *testing.T) {
+	key := mustKey(t)
+	tok, _ := Mint(key, MintOptions{Subject: "x"})
+	tok.RootID = "spoofed-root"
+	if err := tok.Verify(key); err == nil {
+		t.Fatal("expected verify failure on tampered RootID")
+	}
+}
+
+func TestCaveatCount(t *testing.T) {
+	key := mustKey(t)
+	root, _ := Mint(key, MintOptions{Subject: "x"})
+	rootCount := root.CaveatCount()
+	child, _ := Attenuate(root, Caveat{Type: CaveatToolWhitelist, Tools: []string{"a"}})
+	if child.CaveatCount() != rootCount+1 {
+		t.Errorf("child CaveatCount=%d, want %d", child.CaveatCount(), rootCount+1)
 	}
 }
 

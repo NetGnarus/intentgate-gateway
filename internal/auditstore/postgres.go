@@ -101,14 +101,16 @@ func (s *PostgresStore) Insert(ctx context.Context, e audit.Event) error {
 			agent_id, session_id,
 			tool, arg_keys,
 			capability_token_id, intent_summary,
-			latency_ms, remote_ip, upstream_status
+			latency_ms, remote_ip, upstream_status,
+			root_capability_token_id, caveat_count
 		) VALUES (
 			$1, $2, $3,
 			$4, $5, $6,
 			$7, $8,
 			$9, $10,
 			$11, $12,
-			$13, $14, $15
+			$13, $14, $15,
+			$16, $17
 		)
 	`
 	if _, err := s.pool.Exec(ctx, q,
@@ -118,10 +120,29 @@ func (s *PostgresStore) Insert(ctx context.Context, e audit.Event) error {
 		e.Tool, argKeysJSON,
 		e.CapabilityTokenID, e.IntentSummary,
 		e.LatencyMS, e.RemoteIP, e.UpstreamStatus,
+		nullableString(e.RootCapabilityTokenID), nullableInt(e.CaveatCount),
 	); err != nil {
 		return fmt.Errorf("auditstore: insert: %w", err)
 	}
 	return nil
+}
+
+// nullableString turns "" into nil so the database stores NULL rather
+// than an empty string (cleaner queries, matches the audit-event
+// omitempty convention).
+func nullableString(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
+}
+
+// nullableInt turns 0 into nil for the same reason.
+func nullableInt(n int) any {
+	if n == 0 {
+		return nil
+	}
+	return n
 }
 
 // Query returns matching events most-recent first.
@@ -145,7 +166,8 @@ func (s *PostgresStore) Query(ctx context.Context, f QueryFilter) ([]audit.Event
 			agent_id, session_id,
 			tool, arg_keys,
 			capability_token_id, intent_summary,
-			latency_ms, remote_ip, upstream_status
+			latency_ms, remote_ip, upstream_status,
+			root_capability_token_id, caveat_count
 		FROM audit_events
 	` + where + `
 		ORDER BY ts DESC
@@ -166,6 +188,8 @@ func (s *PostgresStore) Query(ctx context.Context, f QueryFilter) ([]audit.Event
 			ev          audit.Event
 			decision    string
 			check       string
+			rootJTI     *string
+			caveatCount *int
 		)
 		if err := rows.Scan(
 			&ts, &ev.EventName, &ev.SchemaVersion,
@@ -174,8 +198,15 @@ func (s *PostgresStore) Query(ctx context.Context, f QueryFilter) ([]audit.Event
 			&ev.Tool, &argKeysJSON,
 			&ev.CapabilityTokenID, &ev.IntentSummary,
 			&ev.LatencyMS, &ev.RemoteIP, &ev.UpstreamStatus,
+			&rootJTI, &caveatCount,
 		); err != nil {
 			return nil, fmt.Errorf("auditstore: scan: %w", err)
+		}
+		if rootJTI != nil {
+			ev.RootCapabilityTokenID = *rootJTI
+		}
+		if caveatCount != nil {
+			ev.CaveatCount = *caveatCount
 		}
 		ev.Timestamp = ts.UTC().Format(time.RFC3339Nano)
 		ev.Decision = audit.Decision(decision)

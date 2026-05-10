@@ -93,6 +93,16 @@ type Event struct {
 	// Capability token identity (the jti). Helpful for correlating an
 	// incident back to the issuance event.
 	CapabilityTokenID string `json:"capability_token_id,omitempty"`
+	// RootCapabilityTokenID is the JTI of the chain root for an
+	// attenuated/delegated token. Equal to CapabilityTokenID for
+	// root tokens. Lets a SOC analyst reconstruct a delegation tree
+	// from the audit log: events with the same root_jti but different
+	// caveat_count traversed different delegation paths.
+	RootCapabilityTokenID string `json:"root_capability_token_id,omitempty"`
+	// CaveatCount is the number of caveats currently bound to the
+	// token's chain. Coarse-grained "is this more constrained than
+	// that?" telemetry; not a security claim.
+	CaveatCount int `json:"caveat_count,omitempty"`
 	// Intent summary captured by the extractor (one line of the user
 	// prompt). Never the raw prompt — that may contain sensitive data.
 	IntentSummary string `json:"intent_summary,omitempty"`
@@ -112,11 +122,19 @@ type Event struct {
 
 // NewEvent constructs an Event with the timestamp, event name, and
 // schema version pre-populated. Callers fill in the rest.
+//
+// Schema versions:
+//
+//	"1" — gateway 0.1–0.6: original OCSF-lite shape.
+//	"2" — gateway 0.7+: adds root_capability_token_id and caveat_count
+//	      for delegation visibility. Field-add is backwards compatible
+//	      for SIEM mappings — old fields unchanged, new fields
+//	      omitempty when zero.
 func NewEvent(d Decision, tool string) Event {
 	return Event{
 		Timestamp:     time.Now().UTC().Format(time.RFC3339Nano),
 		EventName:     "intentgate.tool_call",
-		SchemaVersion: "1",
+		SchemaVersion: "2",
 		Decision:      d,
 		Tool:          tool,
 	}

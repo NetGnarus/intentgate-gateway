@@ -766,6 +766,8 @@ func (h *mcpHandler) emitAudit(
 
 	if cap.token != nil {
 		e.CapabilityTokenID = cap.token.ID
+		e.RootCapabilityTokenID = cap.token.RootID
+		e.CaveatCount = cap.token.CaveatCount()
 	}
 	if intent.intent != nil {
 		e.IntentSummary = intent.intent.Summary
