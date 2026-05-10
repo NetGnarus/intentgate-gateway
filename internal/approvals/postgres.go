@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -162,17 +163,17 @@ func (s *PostgresStore) Enqueue(ctx context.Context, req PendingRequest) (Pendin
 		INSERT INTO pending_approvals (
 			pending_id, capability_token_id, root_capability_token_id,
 			agent_id, tool, args, intent_summary, reason,
-			status, created_at
+			status, created_at, tenant
 		) VALUES (
 			$1, $2, $3,
 			$4, $5, $6, $7, $8,
-			'pending', $9
+			'pending', $9, $10
 		)
 	`
 	if _, err := s.pool.Exec(ctx, q,
 		req.PendingID, nullableString(req.CapabilityTokenID), nullableString(req.RootCapabilityTokenID),
 		req.AgentID, req.Tool, argsJSON, req.IntentSummary, req.Reason,
-		req.CreatedAt,
+		req.CreatedAt, nullableString(req.Tenant),
 	); err != nil {
 		return PendingRequest{}, fmt.Errorf("approvals: insert: %w", err)
 	}
@@ -309,7 +310,7 @@ func (s *PostgresStore) Get(ctx context.Context, pendingID string) (PendingReque
 	const q = `
 		SELECT pending_id, capability_token_id, root_capability_token_id,
 			agent_id, tool, args, intent_summary, reason,
-			status, created_at, decided_at, decided_by, decide_note
+			status, created_at, decided_at, decided_by, decide_note, tenant
 		FROM pending_approvals
 		WHERE pending_id = $1
 	`
@@ -320,11 +321,12 @@ func (s *PostgresStore) Get(ctx context.Context, pendingID string) (PendingReque
 		args    []byte
 		decAt   *time.Time
 		status  string
+		tenant  *string
 	)
 	err := s.pool.QueryRow(ctx, q, pendingID).Scan(
 		&row.PendingID, &captok, &roottok,
 		&row.AgentID, &row.Tool, &args, &row.IntentSummary, &row.Reason,
-		&status, &row.CreatedAt, &decAt, &row.DecidedBy, &row.DecideNote,
+		&status, &row.CreatedAt, &decAt, &row.DecidedBy, &row.DecideNote, &tenant,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return PendingRequest{}, ErrNotFound
@@ -337,6 +339,9 @@ func (s *PostgresStore) Get(ctx context.Context, pendingID string) (PendingReque
 	}
 	if roottok != nil {
 		row.RootCapabilityTokenID = *roottok
+	}
+	if tenant != nil {
+		row.Tenant = *tenant
 	}
 	row.Status = Status(status)
 	row.DecidedAt = decAt
@@ -363,17 +368,23 @@ func (s *PostgresStore) List(ctx context.Context, f ListFilter) ([]PendingReques
 	q := `
 		SELECT pending_id, capability_token_id, root_capability_token_id,
 			agent_id, tool, args, intent_summary, reason,
-			status, created_at, decided_at, decided_by, decide_note
+			status, created_at, decided_at, decided_by, decide_note, tenant
 		FROM pending_approvals
 	`
 	args := []any{}
+	clauses := []string{}
 	if f.Status != "" {
-		q += " WHERE status = $1"
 		args = append(args, string(f.Status))
-		q += fmt.Sprintf(" ORDER BY created_at DESC LIMIT $%d OFFSET $%d", len(args)+1, len(args)+2)
-	} else {
-		q += fmt.Sprintf(" ORDER BY created_at DESC LIMIT $%d OFFSET $%d", len(args)+1, len(args)+2)
+		clauses = append(clauses, fmt.Sprintf("status = $%d", len(args)))
 	}
+	if f.Tenant != "" {
+		args = append(args, f.Tenant)
+		clauses = append(clauses, fmt.Sprintf("tenant = $%d", len(args)))
+	}
+	if len(clauses) > 0 {
+		q += " WHERE " + strings.Join(clauses, " AND ")
+	}
+	q += fmt.Sprintf(" ORDER BY created_at DESC LIMIT $%d OFFSET $%d", len(args)+1, len(args)+2)
 	args = append(args, limit, offset)
 
 	rows, err := s.pool.Query(ctx, q, args...)
@@ -391,11 +402,12 @@ func (s *PostgresStore) List(ctx context.Context, f ListFilter) ([]PendingReques
 			rawArgs []byte
 			decAt   *time.Time
 			status  string
+			tenant  *string
 		)
 		if err := rows.Scan(
 			&row.PendingID, &captok, &roottok,
 			&row.AgentID, &row.Tool, &rawArgs, &row.IntentSummary, &row.Reason,
-			&status, &row.CreatedAt, &decAt, &row.DecidedBy, &row.DecideNote,
+			&status, &row.CreatedAt, &decAt, &row.DecidedBy, &row.DecideNote, &tenant,
 		); err != nil {
 			return nil, fmt.Errorf("approvals: scan: %w", err)
 		}
@@ -404,6 +416,9 @@ func (s *PostgresStore) List(ctx context.Context, f ListFilter) ([]PendingReques
 		}
 		if roottok != nil {
 			row.RootCapabilityTokenID = *roottok
+		}
+		if tenant != nil {
+			row.Tenant = *tenant
 		}
 		row.Status = Status(status)
 		row.DecidedAt = decAt

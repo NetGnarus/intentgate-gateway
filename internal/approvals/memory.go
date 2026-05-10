@@ -124,7 +124,9 @@ func (s *MemoryStore) Get(_ context.Context, pendingID string) (PendingRequest, 
 	return row.req, nil
 }
 
-// List returns rows matching the filter, most-recent first.
+// List returns rows matching the filter, most-recent first. Tenant
+// scoping: empty filter.Tenant returns ALL rows (superadmin view);
+// non-empty filters to rows whose tenant matches exactly.
 func (s *MemoryStore) List(_ context.Context, f ListFilter) ([]PendingRequest, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -132,6 +134,9 @@ func (s *MemoryStore) List(_ context.Context, f ListFilter) ([]PendingRequest, e
 	all := make([]PendingRequest, 0, len(s.rows))
 	for _, r := range s.rows {
 		if f.Status != "" && r.req.Status != f.Status {
+			continue
+		}
+		if f.Tenant != "" && r.req.Tenant != f.Tenant {
 			continue
 		}
 		all = append(all, r.req)

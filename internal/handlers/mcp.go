@@ -587,6 +587,7 @@ func (h *mcpHandler) runApprovalFlow(
 	if capResult.token != nil {
 		pending.CapabilityTokenID = capResult.token.ID
 		pending.RootCapabilityTokenID = capResult.token.RootID
+		pending.Tenant = capResult.token.Tenant
 	}
 
 	row, err := h.cfg.Approvals.Enqueue(ctx, pending)

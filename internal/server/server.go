@@ -82,9 +82,14 @@ type Config struct {
 	// tokens revoked after issuance. nil means the revocation step is
 	// skipped (dev convenience). Production supplies a real store.
 	Revocation revocation.Store
-	// AdminToken is the shared secret the /v1/admin/* endpoints check
-	// in constant time. When empty, admin endpoints are disabled.
+	// AdminToken is the superadmin shared secret. Holders see and
+	// operate on every tenant. Empty disables the superadmin path
+	// — per-tenant admins (TenantAdmins) can still authenticate.
 	AdminToken string
+	// TenantAdmins maps tenant → admin token. Each holder is scoped
+	// to their tenant for every admin operation. nil/empty means
+	// only the superadmin (if set) can hit /v1/admin/*.
+	TenantAdmins map[string]string
 	// Metrics is the Prometheus instrumentation. nil disables both the
 	// /metrics endpoint and per-handler observation calls (handlers
 	// guard against nil internally).
@@ -147,17 +152,17 @@ func New(cfg Config) *http.Server {
 		mux.Handle("GET /metrics", cfg.Metrics.Handler())
 	}
 
-	// Admin API. Wired in only when an admin token is configured;
-	// without one, every request would fail 401 anyway and exposing
-	// the routes adds no value. With one, the operator (or admin UI)
-	// can revoke tokens and inspect the revocation list.
-	if cfg.AdminToken != "" {
+	// Admin API. Wired in when at least one admin path is configured
+	// (superadmin OR per-tenant). Without any, every request would
+	// fail 401 anyway and exposing the routes adds no value.
+	if cfg.AdminToken != "" || len(cfg.TenantAdmins) > 0 {
 		adminCfg := handlers.AdminConfig{
-			Logger:     logger,
-			AdminToken: cfg.AdminToken,
-			MasterKey:  cfg.MasterKey,
-			Revocation: cfg.Revocation,
-			Audit:      cfg.Audit,
+			Logger:       logger,
+			AdminToken:   cfg.AdminToken,
+			TenantAdmins: cfg.TenantAdmins,
+			MasterKey:    cfg.MasterKey,
+			Revocation:   cfg.Revocation,
+			Audit:        cfg.Audit,
 		}
 		mux.Handle("POST /v1/admin/revoke", handlers.NewAdminRevokeHandler(adminCfg))
 		mux.Handle("GET /v1/admin/revocations", handlers.NewAdminRevocationsListHandler(adminCfg))

@@ -76,6 +76,13 @@
 //	                                human decision before timing out
 //	                                and returning block. Default 300
 //	                                (5 minutes).
+//	INTENTGATE_TENANT_ADMINS       Comma-separated tenant:token pairs
+//	                                that scope admin operations to a
+//	                                single tenant.
+//	                                Example: "acme:tok-a,globex:tok-b".
+//	                                Coexists with INTENTGATE_ADMIN_TOKEN
+//	                                (the superadmin); a deployment can
+//	                                set both, neither, or just one.
 //	INTENTGATE_UPSTREAM_URL         URL of the downstream MCP tool server
 //	                                authorized calls are forwarded to. When
 //	                                unset, the gateway returns a stub allow
@@ -172,6 +179,7 @@ func main() {
 	sentinelClientSecret := envOr("INTENTGATE_SIEM_SENTINEL_CLIENT_SECRET", "")
 	approvalsBackend := envOr("INTENTGATE_APPROVALS_BACKEND", "memory")
 	approvalTimeoutS := envOr("INTENTGATE_APPROVAL_TIMEOUT_S", "300")
+	tenantAdminsRaw := envOr("INTENTGATE_TENANT_ADMINS", "")
 	upstreamURL := envOr("INTENTGATE_UPSTREAM_URL", "")
 	upstreamTimeoutMS := envOr("INTENTGATE_UPSTREAM_TIMEOUT_MS", "")
 	postgresURL := envOr("INTENTGATE_POSTGRES_URL", "")
@@ -302,6 +310,16 @@ func main() {
 		adminTokenDesc = "configured"
 	}
 
+	tenantAdmins, err := parseTenantAdmins(tenantAdminsRaw)
+	if err != nil {
+		logger.Error("INTENTGATE_TENANT_ADMINS invalid", "err", err)
+		os.Exit(1)
+	}
+	tenantAdminsDesc := "none"
+	if n := len(tenantAdmins); n > 0 {
+		tenantAdminsDesc = fmt.Sprintf("%d tenant(s)", n)
+	}
+
 	metricsHandle := metrics.New(metrics.Config{IncludeRuntimeMetrics: metricsEnabled})
 
 	otelShutdown, otelDesc, err := loadTracing(context.Background(), version, otelEndpoint)
@@ -330,6 +348,7 @@ func main() {
 		"upstream", upstreamDesc,
 		"revocation_store", revocationDesc,
 		"admin_api", adminTokenDesc,
+		"tenant_admins", tenantAdminsDesc,
 		"approvals", approvalsDesc,
 		"metrics_endpoint", metricsEnabled,
 		"otel_tracing", otelDesc,
@@ -353,6 +372,7 @@ func main() {
 		Revocation:            revocationStore,
 		Approvals:             approvalsStore,
 		ApprovalTimeout:       approvalTimeout,
+		TenantAdmins:          tenantAdmins,
 		AdminToken:            adminToken,
 		Metrics:               metricsHandle,
 		EnableMetricsEndpoint: metricsEnabled,
@@ -672,6 +692,40 @@ func loadAuditStore(ctx context.Context, logger *slog.Logger, postgresURL string
 	})
 	logger.Info("audit store: postgres", "persist", true)
 	return store, em, "postgres", nil
+}
+
+// parseTenantAdmins reads INTENTGATE_TENANT_ADMINS into a map.
+//
+// Format: "tenant1:token1,tenant2:token2". Whitespace around each
+// component is trimmed; entries with empty tenant or empty token are
+// rejected at startup so a typo doesn't silently lock out an admin.
+// Tokens MUST NOT contain commas (encoded if needed) or colons in
+// the tenant name; the parser refuses ambiguous inputs.
+func parseTenantAdmins(raw string) (map[string]string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	out := make(map[string]string)
+	for _, pair := range strings.Split(raw, ",") {
+		pair = strings.TrimSpace(pair)
+		if pair == "" {
+			continue
+		}
+		idx := strings.Index(pair, ":")
+		if idx <= 0 || idx == len(pair)-1 {
+			return nil, fmt.Errorf("entry %q must be in tenant:token format", pair)
+		}
+		tenant := strings.TrimSpace(pair[:idx])
+		token := strings.TrimSpace(pair[idx+1:])
+		if tenant == "" || token == "" {
+			return nil, fmt.Errorf("entry %q has empty tenant or token", pair)
+		}
+		if _, dup := out[tenant]; dup {
+			return nil, fmt.Errorf("duplicate tenant %q in TENANT_ADMINS", tenant)
+		}
+		out[tenant] = token
+	}
+	return out, nil
 }
 
 // loadApprovals constructs the human-approval queue.

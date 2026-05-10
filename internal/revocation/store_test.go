@@ -20,10 +20,10 @@ func runStoreContract(t *testing.T, s Store) {
 	}
 
 	// Revoke; revoking twice is a no-op (idempotent).
-	if err := s.Revoke(ctx, "tok1", "leaked"); err != nil {
+	if err := s.Revoke(ctx, "tok1", "leaked", ""); err != nil {
 		t.Fatalf("Revoke 1: %v", err)
 	}
-	if err := s.Revoke(ctx, "tok1", "leaked"); err != nil {
+	if err := s.Revoke(ctx, "tok1", "leaked", ""); err != nil {
 		t.Fatalf("Revoke 2 (idempotent): %v", err)
 	}
 
@@ -36,15 +36,16 @@ func runStoreContract(t *testing.T, s Store) {
 		t.Fatalf("tok2: revoked=%v err=%v; want false, nil", revoked, err)
 	}
 
-	// Revoke a few more so List has something to sort.
-	if err := s.Revoke(ctx, "tok2", "agent compromise"); err != nil {
+	// Revoke a few more so List has something to sort. Mix tenants to
+	// also exercise per-tenant filtering at the contract level.
+	if err := s.Revoke(ctx, "tok2", "agent compromise", "acme"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Revoke(ctx, "tok3", ""); err != nil {
+	if err := s.Revoke(ctx, "tok3", "", "globex"); err != nil {
 		t.Fatal(err)
 	}
 
-	list, err := s.List(ctx, 10, 0)
+	list, err := s.List(ctx, "", 10, 0)
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
@@ -69,7 +70,7 @@ func runStoreContract(t *testing.T, s Store) {
 	}
 
 	// Pagination: offset past the end returns empty, not error.
-	page, err := s.List(ctx, 10, 1000)
+	page, err := s.List(ctx, "", 10, 1000)
 	if err != nil {
 		t.Fatalf("List with high offset: %v", err)
 	}
@@ -77,13 +78,23 @@ func runStoreContract(t *testing.T, s Store) {
 		t.Errorf("List with high offset: got %d entries, want 0", len(page))
 	}
 
+	// Per-tenant filter: acme admin sees only tok2, not tok1 (no
+	// tenant) or tok3 (different tenant).
+	acme, err := s.List(ctx, "acme", 100, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(acme) != 1 || acme[0].JTI != "tok2" {
+		t.Errorf("acme List: %+v want [tok2]", acme)
+	}
+
 	// Reason update preserves original revoked_at semantics.
 	// (We can't assert on RevokedAt directly across implementations
 	// without races, but we can confirm the new reason is observable.)
-	if err := s.Revoke(ctx, "tok1", "updated reason"); err != nil {
+	if err := s.Revoke(ctx, "tok1", "updated reason", ""); err != nil {
 		t.Fatal(err)
 	}
-	got, err := s.List(ctx, 100, 0)
+	got, err := s.List(ctx, "", 100, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

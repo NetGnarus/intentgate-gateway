@@ -88,32 +88,52 @@ func (s *PostgresStore) IsRevoked(ctx context.Context, jti string) (bool, error)
 }
 
 // Revoke is idempotent. ON CONFLICT updates the reason but keeps the
-// original revoked_at — the audit story is "when was this first
-// revoked", not "when did the operator update the note".
-func (s *PostgresStore) Revoke(ctx context.Context, jti, reason string) error {
+// original revoked_at AND the original tenant — the audit story is
+// "when was this first revoked, by whom", not "who touched the note
+// most recently".
+func (s *PostgresStore) Revoke(ctx context.Context, jti, reason, tenant string) error {
 	const q = `
-		INSERT INTO revoked_tokens (jti, reason)
-		VALUES ($1, $2)
+		INSERT INTO revoked_tokens (jti, reason, tenant)
+		VALUES ($1, $2, $3)
 		ON CONFLICT (jti) DO UPDATE SET reason = EXCLUDED.reason
 	`
-	if _, err := s.pool.Exec(ctx, q, jti, reason); err != nil {
+	if _, err := s.pool.Exec(ctx, q, jti, reason, nullableString(tenant)); err != nil {
 		return fmt.Errorf("revocation: insert: %w", err)
 	}
 	return nil
 }
 
 // List returns recent revocations, most-recent first.
-func (s *PostgresStore) List(ctx context.Context, limit, offset int) ([]RevokedToken, error) {
+//
+// tenant=="" returns ALL rows (superadmin view). A non-empty tenant
+// filters to rows whose tenant column matches exactly. Rows with
+// NULL tenant (legacy or superadmin-issued) are NOT visible to
+// per-tenant admins.
+func (s *PostgresStore) List(ctx context.Context, tenant string, limit, offset int) ([]RevokedToken, error) {
 	if limit <= 0 {
 		limit = 100
 	}
-	const q = `
-		SELECT jti, revoked_at, reason
-		FROM revoked_tokens
-		ORDER BY revoked_at DESC
-		LIMIT $1 OFFSET $2
-	`
-	rows, err := s.pool.Query(ctx, q, limit, offset)
+	var q string
+	var args []any
+	if tenant == "" {
+		q = `
+			SELECT jti, revoked_at, reason, tenant
+			FROM revoked_tokens
+			ORDER BY revoked_at DESC
+			LIMIT $1 OFFSET $2
+		`
+		args = []any{limit, offset}
+	} else {
+		q = `
+			SELECT jti, revoked_at, reason, tenant
+			FROM revoked_tokens
+			WHERE tenant = $1
+			ORDER BY revoked_at DESC
+			LIMIT $2 OFFSET $3
+		`
+		args = []any{tenant, limit, offset}
+	}
+	rows, err := s.pool.Query(ctx, q, args...)
 	if err != nil {
 		return nil, fmt.Errorf("revocation: query list: %w", err)
 	}
@@ -121,9 +141,15 @@ func (s *PostgresStore) List(ctx context.Context, limit, offset int) ([]RevokedT
 
 	out := make([]RevokedToken, 0, limit)
 	for rows.Next() {
-		var rt RevokedToken
-		if err := rows.Scan(&rt.JTI, &rt.RevokedAt, &rt.Reason); err != nil {
+		var (
+			rt    RevokedToken
+			tnant *string
+		)
+		if err := rows.Scan(&rt.JTI, &rt.RevokedAt, &rt.Reason, &tnant); err != nil {
 			return nil, fmt.Errorf("revocation: scan: %w", err)
+		}
+		if tnant != nil {
+			rt.Tenant = *tnant
 		}
 		out = append(out, rt)
 	}
@@ -131,4 +157,12 @@ func (s *PostgresStore) List(ctx context.Context, limit, offset int) ([]RevokedT
 		return nil, fmt.Errorf("revocation: rows iter: %w", err)
 	}
 	return out, nil
+}
+
+// nullableString turns "" into nil so the database stores NULL.
+func nullableString(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
 }

@@ -29,8 +29,19 @@ CREATE TABLE IF NOT EXISTS pending_approvals (
     created_at               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     decided_at               TIMESTAMPTZ,
     decided_by               TEXT NOT NULL DEFAULT '',
-    decide_note              TEXT NOT NULL DEFAULT ''
+    decide_note              TEXT NOT NULL DEFAULT '',
+
+    -- Tenant scope (multi-tenant, gateway 1.0+). Per-tenant admins
+    -- only see / decide their own tenant's pending rows.
+    tenant                   TEXT
 );
+
+ALTER TABLE pending_approvals
+    ADD COLUMN IF NOT EXISTS tenant TEXT;
+
+CREATE INDEX IF NOT EXISTS pending_approvals_tenant_pending_idx
+    ON pending_approvals (tenant, created_at DESC)
+    WHERE status = 'pending' AND tenant IS NOT NULL;
 
 -- The console's "show me the pending queue" call filters on status +
 -- orders by created_at DESC. The partial index keeps lookups cheap

@@ -54,6 +54,11 @@ type RevokedToken struct {
 	RevokedAt time.Time `json:"revoked_at"`
 	// Reason is operator-supplied context. May be empty.
 	Reason string `json:"reason,omitempty"`
+	// Tenant scopes the revocation. Per-tenant admins set this on
+	// revoke; superadmin-revoked rows carry empty tenant. Per-tenant
+	// list queries filter on this field; superadmin queries see
+	// every row. Empty string normalizes to NULL on Postgres.
+	Tenant string `json:"tenant,omitempty"`
 }
 
 // Store is the contract every revocation backend implements.
@@ -71,11 +76,19 @@ type Store interface {
 	IsRevoked(ctx context.Context, jti string) (bool, error)
 
 	// Revoke records a revocation. Idempotent: revoking an already-
-	// revoked JTI is not an error. Reason may be empty.
-	Revoke(ctx context.Context, jti, reason string) error
+	// revoked JTI is not an error. Reason may be empty. Tenant is
+	// stored for attribution and admin-list scoping, NOT for
+	// hot-path enforcement — IsRevoked is tenant-blind because a
+	// revoked JTI is revoked everywhere. JTIs are 16-byte random,
+	// so cross-tenant collisions are not a real concern.
+	Revoke(ctx context.Context, jti, reason, tenant string) error
 
 	// List returns recent revocations, most-recent first. limit caps
 	// the page size; offset enables pagination. Used by the admin UI;
-	// not on the request path.
-	List(ctx context.Context, limit, offset int) ([]RevokedToken, error)
+	// not on the request path. Tenant scopes the result — empty
+	// returns ALL rows (superadmin view); a non-empty tenant filters
+	// to that tenant's revocations only. Rows whose tenant is NULL
+	// (revocations recorded before multi-tenant) are visible only to
+	// the superadmin (empty filter).
+	List(ctx context.Context, tenant string, limit, offset int) ([]RevokedToken, error)
 }

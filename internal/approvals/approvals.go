@@ -99,6 +99,11 @@ type PendingRequest struct {
 	// safe to expose in URLs.
 	PendingID string `json:"pending_id"`
 
+	// Tenant is the trust-domain namespace the request was made
+	// under, copied from the verified capability token. Per-tenant
+	// admins see / decide only rows whose tenant matches their own.
+	Tenant string `json:"tenant,omitempty"`
+
 	// CapabilityTokenID and RootCapabilityTokenID correlate with the
 	// audit event for this same request.
 	CapabilityTokenID     string `json:"capability_token_id,omitempty"`
@@ -183,6 +188,10 @@ type Store interface {
 // ListFilter narrows [Store.List] results.
 type ListFilter struct {
 	Status Status
+	// Tenant scopes the result. Empty = ALL rows (superadmin view);
+	// non-empty filters to that tenant's rows only. Per-tenant admin
+	// callers MUST set this to their own tenant.
+	Tenant string
 	Limit  int
 	Offset int
 }

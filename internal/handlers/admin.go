@@ -21,26 +21,36 @@ import (
 
 // AdminConfig configures the admin-API handlers.
 //
-// Admin endpoints are guarded by a static shared secret (the admin
-// token). The token is supplied at startup via INTENTGATE_ADMIN_TOKEN
-// and compared in constant time on every request.
+// Admin endpoints are guarded by static shared secrets (the admin
+// tokens). Tokens come in two flavours:
+//
+//   - Superadmin (AdminToken). One token, sees and operates on every
+//     tenant. Useful for break-glass and ops. Disabled when empty.
+//   - Per-tenant (TenantAdmins). One token per tenant. Each token
+//     scopes ALL admin operations to that single tenant: mint stamps
+//     it, revoke writes it, list filters it, audit query forces the
+//     filter, approvals decide rejects cross-tenant ids as 404.
+//
+// Both shapes can coexist. Tokens are compared in constant time on
+// every request — across the entire registry, so a per-tenant
+// attempt doesn't reveal which tenant's token they tried.
 //
 // A static token is intentional for v1: it matches the self-hosted,
 // single-operator deployment shape the gateway targets and avoids
-// dragging in OIDC/JWT machinery before a real second user exists. A
-// future commercial control plane can layer a richer auth model in
-// front of this same surface.
+// dragging in OIDC/JWT machinery before a real second user exists.
 //
-// MasterKey is the HMAC secret used by the mint endpoint. It is the
-// same key the gateway uses to verify capability tokens on /v1/mcp;
-// the mint endpoint signs new tokens under it. When MasterKey is empty
-// the mint endpoint is unavailable (returns 503).
+// MasterKey is the HMAC secret used by the mint endpoint. When
+// MasterKey is empty the mint endpoint is unavailable (returns 503).
 type AdminConfig struct {
 	Logger     *slog.Logger
 	AdminToken string
-	MasterKey  []byte
-	Revocation revocation.Store
-	Audit      audit.Emitter
+	// TenantAdmins maps tenant name → token. Empty / nil means no
+	// per-tenant admins are configured; only the superadmin (if set)
+	// can hit /v1/admin/*.
+	TenantAdmins map[string]string
+	MasterKey    []byte
+	Revocation   revocation.Store
+	Audit        audit.Emitter
 	// AuditStore is the queryable audit store consulted by the
 	// /v1/admin/audit endpoint. Optional; when nil, that endpoint is
 	// not registered.
@@ -73,7 +83,8 @@ func NewAdminRevokeHandler(cfg AdminConfig) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 
-		if !checkAdminToken(r, cfg.AdminToken) {
+		auth := resolveAdminAuth(r, cfg)
+		if !auth.ok {
 			adminError(w, http.StatusUnauthorized, "invalid or missing admin token")
 			return
 		}
@@ -97,7 +108,7 @@ func NewAdminRevokeHandler(cfg AdminConfig) http.Handler {
 			return
 		}
 
-		if err := cfg.Revocation.Revoke(r.Context(), body.JTI, body.Reason); err != nil {
+		if err := cfg.Revocation.Revoke(r.Context(), body.JTI, body.Reason, auth.tenant); err != nil {
 			cfg.Logger.Error("revoke failed", "jti", body.JTI, "err", err)
 			adminError(w, http.StatusServiceUnavailable, "store error: "+err.Error())
 			return
@@ -110,6 +121,7 @@ func NewAdminRevokeHandler(cfg AdminConfig) http.Handler {
 		ev.Check = audit.CheckCapability
 		ev.Reason = "token revoked: " + body.Reason
 		ev.CapabilityTokenID = body.JTI
+		ev.Tenant = auth.tenant
 		ev.RemoteIP = r.RemoteAddr
 		cfg.Audit.Emit(r.Context(), ev)
 
@@ -128,7 +140,8 @@ func NewAdminRevocationsListHandler(cfg AdminConfig) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 
-		if !checkAdminToken(r, cfg.AdminToken) {
+		auth := resolveAdminAuth(r, cfg)
+		if !auth.ok {
 			adminError(w, http.StatusUnauthorized, "invalid or missing admin token")
 			return
 		}
@@ -140,7 +153,7 @@ func NewAdminRevocationsListHandler(cfg AdminConfig) http.Handler {
 		limit := parseIntParam(r, "limit", 100, 1, 1000)
 		offset := parseIntParam(r, "offset", 0, 0, 1<<31-1)
 
-		list, err := cfg.Revocation.List(r.Context(), limit, offset)
+		list, err := cfg.Revocation.List(r.Context(), auth.tenant, limit, offset)
 		if err != nil {
 			cfg.Logger.Error("revocation list failed", "err", err)
 			adminError(w, http.StatusServiceUnavailable, "store error: "+err.Error())
@@ -187,7 +200,8 @@ func NewAdminMintHandler(cfg AdminConfig) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 
-		if !checkAdminToken(r, cfg.AdminToken) {
+		auth := resolveAdminAuth(r, cfg)
+		if !auth.ok {
 			adminError(w, http.StatusUnauthorized, "invalid or missing admin token")
 			return
 		}
@@ -223,9 +237,25 @@ func NewAdminMintHandler(cfg AdminConfig) http.Handler {
 			return
 		}
 
+		// Tenant resolution rules:
+		//   - Per-tenant admin: their tenant wins. Body field is
+		//     ignored (or rejected if it disagrees) so a stolen
+		//     token can't be used to mint cross-tenant.
+		//   - Superadmin: body.tenant is honored, defaulting to
+		//     "default" via Mint when empty.
+		tenant := strings.TrimSpace(body.Tenant)
+		if auth.tenant != "" {
+			if tenant != "" && tenant != auth.tenant {
+				adminError(w, http.StatusForbidden,
+					"tenant in body does not match admin token's tenant")
+				return
+			}
+			tenant = auth.tenant
+		}
+
 		opts := capability.MintOptions{
 			Issuer:  strings.TrimSpace(body.Issuer),
-			Tenant:  strings.TrimSpace(body.Tenant),
+			Tenant:  tenant,
 			Subject: body.Subject,
 		}
 		if body.TTLSeconds > 0 {
@@ -328,7 +358,8 @@ func NewAdminAuditQueryHandler(cfg AdminConfig) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 
-		if !checkAdminToken(r, cfg.AdminToken) {
+		auth := resolveAdminAuth(r, cfg)
+		if !auth.ok {
 			adminError(w, http.StatusUnauthorized, "invalid or missing admin token")
 			return
 		}
@@ -338,13 +369,27 @@ func NewAdminAuditQueryHandler(cfg AdminConfig) http.Handler {
 		}
 
 		q := r.URL.Query()
+		// Per-tenant admins: tenant is forced from the resolver,
+		// query-string tenant is ignored (and rejected if it
+		// disagrees, to avoid a confusing silent override).
+		// Superadmin: ?tenant= is honored verbatim.
+		tenant := q.Get("tenant")
+		if auth.tenant != "" {
+			if tenant != "" && tenant != auth.tenant {
+				adminError(w, http.StatusForbidden,
+					"tenant in query does not match admin token's tenant")
+				return
+			}
+			tenant = auth.tenant
+		}
+
 		filter := auditstore.QueryFilter{
 			AgentID:           q.Get("agent_id"),
 			Tool:              q.Get("tool"),
 			Decision:          q.Get("decision"),
 			Check:             q.Get("check"),
 			CapabilityTokenID: q.Get("jti"),
-			Tenant:            q.Get("tenant"),
+			Tenant:            tenant,
 			Limit:             parseIntParam(r, "limit", 100, 1, 1000),
 			Offset:            parseIntParam(r, "offset", 0, 0, 1<<31-1),
 		}
@@ -467,7 +512,8 @@ func NewAdminApprovalsListHandler(cfg AdminConfig) http.Handler {
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		if !checkAdminToken(r, cfg.AdminToken) {
+		auth := resolveAdminAuth(r, cfg)
+		if !auth.ok {
 			adminError(w, http.StatusUnauthorized, "invalid or missing admin token")
 			return
 		}
@@ -478,6 +524,7 @@ func NewAdminApprovalsListHandler(cfg AdminConfig) http.Handler {
 
 		filter := approvals.ListFilter{
 			Status: approvals.Status(r.URL.Query().Get("status")),
+			Tenant: auth.tenant,
 			Limit:  parseIntParam(r, "limit", 100, 1, 1000),
 			Offset: parseIntParam(r, "offset", 0, 0, 1<<31-1),
 		}
@@ -508,7 +555,8 @@ func NewAdminApprovalsDecideHandler(cfg AdminConfig) http.Handler {
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		if !checkAdminToken(r, cfg.AdminToken) {
+		auth := resolveAdminAuth(r, cfg)
+		if !auth.ok {
 			adminError(w, http.StatusUnauthorized, "invalid or missing admin token")
 			return
 		}
@@ -545,6 +593,22 @@ func NewAdminApprovalsDecideHandler(cfg AdminConfig) http.Handler {
 			return
 		}
 
+		// Tenant scoping: a per-tenant admin can only decide rows in
+		// their tenant. We pre-check via Get so cross-tenant attempts
+		// return 404 (don't leak existence) rather than 403.
+		if auth.tenant != "" {
+			existing, gerr := cfg.Approvals.Get(r.Context(), pendingID)
+			if errors.Is(gerr, approvals.ErrNotFound) || existing.Tenant != auth.tenant {
+				adminError(w, http.StatusNotFound, "pending id not found")
+				return
+			}
+			if gerr != nil {
+				cfg.Logger.Error("approvals get failed", "err", gerr, "pending_id", pendingID)
+				adminError(w, http.StatusServiceUnavailable, "store error: "+gerr.Error())
+				return
+			}
+		}
+
 		row, err := cfg.Approvals.Decide(r.Context(), pendingID, approvals.Decision{
 			Status:    status,
 			DecidedBy: body.DecidedBy,
@@ -571,10 +635,53 @@ func NewAdminApprovalsDecideHandler(cfg AdminConfig) http.Handler {
 	})
 }
 
-// checkAdminToken returns true if the request carries a valid admin
-// token. Admin endpoints are unavailable when AdminToken is empty —
-// safer than degrading to "anyone can revoke any token", which is the
-// nightmare scenario.
+// adminAuth is the result of resolving a request's bearer token
+// against AdminConfig. ok=false means deny. ok=true with tenant=""
+// means superadmin (sees all tenants). ok=true with non-empty tenant
+// means a per-tenant admin scoped to that tenant.
+type adminAuth struct {
+	ok     bool
+	tenant string
+}
+
+// resolveAdminAuth checks the request's bearer token against the
+// superadmin token first, then every per-tenant token. ALL slots are
+// compared even on a hit — constant-time across the whole registry
+// so the response time doesn't leak which slot matched (or whether
+// any did). Empty config slots are skipped before the loop, not
+// during, so the per-request work is bounded by configured tenants.
+func resolveAdminAuth(r *http.Request, cfg AdminConfig) adminAuth {
+	got := r.Header.Get("Authorization")
+	got = strings.TrimSpace(strings.TrimPrefix(got, "Bearer "))
+	if got == "" {
+		return adminAuth{}
+	}
+	gotBytes := []byte(got)
+
+	out := adminAuth{}
+	// Superadmin first. ConstantTimeCompare with mismatched lengths
+	// returns 0 immediately; we still walk the per-tenant slots
+	// regardless to keep timing flat.
+	if cfg.AdminToken != "" &&
+		subtle.ConstantTimeCompare(gotBytes, []byte(cfg.AdminToken)) == 1 {
+		out = adminAuth{ok: true, tenant: ""}
+	}
+	for tenant, want := range cfg.TenantAdmins {
+		if want == "" {
+			continue
+		}
+		if subtle.ConstantTimeCompare(gotBytes, []byte(want)) == 1 && !out.ok {
+			out = adminAuth{ok: true, tenant: tenant}
+		}
+	}
+	return out
+}
+
+// checkAdminToken is the legacy boolean shim retained for
+// compatibility with handlers that haven't been ported to
+// resolveAdminAuth yet. Treats empty tenant ("superadmin") and any
+// per-tenant match the same. New handlers should call
+// resolveAdminAuth directly so they can scope by the resolved tenant.
 func checkAdminToken(r *http.Request, want string) bool {
 	if want == "" {
 		return false
