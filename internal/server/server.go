@@ -167,6 +167,12 @@ func New(cfg Config) *http.Server {
 		mux.Handle("POST /v1/admin/revoke", handlers.NewAdminRevokeHandler(adminCfg))
 		mux.Handle("GET /v1/admin/revocations", handlers.NewAdminRevocationsListHandler(adminCfg))
 		mux.Handle("POST /v1/admin/mint", handlers.NewAdminMintHandler(adminCfg))
+		// Tenants list — surfaces configured per-tenant admin scopes so
+		// the console can populate a tenant switcher. Always registered
+		// when admin auth is set; returns an empty list when no per-
+		// tenant admins are configured (the UI hides the switcher in
+		// that case).
+		mux.Handle("GET /v1/admin/tenants", handlers.NewAdminTenantsListHandler(adminCfg))
 		// Audit query is registered only when an AuditStore is wired
 		// in. Older deployments running stdout-only audit get a 404,
 		// which is what the console keys off to fall back to its
@@ -306,7 +312,7 @@ func routeLabel(path string) string {
 	case "/healthz", "/v1/tool-call", "/v1/mcp", "/metrics",
 		"/v1/admin/revoke", "/v1/admin/revocations", "/v1/admin/mint",
 		"/v1/admin/audit", "/v1/admin/integrations",
-		"/v1/admin/approvals":
+		"/v1/admin/approvals", "/v1/admin/tenants":
 		return path
 	}
 	// /v1/admin/approvals/{id}/decide collapses to a fixed label so

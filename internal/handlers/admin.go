@@ -635,6 +635,84 @@ func NewAdminApprovalsDecideHandler(cfg AdminConfig) http.Handler {
 	})
 }
 
+// NewAdminTenantsListHandler returns the GET /v1/admin/tenants handler.
+//
+// Surfaces the configured tenant identifiers so the console can
+// populate a tenant switcher. Scoping rules mirror the rest of the
+// admin API:
+//
+//   - Superadmin sees every tenant in cfg.TenantAdmins, sorted.
+//   - A per-tenant admin sees only their own tenant.
+//   - When the gateway is configured with neither (a single-tenant
+//     deploy that never set TenantAdmins) the response is an empty
+//     list — the console renders that as "no tenants configured" and
+//     hides the switcher rather than 404'ing.
+//
+// Body: {"tenants": [{"id": "acme", "has_admin": true}, ...]}.
+// has_admin is reserved for a future "tenants without an admin token
+// configured" view; today it is always true because every entry in
+// the response originates from cfg.TenantAdmins.
+func NewAdminTenantsListHandler(cfg AdminConfig) http.Handler {
+	if cfg.Logger == nil {
+		cfg.Logger = slog.Default()
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		auth := resolveAdminAuth(r, cfg)
+		if !auth.ok {
+			adminError(w, http.StatusUnauthorized, "invalid or missing admin token")
+			return
+		}
+
+		type tenantEntry struct {
+			ID       string `json:"id"`
+			HasAdmin bool   `json:"has_admin"`
+		}
+
+		var out []tenantEntry
+		if auth.tenant != "" {
+			// Per-tenant admin sees only its own tenant. We don't even
+			// look at cfg.TenantAdmins here — the resolved tenant came
+			// from constant-time auth, so it's already authoritative.
+			out = []tenantEntry{{ID: auth.tenant, HasAdmin: true}}
+		} else {
+			// Superadmin: every configured tenant, sorted for stable
+			// rendering in the switcher. We don't include the empty
+			// "" tenant; that's the superadmin scope itself, which the
+			// UI represents implicitly with "All tenants".
+			ids := make([]string, 0, len(cfg.TenantAdmins))
+			for tenant, tok := range cfg.TenantAdmins {
+				if tenant == "" || tok == "" {
+					continue
+				}
+				ids = append(ids, tenant)
+			}
+			// Sort in-place. sort.Strings is alphabetic which is good
+			// enough for a switcher (single-screen list, no pagination).
+			sortStringsInPlace(ids)
+			out = make([]tenantEntry, 0, len(ids))
+			for _, id := range ids {
+				out = append(out, tenantEntry{ID: id, HasAdmin: true})
+			}
+		}
+
+		_ = json.NewEncoder(w).Encode(map[string]any{"tenants": out})
+	})
+}
+
+// sortStringsInPlace is a tiny helper to keep the main package free
+// of an extra "sort" import here. Insertion sort is fine: tenant
+// counts are O(10) in practice; even O(1000) would still be cheap on
+// every admin request, and avoiding sort.Strings keeps imports tight.
+func sortStringsInPlace(a []string) {
+	for i := 1; i < len(a); i++ {
+		for j := i; j > 0 && a[j-1] > a[j]; j-- {
+			a[j-1], a[j] = a[j], a[j-1]
+		}
+	}
+}
+
 // adminAuth is the result of resolving a request's bearer token
 // against AdminConfig. ok=false means deny. ok=true with tenant=""
 // means superadmin (sees all tenants). ok=true with non-empty tenant
