@@ -15,6 +15,7 @@ import (
 	"github.com/NetGnarus/intentgate-gateway/internal/auditstore"
 	"github.com/NetGnarus/intentgate-gateway/internal/capability"
 	"github.com/NetGnarus/intentgate-gateway/internal/revocation"
+	"github.com/NetGnarus/intentgate-gateway/internal/siem"
 )
 
 // AdminConfig configures the admin-API handlers.
@@ -43,6 +44,11 @@ type AdminConfig struct {
 	// /v1/admin/audit endpoint. Optional; when nil, that endpoint is
 	// not registered.
 	AuditStore auditstore.Store
+	// SIEMReporters surfaces the configured SIEM-emitter statuses on
+	// /v1/admin/integrations. Nil / empty slice yields an empty
+	// integrations list rather than a 404 — the console renders that
+	// as "no integrations configured" guidance.
+	SIEMReporters []siem.StatusReporter
 }
 
 // NewAdminRevokeHandler returns the POST /v1/admin/revoke handler.
@@ -373,6 +379,64 @@ func NewAdminAuditQueryHandler(cfg AdminConfig) http.Handler {
 			}
 		}
 		_ = json.NewEncoder(w).Encode(resp)
+	})
+}
+
+// NewAdminIntegrationsHandler returns the GET /v1/admin/integrations
+// handler. Returns the read-only status of every wired SIEM emitter
+// (Splunk, Datadog) plus a stable list of "supported but not
+// configured" entries so the console can render greyed-out cards
+// with setup hints.
+//
+// Body:
+//
+//	{
+//	  "integrations": [
+//	    {
+//	      "name": "splunk",
+//	      "configured": true,
+//	      "endpoint": "https://splunk.example:8088/services/collector",
+//	      "last_flush_ts": "2026-05-09T15:30:00Z",
+//	      "total_events": 1234,
+//	      "dropped_count": 0,
+//	      "last_error": ""
+//	    },
+//	    { "name": "datadog", "configured": false }
+//	  ]
+//	}
+//
+// Sensitive config (tokens, API keys) is never returned.
+func NewAdminIntegrationsHandler(cfg AdminConfig) http.Handler {
+	if cfg.Logger == nil {
+		cfg.Logger = slog.Default()
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		if !checkAdminToken(r, cfg.AdminToken) {
+			adminError(w, http.StatusUnauthorized, "invalid or missing admin token")
+			return
+		}
+
+		// Index by name so we can fill stubs for the integrations the
+		// gateway *supports* but the operator hasn't wired up. The
+		// console wants a stable card grid; "splunk + datadog" is the
+		// canonical order in v0.6.
+		statuses := make(map[string]siem.Status)
+		for _, rep := range cfg.SIEMReporters {
+			s := rep.Status()
+			statuses[s.Name] = s
+		}
+
+		out := make([]siem.Status, 0, 3)
+		for _, name := range []string{"splunk", "datadog", "sentinel"} {
+			if s, ok := statuses[name]; ok {
+				out = append(out, s)
+			} else {
+				out = append(out, siem.Status{Name: name, Configured: false})
+			}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"integrations": out})
 	})
 }
 

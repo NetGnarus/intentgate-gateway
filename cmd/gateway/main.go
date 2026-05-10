@@ -40,6 +40,32 @@
 //	                                set, GET /v1/admin/audit becomes
 //	                                queryable. Default off so existing
 //	                                stdout-only deployments are unchanged.
+//	INTENTGATE_SIEM_SPLUNK_URL      Splunk HEC endpoint URL. When set
+//	                                with INTENTGATE_SIEM_SPLUNK_TOKEN,
+//	                                every audit event also ships to
+//	                                Splunk in batches.
+//	INTENTGATE_SIEM_SPLUNK_TOKEN    Splunk HEC token (header value).
+//	INTENTGATE_SIEM_SPLUNK_INDEX    Optional Splunk index. Empty routes
+//	                                to the token's default index.
+//	INTENTGATE_SIEM_DATADOG_API_KEY When set, every audit event also
+//	                                ships to Datadog Logs Intake.
+//	INTENTGATE_SIEM_DATADOG_SITE    Datadog regional site, default
+//	                                "datadoghq.com".
+//	INTENTGATE_SIEM_DATADOG_SERVICE Datadog "service" tag, default
+//	                                "intentgate-gateway".
+//	INTENTGATE_SIEM_SENTINEL_DCE_URL    Microsoft Sentinel Data
+//	                                Collection Endpoint URL.
+//	INTENTGATE_SIEM_SENTINEL_DCR_ID  Immutable ID of the Data
+//	                                Collection Rule.
+//	INTENTGATE_SIEM_SENTINEL_STREAM  Custom-table stream name, e.g.
+//	                                "Custom-IntentGate_CL".
+//	INTENTGATE_SIEM_SENTINEL_TENANT_ID    Azure AD tenant.
+//	INTENTGATE_SIEM_SENTINEL_CLIENT_ID    Service-principal client ID.
+//	INTENTGATE_SIEM_SENTINEL_CLIENT_SECRET  Service-principal secret.
+//	                                All six are required together;
+//	                                missing any disables the Sentinel
+//	                                emitter (or fails fast if some
+//	                                but not all are set).
 //	INTENTGATE_UPSTREAM_URL         URL of the downstream MCP tool server
 //	                                authorized calls are forwarded to. When
 //	                                unset, the gateway returns a stub allow
@@ -79,6 +105,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -91,6 +118,7 @@ import (
 	"github.com/NetGnarus/intentgate-gateway/internal/policy"
 	"github.com/NetGnarus/intentgate-gateway/internal/revocation"
 	"github.com/NetGnarus/intentgate-gateway/internal/server"
+	"github.com/NetGnarus/intentgate-gateway/internal/siem"
 	"github.com/NetGnarus/intentgate-gateway/internal/upstream"
 	"github.com/redis/go-redis/v9"
 
@@ -119,6 +147,18 @@ func main() {
 	redisURL := envOr("INTENTGATE_REDIS_URL", "")
 	auditTarget := envOr("INTENTGATE_AUDIT_TARGET", "stdout")
 	auditPersist := envOr("INTENTGATE_AUDIT_PERSIST", "") == "true"
+	splunkURL := envOr("INTENTGATE_SIEM_SPLUNK_URL", "")
+	splunkToken := envOr("INTENTGATE_SIEM_SPLUNK_TOKEN", "")
+	splunkIndex := envOr("INTENTGATE_SIEM_SPLUNK_INDEX", "")
+	datadogAPIKey := envOr("INTENTGATE_SIEM_DATADOG_API_KEY", "")
+	datadogSite := envOr("INTENTGATE_SIEM_DATADOG_SITE", "")
+	datadogService := envOr("INTENTGATE_SIEM_DATADOG_SERVICE", "")
+	sentinelDCEURL := envOr("INTENTGATE_SIEM_SENTINEL_DCE_URL", "")
+	sentinelDCRID := envOr("INTENTGATE_SIEM_SENTINEL_DCR_ID", "")
+	sentinelStream := envOr("INTENTGATE_SIEM_SENTINEL_STREAM", "")
+	sentinelTenantID := envOr("INTENTGATE_SIEM_SENTINEL_TENANT_ID", "")
+	sentinelClientID := envOr("INTENTGATE_SIEM_SENTINEL_CLIENT_ID", "")
+	sentinelClientSecret := envOr("INTENTGATE_SIEM_SENTINEL_CLIENT_SECRET", "")
 	upstreamURL := envOr("INTENTGATE_UPSTREAM_URL", "")
 	upstreamTimeoutMS := envOr("INTENTGATE_UPSTREAM_TIMEOUT_MS", "")
 	postgresURL := envOr("INTENTGATE_POSTGRES_URL", "")
@@ -170,11 +210,45 @@ func main() {
 		auditEmitter = audit.NewFanOut(auditEmitter, auditStoreEmitter)
 		auditDesc = auditDesc + "+" + auditStoreDesc
 	}
+
+	siemEmitters, siemReporters, siemDesc, err := loadSIEM(logger, siemEnv{
+		splunkURL:            splunkURL,
+		splunkToken:          splunkToken,
+		splunkIndex:          splunkIndex,
+		datadogAPIKey:        datadogAPIKey,
+		datadogSite:          datadogSite,
+		datadogService:       datadogService,
+		sentinelDCEURL:       sentinelDCEURL,
+		sentinelDCRID:        sentinelDCRID,
+		sentinelStream:       sentinelStream,
+		sentinelTenantID:     sentinelTenantID,
+		sentinelClientID:     sentinelClientID,
+		sentinelClientSecret: sentinelClientSecret,
+	})
+	if err != nil {
+		logger.Error("failed to initialize SIEM emitters", "err", err)
+		os.Exit(1)
+	}
+	if len(siemEmitters) > 0 {
+		all := []audit.Emitter{auditEmitter}
+		for _, e := range siemEmitters {
+			all = append(all, e)
+		}
+		auditEmitter = audit.NewFanOut(all...)
+		auditDesc = auditDesc + "+" + siemDesc
+	}
 	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		// Drain SIEM emitters first so any tail-end events make it
+		// to Splunk / Datadog before the process exits.
+		for _, e := range siemEmitters {
+			if s, ok := e.(siem.Stoppable); ok {
+				_ = s.Stop(shutdownCtx)
+			}
+		}
 		if auditStoreEmitter != nil {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			_ = auditStoreEmitter.Stop(ctx)
+			_ = auditStoreEmitter.Stop(shutdownCtx)
 		}
 		if auditStore != nil {
 			_ = auditStore.Close()
@@ -243,6 +317,7 @@ func main() {
 		RequireBudget:         requireBudget,
 		Audit:                 auditEmitter,
 		AuditStore:            auditStore,
+		SIEMReporters:         siemReporters,
 		Upstream:              upstreamClient,
 		Revocation:            revocationStore,
 		AdminToken:            adminToken,
@@ -437,6 +512,105 @@ func loadTracing(ctx context.Context, version, endpoint string) (func(context.Co
 	otel.SetTracerProvider(tp)
 
 	return tp.Shutdown, fmt.Sprintf("enabled (otlp grpc: %s)", endpoint), nil
+}
+
+// siemEnv groups the SIEM-related environment variables so loadSIEM
+// has a small, stable signature.
+type siemEnv struct {
+	splunkURL            string
+	splunkToken          string
+	splunkIndex          string
+	datadogAPIKey        string
+	datadogSite          string
+	datadogService       string
+	sentinelDCEURL       string
+	sentinelDCRID        string
+	sentinelStream       string
+	sentinelTenantID     string
+	sentinelClientID     string
+	sentinelClientSecret string
+}
+
+// loadSIEM constructs whichever SIEM emitters the operator has wired
+// via env vars. Returns:
+//
+//   - emitters    : audit.Emitter slice ready to drop into the fan-out
+//   - reporters   : siem.StatusReporter slice for the admin endpoint
+//   - description : human-readable summary used in the startup log
+//
+// A misconfigured destination (e.g. SPLUNK_URL set without
+// SPLUNK_TOKEN) returns an error so the gateway fails fast instead
+// of silently dropping events.
+func loadSIEM(logger *slog.Logger, env siemEnv) ([]audit.Emitter, []siem.StatusReporter, string, error) {
+	var emitters []audit.Emitter
+	var reporters []siem.StatusReporter
+	var labels []string
+
+	if env.splunkURL != "" || env.splunkToken != "" {
+		if env.splunkURL == "" || env.splunkToken == "" {
+			return nil, nil, "", fmt.Errorf("INTENTGATE_SIEM_SPLUNK_URL and INTENTGATE_SIEM_SPLUNK_TOKEN must both be set")
+		}
+		em, err := siem.NewSplunkEmitter(siem.SplunkConfig{
+			URL:    env.splunkURL,
+			Token:  env.splunkToken,
+			Index:  env.splunkIndex,
+			Logger: logger,
+		})
+		if err != nil {
+			return nil, nil, "", err
+		}
+		emitters = append(emitters, em)
+		reporters = append(reporters, em)
+		labels = append(labels, "splunk")
+		logger.Info("SIEM emitter: splunk", "url", env.splunkURL, "index", env.splunkIndex)
+	}
+
+	if env.datadogAPIKey != "" {
+		em, err := siem.NewDatadogEmitter(siem.DatadogConfig{
+			APIKey:  env.datadogAPIKey,
+			Site:    env.datadogSite,
+			Service: env.datadogService,
+			Logger:  logger,
+		})
+		if err != nil {
+			return nil, nil, "", err
+		}
+		emitters = append(emitters, em)
+		reporters = append(reporters, em)
+		labels = append(labels, "datadog")
+		logger.Info("SIEM emitter: datadog", "site", env.datadogSite)
+	}
+
+	if anySentinelSet := env.sentinelDCEURL != "" ||
+		env.sentinelDCRID != "" || env.sentinelStream != "" ||
+		env.sentinelTenantID != "" || env.sentinelClientID != "" ||
+		env.sentinelClientSecret != ""; anySentinelSet {
+		em, err := siem.NewSentinelEmitter(siem.SentinelConfig{
+			DCEUrl:         env.sentinelDCEURL,
+			DCRImmutableID: env.sentinelDCRID,
+			StreamName:     env.sentinelStream,
+			TenantID:       env.sentinelTenantID,
+			ClientID:       env.sentinelClientID,
+			ClientSecret:   env.sentinelClientSecret,
+			Logger:         logger,
+		})
+		if err != nil {
+			return nil, nil, "", fmt.Errorf("sentinel: %w", err)
+		}
+		emitters = append(emitters, em)
+		reporters = append(reporters, em)
+		labels = append(labels, "sentinel")
+		logger.Info("SIEM emitter: sentinel",
+			"dce", env.sentinelDCEURL,
+			"dcr", env.sentinelDCRID,
+			"stream", env.sentinelStream)
+	}
+
+	desc := "none"
+	if len(labels) > 0 {
+		desc = strings.Join(labels, ",")
+	}
+	return emitters, reporters, desc, nil
 }
 
 // loadAuditStore constructs the optional Postgres-backed audit store

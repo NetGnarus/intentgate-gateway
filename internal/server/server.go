@@ -14,6 +14,7 @@ import (
 	"github.com/NetGnarus/intentgate-gateway/internal/metrics"
 	"github.com/NetGnarus/intentgate-gateway/internal/policy"
 	"github.com/NetGnarus/intentgate-gateway/internal/revocation"
+	"github.com/NetGnarus/intentgate-gateway/internal/siem"
 	"github.com/NetGnarus/intentgate-gateway/internal/upstream"
 
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
@@ -58,6 +59,12 @@ type Config struct {
 	// (the route is not registered, so /v1/admin/audit returns 404 on
 	// older / lighter deployments).
 	AuditStore auditstore.Store
+	// SIEMReporters provides the read-only status snapshots the
+	// /v1/admin/integrations endpoint surfaces. One reporter per
+	// configured SIEM destination; empty slice means no SIEM
+	// integrations are wired (the route is registered anyway so the
+	// console can render "not configured" cards).
+	SIEMReporters []siem.StatusReporter
 	// Upstream is the configured downstream MCP tool server. nil means
 	// no upstream is configured and the gateway returns its stub allow
 	// for authorized calls. Production deployments always supply one.
@@ -152,6 +159,12 @@ func New(cfg Config) *http.Server {
 			adminCfg.AuditStore = cfg.AuditStore
 			mux.Handle("GET /v1/admin/audit", handlers.NewAdminAuditQueryHandler(adminCfg))
 		}
+		// Integrations endpoint always registered when an admin token
+		// is set: returns an empty array when no SIEM is wired, which
+		// the console renders as "no integrations configured" rather
+		// than a 404.
+		adminCfg.SIEMReporters = cfg.SIEMReporters
+		mux.Handle("GET /v1/admin/integrations", handlers.NewAdminIntegrationsHandler(adminCfg))
 	}
 
 	handler := chain(mux,
@@ -268,7 +281,7 @@ func routeLabel(path string) string {
 	switch path {
 	case "/healthz", "/v1/tool-call", "/v1/mcp", "/metrics",
 		"/v1/admin/revoke", "/v1/admin/revocations", "/v1/admin/mint",
-		"/v1/admin/audit":
+		"/v1/admin/audit", "/v1/admin/integrations":
 		return path
 	default:
 		return "other"
