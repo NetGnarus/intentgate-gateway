@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/NetGnarus/intentgate-gateway/internal/approvals"
 	"github.com/NetGnarus/intentgate-gateway/internal/audit"
 	"github.com/NetGnarus/intentgate-gateway/internal/budget"
 	"github.com/NetGnarus/intentgate-gateway/internal/capability"
@@ -72,6 +73,16 @@ type MCPHandlerConfig struct {
 	// observation calls (the helpers nil-check internally so handlers
 	// don't need to).
 	Metrics *metrics.Metrics
+	// Approvals is the queue the handler uses when policy returns
+	// escalate. nil disables the escalation path: a policy
+	// returning escalate without an approvals store wired
+	// degrades to block ("escalate not configured").
+	Approvals approvals.Store
+	// ApprovalTimeout caps how long the handler waits for a human
+	// decision before timing out and returning block. Zero falls
+	// back to 5 minutes — operators with on-call humans can lower
+	// this; deployments with offline reviewers should raise it.
+	ApprovalTimeout time.Duration
 }
 
 type mcpHandler struct {
@@ -228,6 +239,19 @@ func (h *mcpHandler) handleToolsCall(ctx context.Context, req *mcp.Request, r *h
 			audit.DecisionBlock, audit.CheckPolicy, polResult.err.Error(), start, 0)
 		return mcp.NewErrorResponse(req.ID, mcp.CodePolicyFailed,
 			"policy check failed", polResult.err.Error())
+	}
+
+	// Check 3b: human approval. Triggered when the Rego policy
+	// returns {"escalate": true}. The handler pauses the request
+	// here and resumes when an operator decides via
+	// /v1/admin/approvals/{id}/decide. Failure modes (queue not
+	// wired, queue error, timeout, rejection) all collapse to a
+	// CodePolicyFailed block — the agent doesn't need to know the
+	// flow took a detour through human review.
+	if polResult.escalate {
+		if escResp := h.runApprovalFlow(ctx, r, req, params, capResult, intResult, polResult.reason, start); escResp != nil {
+			return escResp
+		}
 	}
 
 	// Check 4: budget.
@@ -522,10 +546,201 @@ type intentCheckResult struct {
 	err     error
 }
 
+// defaultApprovalTimeout is used when the operator did not set
+// MCPHandlerConfig.ApprovalTimeout. Five minutes is a deliberate
+// midpoint between "synchronous reviewers can keep up" and "agent
+// HTTP clients won't drop the connection."
+const defaultApprovalTimeout = 5 * time.Minute
+
+// runApprovalFlow handles the escalate path. Returns a non-nil
+// JSON-RPC response when the call should NOT proceed (queue
+// misconfigured, enqueue error, rejected, timed out). Returns nil
+// when the operator approved and the caller should resume the
+// pipeline (continue to the budget check).
+func (h *mcpHandler) runApprovalFlow(
+	ctx context.Context,
+	r *http.Request,
+	req *mcp.Request,
+	params *mcp.ToolCallParams,
+	capResult capabilityCheckResult,
+	intResult intentCheckResult,
+	policyReason string,
+	start time.Time,
+) *mcp.Response {
+	// No queue wired? Block. We refuse to silently allow a call the
+	// policy specifically said needed human review.
+	if h.cfg.Approvals == nil {
+		reason := "escalation required but no approvals queue configured (set INTENTGATE_APPROVAL_QUEUE)"
+		h.emitAudit(ctx, r, params, capResult, intResult,
+			audit.DecisionBlock, audit.CheckPolicy, reason, start, 0)
+		return mcp.NewErrorResponse(req.ID, mcp.CodePolicyFailed,
+			"policy escalation required", reason)
+	}
+
+	pending := approvals.PendingRequest{
+		AgentID:       capResult.agentID,
+		Tool:          params.Name,
+		Args:          params.Arguments,
+		IntentSummary: intentSummary(intResult),
+		Reason:        policyReason,
+	}
+	if capResult.token != nil {
+		pending.CapabilityTokenID = capResult.token.ID
+		pending.RootCapabilityTokenID = capResult.token.RootID
+	}
+
+	row, err := h.cfg.Approvals.Enqueue(ctx, pending)
+	if err != nil {
+		reason := "approval queue: " + err.Error()
+		h.cfg.Logger.Error("approval enqueue failed", "err", err, "tool", params.Name)
+		h.emitAudit(ctx, r, params, capResult, intResult,
+			audit.DecisionBlock, audit.CheckPolicy, reason, start, 0)
+		return mcp.NewErrorResponse(req.ID, mcp.CodePolicyFailed,
+			"policy escalation failed", reason)
+	}
+
+	// Audit the escalation. PendingID lets SOC join this event with
+	// the eventual approve / reject / timeout event.
+	h.emitApprovalAudit(ctx, r, params, capResult, intResult,
+		audit.DecisionEscalate, "escalate: "+policyReason, row.PendingID, "", start)
+
+	timeout := h.cfg.ApprovalTimeout
+	if timeout <= 0 {
+		timeout = defaultApprovalTimeout
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	final, werr := h.cfg.Approvals.Wait(waitCtx, row.PendingID)
+	if werr != nil {
+		reason := "approval wait: " + werr.Error()
+		h.cfg.Logger.Error("approval wait failed", "err", werr, "pending_id", row.PendingID)
+		h.emitApprovalAudit(ctx, r, params, capResult, intResult,
+			audit.DecisionBlock, reason, row.PendingID, "", start)
+		return mcp.NewErrorResponse(req.ID, mcp.CodePolicyFailed,
+			"policy escalation failed", reason)
+	}
+
+	switch final.Status {
+	case approvals.StatusApproved:
+		// Audit the human approval as a CheckPolicy allow so the
+		// SOC log shows the human-in-the-loop step. The pipeline
+		// continues to budget and then upstream; that final
+		// allow/forward emits its own audit too.
+		reason := "approved by " + safeDecidedBy(final)
+		if final.DecideNote != "" {
+			reason += ": " + final.DecideNote
+		}
+		h.emitApprovalAudit(ctx, r, params, capResult, intResult,
+			audit.DecisionAllow, reason, row.PendingID, final.DecidedBy, start)
+		h.cfg.Logger.Info("mcp tools/call approved by human",
+			"tool", params.Name, "agent", capResult.agentID,
+			"pending_id", row.PendingID, "by", final.DecidedBy)
+		return nil
+
+	case approvals.StatusRejected:
+		reason := "rejected by " + safeDecidedBy(final)
+		if final.DecideNote != "" {
+			reason += ": " + final.DecideNote
+		}
+		h.emitApprovalAudit(ctx, r, params, capResult, intResult,
+			audit.DecisionBlock, reason, row.PendingID, final.DecidedBy, start)
+		h.cfg.Logger.Info("mcp tools/call rejected by human",
+			"tool", params.Name, "agent", capResult.agentID,
+			"pending_id", row.PendingID, "by", final.DecidedBy)
+		return mcp.NewErrorResponse(req.ID, mcp.CodePolicyFailed,
+			"policy: rejected by reviewer", reason)
+
+	case approvals.StatusTimeout:
+		reason := "approval window expired (" + timeout.String() + ")"
+		h.emitApprovalAudit(ctx, r, params, capResult, intResult,
+			audit.DecisionBlock, reason, row.PendingID, "", start)
+		h.cfg.Logger.Info("mcp tools/call approval timed out",
+			"tool", params.Name, "agent", capResult.agentID,
+			"pending_id", row.PendingID)
+		return mcp.NewErrorResponse(req.ID, mcp.CodePolicyFailed,
+			"policy: approval window expired", reason)
+
+	default:
+		reason := "unexpected approval status: " + string(final.Status)
+		h.emitApprovalAudit(ctx, r, params, capResult, intResult,
+			audit.DecisionBlock, reason, row.PendingID, "", start)
+		return mcp.NewErrorResponse(req.ID, mcp.CodePolicyFailed,
+			"policy escalation failed", reason)
+	}
+}
+
+// emitApprovalAudit is emitAudit with two extra fields populated
+// (pending_id, decided_by). Lets the SOC analyst reconstruct an
+// approval lifecycle by filtering on pending_id.
+func (h *mcpHandler) emitApprovalAudit(
+	ctx context.Context,
+	r *http.Request,
+	params *mcp.ToolCallParams,
+	cap capabilityCheckResult,
+	intent intentCheckResult,
+	decision audit.Decision,
+	reason string,
+	pendingID string,
+	decidedBy string,
+	start time.Time,
+) {
+	if h.cfg.Audit == nil {
+		return
+	}
+
+	argKeys := make([]string, 0, len(params.Arguments))
+	for k := range params.Arguments {
+		argKeys = append(argKeys, k)
+	}
+
+	e := audit.NewEvent(decision, params.Name)
+	e.Check = audit.CheckPolicy
+	e.Reason = reason
+	e.AgentID = cap.agentID
+	e.ArgKeys = argKeys
+	e.LatencyMS = time.Since(start).Milliseconds()
+	e.RemoteIP = r.RemoteAddr
+	e.PendingID = pendingID
+	e.DecidedBy = decidedBy
+
+	if cap.token != nil {
+		e.CapabilityTokenID = cap.token.ID
+		e.RootCapabilityTokenID = cap.token.RootID
+		e.CaveatCount = cap.token.CaveatCount()
+	}
+	if intent.intent != nil {
+		e.IntentSummary = intent.intent.Summary
+	}
+
+	h.cfg.Audit.Emit(ctx, e)
+}
+
+// intentSummary returns the captured intent summary (or empty).
+// Helper for runApprovalFlow's PendingRequest building.
+func intentSummary(r intentCheckResult) string {
+	if r.intent == nil {
+		return ""
+	}
+	return r.intent.Summary
+}
+
+// safeDecidedBy returns the operator identity, or "(anonymous)" when
+// blank — useful so the audit reason field is never an awkward
+// "approved by ".
+func safeDecidedBy(p approvals.PendingRequest) string {
+	if p.DecidedBy == "" {
+		return "(anonymous)"
+	}
+	return p.DecidedBy
+}
+
 // policyCheckResult bundles what the policy stage learned.
 type policyCheckResult struct {
-	summary string // short description ("ok: <reason>", "skipped (no engine)", ...)
-	err     error
+	summary  string // short description ("ok: <reason>", "skipped (no engine)", ...)
+	err      error
+	escalate bool   // policy returned {"escalate": true} — pause for human review
+	reason   string // operator-readable reason (used as summary on escalate path)
 }
 
 // budgetCheckResult bundles what the budget stage learned.
@@ -685,6 +900,16 @@ func (h *mcpHandler) runPolicyCheck(
 	if err != nil {
 		// Engine failure = fail closed.
 		return policyCheckResult{err: err}
+	}
+	// Escalate beats both allow and block: a high-risk rule fired,
+	// no autopilot. The mcp handler surfaces this to the approvals
+	// queue and pauses.
+	if d.Escalate {
+		return policyCheckResult{
+			escalate: true,
+			reason:   d.Reason,
+			summary:  "escalate: " + d.Reason,
+		}
 	}
 	if !d.Allow {
 		return policyCheckResult{err: capError(d.Reason)}

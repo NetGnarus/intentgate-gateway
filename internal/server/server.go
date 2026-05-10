@@ -4,8 +4,10 @@ package server
 import (
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
+	"github.com/NetGnarus/intentgate-gateway/internal/approvals"
 	"github.com/NetGnarus/intentgate-gateway/internal/audit"
 	"github.com/NetGnarus/intentgate-gateway/internal/auditstore"
 	"github.com/NetGnarus/intentgate-gateway/internal/budget"
@@ -65,6 +67,13 @@ type Config struct {
 	// integrations are wired (the route is registered anyway so the
 	// console can render "not configured" cards).
 	SIEMReporters []siem.StatusReporter
+	// Approvals is the human-approval queue. nil disables both the
+	// in-pipeline escalate path and the /v1/admin/approvals routes.
+	Approvals approvals.Store
+	// ApprovalTimeout caps how long the gateway waits for a human
+	// decision before timing out and returning block. Zero falls
+	// back to the handler's default (5 minutes).
+	ApprovalTimeout time.Duration
 	// Upstream is the configured downstream MCP tool server. nil means
 	// no upstream is configured and the gateway returns its stub allow
 	// for authorized calls. Production deployments always supply one.
@@ -126,6 +135,8 @@ func New(cfg Config) *http.Server {
 		Upstream:          cfg.Upstream,
 		Revocation:        cfg.Revocation,
 		Metrics:           cfg.Metrics,
+		Approvals:         cfg.Approvals,
+		ApprovalTimeout:   cfg.ApprovalTimeout,
 	}))
 
 	// Prometheus scrape endpoint. Behind a flag because exposing
@@ -165,6 +176,14 @@ func New(cfg Config) *http.Server {
 		// than a 404.
 		adminCfg.SIEMReporters = cfg.SIEMReporters
 		mux.Handle("GET /v1/admin/integrations", handlers.NewAdminIntegrationsHandler(adminCfg))
+		// Approvals endpoints register only when a queue is wired.
+		// Older / lighter deployments without escalation get a 404,
+		// which the console renders as "feature not enabled".
+		if cfg.Approvals != nil {
+			adminCfg.Approvals = cfg.Approvals
+			mux.Handle("GET /v1/admin/approvals", handlers.NewAdminApprovalsListHandler(adminCfg))
+			mux.Handle("POST /v1/admin/approvals/{id}/decide", handlers.NewAdminApprovalsDecideHandler(adminCfg))
+		}
 	}
 
 	handler := chain(mux,
@@ -281,9 +300,14 @@ func routeLabel(path string) string {
 	switch path {
 	case "/healthz", "/v1/tool-call", "/v1/mcp", "/metrics",
 		"/v1/admin/revoke", "/v1/admin/revocations", "/v1/admin/mint",
-		"/v1/admin/audit", "/v1/admin/integrations":
+		"/v1/admin/audit", "/v1/admin/integrations",
+		"/v1/admin/approvals":
 		return path
-	default:
-		return "other"
 	}
+	// /v1/admin/approvals/{id}/decide collapses to a fixed label so
+	// the metrics histogram doesn't blow up cardinality on the id.
+	if strings.HasPrefix(path, "/v1/admin/approvals/") && strings.HasSuffix(path, "/decide") {
+		return "/v1/admin/approvals/decide"
+	}
+	return "other"
 }

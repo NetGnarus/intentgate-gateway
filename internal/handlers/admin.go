@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/NetGnarus/intentgate-gateway/internal/approvals"
 	"github.com/NetGnarus/intentgate-gateway/internal/audit"
 	"github.com/NetGnarus/intentgate-gateway/internal/auditstore"
 	"github.com/NetGnarus/intentgate-gateway/internal/capability"
@@ -49,6 +50,9 @@ type AdminConfig struct {
 	// integrations list rather than a 404 — the console renders that
 	// as "no integrations configured" guidance.
 	SIEMReporters []siem.StatusReporter
+	// Approvals is the queue the /v1/admin/approvals endpoints read
+	// from. nil disables those routes (they're not registered).
+	Approvals approvals.Store
 }
 
 // NewAdminRevokeHandler returns the POST /v1/admin/revoke handler.
@@ -439,6 +443,127 @@ func NewAdminIntegrationsHandler(cfg AdminConfig) http.Handler {
 			}
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"integrations": out})
+	})
+}
+
+// NewAdminApprovalsListHandler returns the GET /v1/admin/approvals
+// handler. Surfaces the queue of pending (or decided) approvals to
+// the operator console.
+//
+// Query params:
+//
+//	status  pending | approved | rejected | timeout (default: empty = all)
+//	limit   page size (default 100, max 1000)
+//	offset  pagination offset
+//
+// Body: {"approvals": [...PendingRequest], "limit": N, "offset": N}.
+func NewAdminApprovalsListHandler(cfg AdminConfig) http.Handler {
+	if cfg.Logger == nil {
+		cfg.Logger = slog.Default()
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if !checkAdminToken(r, cfg.AdminToken) {
+			adminError(w, http.StatusUnauthorized, "invalid or missing admin token")
+			return
+		}
+		if cfg.Approvals == nil {
+			adminError(w, http.StatusServiceUnavailable, "approvals queue not configured")
+			return
+		}
+
+		filter := approvals.ListFilter{
+			Status: approvals.Status(r.URL.Query().Get("status")),
+			Limit:  parseIntParam(r, "limit", 100, 1, 1000),
+			Offset: parseIntParam(r, "offset", 0, 0, 1<<31-1),
+		}
+		rows, err := cfg.Approvals.List(r.Context(), filter)
+		if err != nil {
+			cfg.Logger.Error("approvals list failed", "err", err)
+			adminError(w, http.StatusServiceUnavailable, "store error: "+err.Error())
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"approvals": rows,
+			"limit":     filter.Limit,
+			"offset":    filter.Offset,
+		})
+	})
+}
+
+// NewAdminApprovalsDecideHandler returns the
+// POST /v1/admin/approvals/{id}/decide handler.
+//
+// Body: {"decision": "approve"|"reject", "decided_by": "name", "note": ""}.
+//
+// 200 on success with the updated row. 401 invalid token, 404
+// unknown id, 409 already decided, 400 malformed body.
+func NewAdminApprovalsDecideHandler(cfg AdminConfig) http.Handler {
+	if cfg.Logger == nil {
+		cfg.Logger = slog.Default()
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if !checkAdminToken(r, cfg.AdminToken) {
+			adminError(w, http.StatusUnauthorized, "invalid or missing admin token")
+			return
+		}
+		if cfg.Approvals == nil {
+			adminError(w, http.StatusServiceUnavailable, "approvals queue not configured")
+			return
+		}
+
+		pendingID := r.PathValue("id")
+		if pendingID == "" {
+			adminError(w, http.StatusBadRequest, "missing pending id")
+			return
+		}
+
+		var body struct {
+			Decision  string `json:"decision"`
+			DecidedBy string `json:"decided_by"`
+			Note      string `json:"note"`
+		}
+		dec := json.NewDecoder(io.LimitReader(r.Body, 1<<16))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&body); err != nil {
+			adminError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+			return
+		}
+		var status approvals.Status
+		switch body.Decision {
+		case "approve":
+			status = approvals.StatusApproved
+		case "reject":
+			status = approvals.StatusRejected
+		default:
+			adminError(w, http.StatusBadRequest, `decision must be "approve" or "reject"`)
+			return
+		}
+
+		row, err := cfg.Approvals.Decide(r.Context(), pendingID, approvals.Decision{
+			Status:    status,
+			DecidedBy: body.DecidedBy,
+			Note:      body.Note,
+		})
+		if errors.Is(err, approvals.ErrNotFound) {
+			adminError(w, http.StatusNotFound, "pending id not found")
+			return
+		}
+		if errors.Is(err, approvals.ErrAlreadyDecided) {
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error":   "already decided",
+				"current": row,
+			})
+			return
+		}
+		if err != nil {
+			cfg.Logger.Error("approval decide failed", "err", err, "pending_id", pendingID)
+			adminError(w, http.StatusServiceUnavailable, "store error: "+err.Error())
+			return
+		}
+		_ = json.NewEncoder(w).Encode(row)
 	})
 }
 

@@ -42,8 +42,9 @@ import (
 type Decision string
 
 const (
-	DecisionAllow Decision = "allow"
-	DecisionBlock Decision = "block"
+	DecisionAllow    Decision = "allow"
+	DecisionBlock    Decision = "block"
+	DecisionEscalate Decision = "escalate"
 )
 
 // Check identifies which stage produced the decision. Empty for an
@@ -103,6 +104,14 @@ type Event struct {
 	// token's chain. Coarse-grained "is this more constrained than
 	// that?" telemetry; not a security claim.
 	CaveatCount int `json:"caveat_count,omitempty"`
+	// PendingID correlates an "escalate" event with the eventual
+	// "allow" or "block" event for the same human-approval flow.
+	// SOC analyst: filter by pending_id to see the full lifecycle.
+	PendingID string `json:"pending_id,omitempty"`
+	// DecidedBy records the operator identity for the resolving
+	// allow/block event after a human approval. Empty for direct
+	// (non-escalated) decisions.
+	DecidedBy string `json:"decided_by,omitempty"`
 	// Intent summary captured by the extractor (one line of the user
 	// prompt). Never the raw prompt — that may contain sensitive data.
 	IntentSummary string `json:"intent_summary,omitempty"`

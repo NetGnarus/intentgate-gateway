@@ -14,12 +14,21 @@
 //
 // Policies are written in Rego, OPA's declarative policy language. The
 // gateway expects the policy to define a top-level rule named
-// `decision` that returns an object with two fields:
+// `decision` that returns an object with two or three fields:
 //
 //	{
-//	  "allow":  true | false,
-//	  "reason": "human-readable explanation"
+//	  "allow":    true | false,
+//	  "reason":   "human-readable explanation",
+//	  "escalate": true | false  // optional, default false
 //	}
+//
+// When `escalate` is true the gateway treats the call as
+// human-approval-required: it pauses the request, enqueues it on the
+// approvals queue, and resumes only when an operator approves
+// (allowing the call to continue) or rejects (returning a block to
+// the agent). `allow` should be set to false when `escalate` is true
+// — the gateway treats them as mutually exclusive (escalate wins on
+// the rare case both are set).
 //
 // The package and rule path are fixed at:
 //
@@ -53,9 +62,18 @@ func DefaultPolicy() string {
 }
 
 // Decision is the verdict returned by the policy engine.
+//
+// Three legal shapes:
+//
+//   - Allow=true, Escalate=false  → call proceeds to budget check.
+//   - Allow=false, Escalate=false → call blocked at policy stage.
+//   - Allow=false, Escalate=true  → call paused for human approval;
+//     eventual outcome decided by an
+//     operator at /v1/admin/approvals.
 type Decision struct {
-	Allow  bool
-	Reason string
+	Allow    bool
+	Escalate bool
+	Reason   string
 }
 
 // Engine wraps a prepared Rego query. Construct one at startup with
@@ -111,8 +129,9 @@ func (e *Engine) Evaluate(ctx context.Context, input any) (Decision, error) {
 	if !ok {
 		return Decision{}, errors.New(`policy: decision missing "allow" boolean`)
 	}
-	reason, _ := obj["reason"].(string) // reason is optional; empty is fine
-	return Decision{Allow: allow, Reason: reason}, nil
+	reason, _ := obj["reason"].(string)   // reason is optional; empty is fine
+	escalate, _ := obj["escalate"].(bool) // escalate is optional; default false
+	return Decision{Allow: allow, Escalate: escalate, Reason: reason}, nil
 }
 
 // Input is a convenience builder for the request shape policies see.

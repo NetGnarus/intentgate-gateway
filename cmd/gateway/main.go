@@ -66,6 +66,16 @@
 //	                                missing any disables the Sentinel
 //	                                emitter (or fails fast if some
 //	                                but not all are set).
+//	INTENTGATE_APPROVALS_BACKEND   "memory" (default), "postgres", or
+//	                                "off". When "postgres" the gateway
+//	                                uses INTENTGATE_POSTGRES_URL for
+//	                                the queue. "off" disables the
+//	                                escalate path: a Rego policy
+//	                                returning escalate becomes a block.
+//	INTENTGATE_APPROVAL_TIMEOUT_S  How long the gateway waits for a
+//	                                human decision before timing out
+//	                                and returning block. Default 300
+//	                                (5 minutes).
 //	INTENTGATE_UPSTREAM_URL         URL of the downstream MCP tool server
 //	                                authorized calls are forwarded to. When
 //	                                unset, the gateway returns a stub allow
@@ -109,6 +119,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/NetGnarus/intentgate-gateway/internal/approvals"
 	"github.com/NetGnarus/intentgate-gateway/internal/audit"
 	"github.com/NetGnarus/intentgate-gateway/internal/auditstore"
 	"github.com/NetGnarus/intentgate-gateway/internal/budget"
@@ -159,6 +170,8 @@ func main() {
 	sentinelTenantID := envOr("INTENTGATE_SIEM_SENTINEL_TENANT_ID", "")
 	sentinelClientID := envOr("INTENTGATE_SIEM_SENTINEL_CLIENT_ID", "")
 	sentinelClientSecret := envOr("INTENTGATE_SIEM_SENTINEL_CLIENT_SECRET", "")
+	approvalsBackend := envOr("INTENTGATE_APPROVALS_BACKEND", "memory")
+	approvalTimeoutS := envOr("INTENTGATE_APPROVAL_TIMEOUT_S", "300")
 	upstreamURL := envOr("INTENTGATE_UPSTREAM_URL", "")
 	upstreamTimeoutMS := envOr("INTENTGATE_UPSTREAM_TIMEOUT_MS", "")
 	postgresURL := envOr("INTENTGATE_POSTGRES_URL", "")
@@ -267,6 +280,23 @@ func main() {
 		os.Exit(1)
 	}
 
+	approvalsStore, approvalsDesc, err := loadApprovals(context.Background(), logger, approvalsBackend, postgresURL)
+	if err != nil {
+		logger.Error("failed to initialize approvals store", "err", err)
+		os.Exit(1)
+	}
+	defer func() {
+		if approvalsStore != nil {
+			_ = approvalsStore.Close()
+		}
+	}()
+
+	approvalTimeout, err := parseApprovalTimeout(approvalTimeoutS)
+	if err != nil {
+		logger.Error("INTENTGATE_APPROVAL_TIMEOUT_S invalid", "err", err)
+		os.Exit(1)
+	}
+
 	adminTokenDesc := "disabled"
 	if adminToken != "" {
 		adminTokenDesc = "configured"
@@ -300,6 +330,7 @@ func main() {
 		"upstream", upstreamDesc,
 		"revocation_store", revocationDesc,
 		"admin_api", adminTokenDesc,
+		"approvals", approvalsDesc,
 		"metrics_endpoint", metricsEnabled,
 		"otel_tracing", otelDesc,
 	)
@@ -320,6 +351,8 @@ func main() {
 		SIEMReporters:         siemReporters,
 		Upstream:              upstreamClient,
 		Revocation:            revocationStore,
+		Approvals:             approvalsStore,
+		ApprovalTimeout:       approvalTimeout,
 		AdminToken:            adminToken,
 		Metrics:               metricsHandle,
 		EnableMetricsEndpoint: metricsEnabled,
@@ -639,6 +672,56 @@ func loadAuditStore(ctx context.Context, logger *slog.Logger, postgresURL string
 	})
 	logger.Info("audit store: postgres", "persist", true)
 	return store, em, "postgres", nil
+}
+
+// loadApprovals constructs the human-approval queue.
+//
+//	backend = "off"      → returns (nil, "off", nil) — escalate becomes block.
+//	backend = "memory"   → in-process queue, single replica only.
+//	backend = "postgres" → durable queue at INTENTGATE_POSTGRES_URL.
+//
+// A misconfigured backend ("postgres" without a DSN) returns an error
+// so the gateway fails fast.
+func loadApprovals(ctx context.Context, logger *slog.Logger, backend, postgresURL string) (approvals.Store, string, error) {
+	switch backend {
+	case "off":
+		logger.Info("approvals queue: disabled")
+		return nil, "off", nil
+	case "", "memory":
+		logger.Info("approvals queue: in-memory (single-replica only, lost on restart)")
+		return approvals.NewMemoryStore(), "memory", nil
+	case "postgres":
+		if postgresURL == "" {
+			return nil, "", fmt.Errorf("INTENTGATE_APPROVALS_BACKEND=postgres requires INTENTGATE_POSTGRES_URL")
+		}
+		store, err := approvals.NewPostgresStore(ctx, postgresURL)
+		if err != nil {
+			return nil, "", err
+		}
+		logger.Info("approvals queue: postgres")
+		return store, "postgres", nil
+	default:
+		return nil, "", fmt.Errorf("unknown INTENTGATE_APPROVALS_BACKEND %q (want off|memory|postgres)", backend)
+	}
+}
+
+// parseApprovalTimeout converts the seconds-as-string env var into a
+// duration. Empty / 0 falls back to 5 minutes; negative is rejected.
+func parseApprovalTimeout(s string) (time.Duration, error) {
+	if s == "" {
+		return 5 * time.Minute, nil
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return 0, fmt.Errorf("not an integer: %w", err)
+	}
+	if n < 0 {
+		return 0, fmt.Errorf("must be >= 0, got %d", n)
+	}
+	if n == 0 {
+		return 5 * time.Minute, nil
+	}
+	return time.Duration(n) * time.Second, nil
 }
 
 // loadRevocation constructs the revocation store. When postgresURL is
