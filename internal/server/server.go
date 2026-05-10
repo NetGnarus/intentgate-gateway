@@ -180,6 +180,13 @@ func New(cfg Config) *http.Server {
 		if cfg.AuditStore != nil {
 			adminCfg.AuditStore = cfg.AuditStore
 			mux.Handle("GET /v1/admin/audit", handlers.NewAdminAuditQueryHandler(adminCfg))
+			// Dry-run policy authoring requires the audit store too —
+			// without persistence there's no historical traffic to
+			// replay the candidate Rego against. Older deployments
+			// return 404 here, which the console-pro /policies page
+			// keys off to render an "enable INTENTGATE_AUDIT_PERSIST"
+			// hint instead of the editor.
+			mux.Handle("POST /v1/admin/policies/dry-run", handlers.NewAdminPoliciesDryRunHandler(adminCfg))
 		}
 		// Integrations endpoint always registered when an admin token
 		// is set: returns an empty array when no SIEM is wired, which
@@ -312,7 +319,8 @@ func routeLabel(path string) string {
 	case "/healthz", "/v1/tool-call", "/v1/mcp", "/metrics",
 		"/v1/admin/revoke", "/v1/admin/revocations", "/v1/admin/mint",
 		"/v1/admin/audit", "/v1/admin/integrations",
-		"/v1/admin/approvals", "/v1/admin/tenants":
+		"/v1/admin/approvals", "/v1/admin/tenants",
+		"/v1/admin/policies/dry-run":
 		return path
 	}
 	// /v1/admin/approvals/{id}/decide collapses to a fixed label so

@@ -15,6 +15,7 @@ import (
 	"github.com/NetGnarus/intentgate-gateway/internal/audit"
 	"github.com/NetGnarus/intentgate-gateway/internal/auditstore"
 	"github.com/NetGnarus/intentgate-gateway/internal/capability"
+	"github.com/NetGnarus/intentgate-gateway/internal/policy"
 	"github.com/NetGnarus/intentgate-gateway/internal/revocation"
 	"github.com/NetGnarus/intentgate-gateway/internal/siem"
 )
@@ -803,3 +804,192 @@ func parseIntParam(r *http.Request, name string, def, minVal, maxVal int) int {
 // errAdminTokenRequired is returned by helpers that refuse to run
 // when no admin token is configured.
 var errAdminTokenRequired = errors.New("admin token required") //nolint:unused
+
+// dryRunMaxEvents is the upper bound on how many audit events a single
+// dry-run will pull from the store. 100k is enough for "last 24 hours"
+// on a busy customer install while keeping worst-case memory and
+// evaluation latency bounded (~tens of MB / a few seconds).
+const dryRunMaxEvents = 100000
+
+// dryRunDefaultEvents is the cap applied when the caller doesn't ask
+// for a specific limit. Keeps interactive UI calls snappy.
+const dryRunDefaultEvents = 10000
+
+// NewAdminPoliciesDryRunHandler returns the POST /v1/admin/policies/dry-run
+// handler.
+//
+// Request body:
+//
+//	{
+//	  "rego":     "package intentgate.policy\nimport rego.v1\n...",  // required
+//	  "from":     "2026-05-09T00:00:00Z",  // optional, RFC3339
+//	  "to":       "2026-05-10T00:00:00Z",  // optional, RFC3339
+//	  "limit":    10000,                   // optional, default 10000, max 100000
+//	  "agent_id": "fin-bot",               // optional filter
+//	  "tool":     "transfer_funds",        // optional filter
+//	  "max_samples": 100                   // optional, default 100
+//	}
+//
+// The endpoint pulls events from the audit store, replays the
+// candidate Rego policy against each one, and returns the cross-tab
+// of original × candidate decisions plus a sample of divergent rows.
+// Tenant scoping mirrors /v1/admin/audit: superadmin can pass
+// `tenant` in the body to scope; per-tenant admin is forced to their
+// own tenant.
+//
+// Returns 400 on missing/invalid body or compile error, 401 on bad
+// token, 503 when the audit store isn't configured.
+func NewAdminPoliciesDryRunHandler(cfg AdminConfig) http.Handler {
+	if cfg.Logger == nil {
+		cfg.Logger = slog.Default()
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		auth := resolveAdminAuth(r, cfg)
+		if !auth.ok {
+			adminError(w, http.StatusUnauthorized, "invalid or missing admin token")
+			return
+		}
+		if cfg.AuditStore == nil {
+			adminError(w, http.StatusServiceUnavailable,
+				"audit store not configured; dry-run requires INTENTGATE_AUDIT_PERSIST=true on the gateway")
+			return
+		}
+
+		var body struct {
+			Rego       string `json:"rego"`
+			From       string `json:"from,omitempty"`
+			To         string `json:"to,omitempty"`
+			Limit      int    `json:"limit,omitempty"`
+			AgentID    string `json:"agent_id,omitempty"`
+			Tool       string `json:"tool,omitempty"`
+			MaxSamples int    `json:"max_samples,omitempty"`
+			Tenant     string `json:"tenant,omitempty"`
+		}
+		dec := json.NewDecoder(io.LimitReader(r.Body, 1<<20)) // 1 MiB cap on body
+		if err := dec.Decode(&body); err != nil {
+			adminError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+			return
+		}
+		if strings.TrimSpace(body.Rego) == "" {
+			adminError(w, http.StatusBadRequest, "missing required field \"rego\"")
+			return
+		}
+
+		// Tenant scoping: per-tenant admin's token forces the filter;
+		// superadmin honors the body's tenant verbatim.
+		tenant := body.Tenant
+		if auth.tenant != "" {
+			if tenant != "" && tenant != auth.tenant {
+				adminError(w, http.StatusForbidden,
+					"tenant in body does not match admin token's tenant")
+				return
+			}
+			tenant = auth.tenant
+		}
+
+		// Clamp inputs.
+		limit := body.Limit
+		if limit <= 0 {
+			limit = dryRunDefaultEvents
+		}
+		if limit > dryRunMaxEvents {
+			limit = dryRunMaxEvents
+		}
+		maxSamples := body.MaxSamples
+		if maxSamples <= 0 {
+			maxSamples = policy.DefaultMaxSamples
+		}
+		if maxSamples > 1000 {
+			maxSamples = 1000
+		}
+
+		// Walk the audit store in pages of 1000 (the store-level cap)
+		// until we either reach the operator-specified limit or run out
+		// of events.
+		const pageSize = 1000
+		filter := auditstore.QueryFilter{
+			AgentID: body.AgentID,
+			Tool:    body.Tool,
+			Tenant:  tenant,
+			Limit:   pageSize,
+		}
+		if body.From != "" {
+			t, err := time.Parse(time.RFC3339, body.From)
+			if err != nil {
+				adminError(w, http.StatusBadRequest, "invalid 'from' timestamp: "+err.Error())
+				return
+			}
+			filter.From = t.UTC()
+		}
+		if body.To != "" {
+			t, err := time.Parse(time.RFC3339, body.To)
+			if err != nil {
+				adminError(w, http.StatusBadRequest, "invalid 'to' timestamp: "+err.Error())
+				return
+			}
+			filter.To = t.UTC()
+		}
+
+		events := make([]audit.Event, 0, limit)
+		offset := 0
+		for len(events) < limit {
+			filter.Offset = offset
+			remaining := limit - len(events)
+			if remaining < pageSize {
+				filter.Limit = remaining
+			}
+			page, err := cfg.AuditStore.Query(r.Context(), filter)
+			if err != nil {
+				cfg.Logger.Error("dry-run: audit query failed", "err", err)
+				adminError(w, http.StatusServiceUnavailable, "audit store error: "+err.Error())
+				return
+			}
+			if len(page) == 0 {
+				break
+			}
+			events = append(events, page...)
+			if len(page) < filter.Limit {
+				break
+			}
+			offset += len(page)
+		}
+
+		result, err := policy.DryRun(r.Context(), body.Rego, events, policy.DryRunOptions{
+			MaxSamples: maxSamples,
+		})
+		if err != nil {
+			// Distinguish compile errors (operator's policy doesn't
+			// parse) from runtime errors. Compile errors are 400 so
+			// the UI can surface "your draft policy didn't compile".
+			cfg.Logger.Info("dry-run: rejected", "err", err)
+			if strings.Contains(err.Error(), "compile candidate") ||
+				strings.Contains(err.Error(), "prepare for eval") ||
+				strings.Contains(err.Error(), "non-empty Rego source") {
+				adminError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			adminError(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
+
+		// Attach the input window to the response so the UI can render
+		// "evaluated against N events between X and Y" without round-
+		// tripping the request body.
+		resp := struct {
+			policy.DryRunResult
+			Window struct {
+				From   string `json:"from,omitempty"`
+				To     string `json:"to,omitempty"`
+				Tenant string `json:"tenant,omitempty"`
+				Limit  int    `json:"limit"`
+			} `json:"window"`
+		}{DryRunResult: result}
+		resp.Window.From = body.From
+		resp.Window.To = body.To
+		resp.Window.Tenant = tenant
+		resp.Window.Limit = limit
+		_ = json.NewEncoder(w).Encode(resp)
+	})
+}
