@@ -464,6 +464,108 @@ func NewAdminAuditQueryHandler(cfg AdminConfig) http.Handler {
 	})
 }
 
+// NewAdminAuditVerifyHandler returns the GET /v1/admin/audit/verify
+// handler (Pro v2 #4, session 54).
+//
+// Query params:
+//
+//	tenant      tenant whose chain to verify. Defaults to the admin
+//	            token's bound tenant; superadmin may pass any value
+//	            (empty = "default" — see auditstore.VerifyChain).
+//	from / to   optional RFC3339 timestamps narrowing the window.
+//
+// Body:
+//
+//	{
+//	  "ok":       true,
+//	  "tenant":   "acme",
+//	  "verified": 12345,
+//	  "skipped":  0,
+//	  "broken_at": null      // or { id, ts, stored_hash, expected_hash, reason }
+//	}
+//
+// 200 on every successful walk regardless of OK/!OK — the body
+// carries the verdict. 401 on bad auth, 503 when the audit store
+// isn't configured, 400 on bad timestamps.
+//
+// Sensitive data (event reasons, agent ids) is NOT included in the
+// response. Operators wanting the offending row's full body query
+// /v1/admin/audit with the returned id.
+func NewAdminAuditVerifyHandler(cfg AdminConfig) http.Handler {
+	if cfg.Logger == nil {
+		cfg.Logger = slog.Default()
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		auth := resolveAdminAuth(r, cfg)
+		if !auth.ok {
+			adminError(w, http.StatusUnauthorized, "invalid or missing admin token")
+			return
+		}
+		if cfg.AuditStore == nil {
+			adminError(w, http.StatusServiceUnavailable, "audit store not configured")
+			return
+		}
+
+		q := r.URL.Query()
+		// Per-tenant admin: tenant forced from the resolved auth, body
+		// param ignored (or rejected on disagreement). Superadmin: ?tenant=
+		// honored verbatim.
+		tenant := strings.TrimSpace(q.Get("tenant"))
+		if auth.tenant != "" {
+			if tenant != "" && tenant != auth.tenant {
+				adminError(w, http.StatusForbidden,
+					"tenant in query does not match admin token's tenant")
+				return
+			}
+			tenant = auth.tenant
+		}
+
+		filter := auditstore.VerifyFilter{Tenant: tenant}
+		if from := q.Get("from"); from != "" {
+			t, err := time.Parse(time.RFC3339, from)
+			if err != nil {
+				adminError(w, http.StatusBadRequest, "invalid 'from' timestamp: "+err.Error())
+				return
+			}
+			filter.From = t.UTC()
+		}
+		if to := q.Get("to"); to != "" {
+			t, err := time.Parse(time.RFC3339, to)
+			if err != nil {
+				adminError(w, http.StatusBadRequest, "invalid 'to' timestamp: "+err.Error())
+				return
+			}
+			filter.To = t.UTC()
+		}
+
+		result, err := cfg.AuditStore.VerifyChain(r.Context(), filter)
+		if err != nil {
+			cfg.Logger.Error("audit verify failed", "err", err)
+			adminError(w, http.StatusServiceUnavailable, "verify error: "+err.Error())
+			return
+		}
+
+		resp := map[string]any{
+			"ok":       result.OK,
+			"tenant":   tenant,
+			"verified": result.Verified,
+			"skipped":  result.Skipped,
+		}
+		if result.BrokenAt != nil {
+			resp["broken_at"] = map[string]any{
+				"id":            result.BrokenAt.ID,
+				"ts":            result.BrokenAt.Timestamp.UTC().Format(time.RFC3339Nano),
+				"stored_hash":   result.BrokenAt.StoredHash,
+				"expected_hash": result.BrokenAt.ExpectedHash,
+				"reason":        result.BrokenAt.Reason,
+			}
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	})
+}
+
 // NewAdminIntegrationsHandler returns the GET /v1/admin/integrations
 // handler. Returns the read-only status of every wired SIEM emitter
 // (Splunk, Datadog) plus a stable list of "supported but not

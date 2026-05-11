@@ -37,7 +37,10 @@ func (s *fakeStore) Query(context.Context, QueryFilter) ([]audit.Event, error) {
 	return nil, nil
 }
 func (s *fakeStore) Count(context.Context, QueryFilter) (int64, error) { return 0, nil }
-func (s *fakeStore) Close() error                                      { return nil }
+func (s *fakeStore) VerifyChain(context.Context, VerifyFilter) (VerifyResult, error) {
+	return VerifyResult{OK: true}, nil
+}
+func (s *fakeStore) Close() error { return nil }
 
 func quietLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))

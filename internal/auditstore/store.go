@@ -94,6 +94,13 @@ type Store interface {
 	// might arise from a retry path. Implementations should fail fast
 	// on a network error rather than retrying internally; the async
 	// emitter handles retry / drop semantics one layer up.
+	//
+	// Insert is responsible for advancing the tamper-evident chain
+	// (Pro v2 #4, session 54): the stored event includes a `prev_hash`
+	// pointing at the previous event in the same tenant's chain, plus
+	// a `hash` over the canonical event body. Concurrent inserts for
+	// the same tenant MUST serialize on the chain so two events never
+	// share a prev_hash.
 	Insert(ctx context.Context, e audit.Event) error
 
 	// Query returns events matching the filter, most-recent first.
@@ -107,7 +114,61 @@ type Store interface {
 	// compute cheaply (the UI should treat -1 as "unknown").
 	Count(ctx context.Context, f QueryFilter) (int64, error)
 
+	// VerifyChain walks the per-tenant chain in insertion order over
+	// [from, to] and returns the first divergence between the stored
+	// hash and the recomputed hash. Returns ok=true with no divergence
+	// when the whole window verifies. Used by the
+	// /v1/admin/audit/verify endpoint (Pro v2 #4).
+	//
+	// Events with `hash=""` (written by a gateway predating the chain
+	// feature) are excluded from verification; the count returned by
+	// the Verified field tells the operator how much of the requested
+	// window was actually chain-covered.
+	VerifyChain(ctx context.Context, f VerifyFilter) (VerifyResult, error)
+
 	// Close releases resources. Calling Insert / Query after Close is
 	// undefined; callers should drain any async emitter first.
 	Close() error
+}
+
+// VerifyFilter narrows the verification window. Tenant is required —
+// the chain is per-tenant; verifying "all tenants at once" doesn't
+// answer a question an auditor would ask. From/To are optional bounds
+// on event timestamp; zero values mean "from the beginning" / "to now".
+type VerifyFilter struct {
+	Tenant string
+	From   time.Time
+	To     time.Time
+}
+
+// VerifyResult is the outcome of [Store.VerifyChain].
+type VerifyResult struct {
+	// OK is true when the whole window verified cleanly.
+	OK bool
+	// Verified is the count of events inside the window whose hash
+	// was recomputed and matched. Excludes pre-feature rows with
+	// hash = "".
+	Verified int
+	// Skipped is the count of pre-feature rows in the window (no hash
+	// stored, so verification doesn't apply). Surfaced so an operator
+	// sees "this old audit data is best-effort, not cryptographically
+	// covered."
+	Skipped int
+	// First divergence, populated when OK is false.
+	BrokenAt *VerifyBreak
+}
+
+// VerifyBreak describes the first row whose stored hash didn't match
+// the recomputed hash. Includes both the stored value and the
+// recomputed value so an operator can spot the difference at a glance.
+type VerifyBreak struct {
+	ID           int64
+	Timestamp    time.Time
+	StoredHash   string
+	ExpectedHash string
+	// Reason describes the failure mode: "hash mismatch" (row body
+	// tampered), "prev_hash mismatch" (a previous row was inserted /
+	// deleted, breaking the link), or "missing prev_hash" (chain
+	// has a gap).
+	Reason string
 }

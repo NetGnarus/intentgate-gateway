@@ -213,6 +213,12 @@ func New(cfg Config) *http.Server {
 		if cfg.AuditStore != nil {
 			adminCfg.AuditStore = cfg.AuditStore
 			mux.Handle("GET /v1/admin/audit", handlers.NewAdminAuditQueryHandler(adminCfg))
+			// Tamper-evident chain verification (Pro v2 #4, session
+			// 54). Available whenever audit persistence is on; older
+			// deployments where the chain columns are NULL surface
+			// rows as Skipped in the response, and operators see a
+			// "best-effort audit before chain was enabled" badge.
+			mux.Handle("GET /v1/admin/audit/verify", handlers.NewAdminAuditVerifyHandler(adminCfg))
 			// Dry-run policy authoring requires the audit store too —
 			// without persistence there's no historical traffic to
 			// replay the candidate Rego against. Older deployments

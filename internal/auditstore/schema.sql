@@ -64,7 +64,16 @@ CREATE TABLE IF NOT EXISTS audit_events (
     -- map[string]any without a separate join, and so SIEM exporters
     -- can ship it verbatim. NULL on every row written by a gateway
     -- not opted into the feature, which is the v1.0-1.2 default.
-    arg_values               JSONB
+    arg_values               JSONB,
+
+    -- Tamper-evident hash chain (Pro v2 #4, gateway 1.7+).
+    -- Each row's hash = SHA-256(prev_hash_or_empty || canonical_json).
+    -- prev_hash is NULL on the very first row of a tenant's chain.
+    -- Pre-feature rows (gateway < 1.7) have hash = '' which is how
+    -- the verify endpoint distinguishes "covered by the chain" from
+    -- "best-effort audit before chain was enabled".
+    prev_hash                TEXT,
+    hash                     TEXT NOT NULL DEFAULT ''
 );
 
 -- Idempotent ALTERs: existing 0.5/0.6 deployments whose audit_events
@@ -78,6 +87,24 @@ ALTER TABLE audit_events
     ADD COLUMN IF NOT EXISTS tenant TEXT;
 ALTER TABLE audit_events
     ADD COLUMN IF NOT EXISTS arg_values JSONB;
+ALTER TABLE audit_events
+    ADD COLUMN IF NOT EXISTS prev_hash TEXT;
+ALTER TABLE audit_events
+    ADD COLUMN IF NOT EXISTS hash TEXT NOT NULL DEFAULT '';
+
+-- Per-tenant chain heads. One row per tenant; locked FOR UPDATE on
+-- every insert to serialize chain progression and prevent two
+-- concurrent emitter workers from forking the chain.
+--
+-- tenant '' is the legitimate single-tenant key; the gateway always
+-- stamps a non-empty tenant on new events (default = 'default'), so
+-- empty here would indicate a misconfigured caller.
+CREATE TABLE IF NOT EXISTS audit_chain_heads (
+    tenant      TEXT NOT NULL PRIMARY KEY,
+    head_hash   TEXT NOT NULL DEFAULT '',
+    head_id     BIGINT,
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 
 -- Per-tenant timeline. Multi-tenant deployments filter on this
 -- frequently: "show me all decisions in tenant=acme last hour".

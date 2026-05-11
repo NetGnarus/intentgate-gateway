@@ -76,6 +76,30 @@ func (s *PostgresStore) Close() error {
 // Insert adds one event. The audit.Event timestamp is RFC3339Nano text
 // in JSON; we parse it to TIMESTAMPTZ here so SQL queries can range
 // over it without text-vs-timestamp coercion.
+//
+// # Chain semantics
+//
+// Insert advances the tamper-evident chain (Pro v2 #4, session 54):
+//
+//  1. BEGIN transaction.
+//  2. Upsert a row in audit_chain_heads for the event's tenant and
+//     SELECT FOR UPDATE its current head_hash. This serializes
+//     concurrent inserts for the same tenant — two emitter workers
+//     hitting Insert simultaneously will pick distinct prev_hashes
+//     because Postgres releases the head lock only at COMMIT.
+//  3. Compute hash = SHA-256(prev_hash || canonical_event_json).
+//  4. INSERT the event row with prev_hash + hash columns populated.
+//  5. UPDATE the chain head to the new hash.
+//  6. COMMIT.
+//
+// On the very first event of a tenant, the head_hash is empty (the
+// default ON CONFLICT DO NOTHING insert leaves it as ”), and the
+// stored prev_hash is NULL. Subsequent rows chain off that head.
+//
+// The cost is one extra UPSERT + SELECT FOR UPDATE + UPDATE per
+// insert (4 statements vs the prior 1). Since audit emission is
+// already async behind the gateway's emitter buffer, this is hidden
+// from the request hot path.
 func (s *PostgresStore) Insert(ctx context.Context, e audit.Event) error {
 	ts, err := parseEventTime(e.Timestamp)
 	if err != nil {
@@ -84,6 +108,19 @@ func (s *PostgresStore) Insert(ctx context.Context, e audit.Event) error {
 		// "now" rather than refusing to record the event. Audit
 		// emission is meant to be best-effort.
 		ts = time.Now().UTC()
+	}
+	// Fix up the event's timestamp string to match what we'll store,
+	// so the hash on the way in matches the hash any consumer would
+	// recompute after loading the row back. Round-tripping RFC3339Nano
+	// through time.Parse + .Format is lossless, but defensively
+	// re-format here in case the source string was abbreviated.
+	e.Timestamp = ts.UTC().Format(time.RFC3339Nano)
+
+	// Canonical hash of this event, BEFORE the prev_hash is woven in
+	// (that happens inside the tx with the locked head).
+	canon, err := audit.CanonicalForHash(e)
+	if err != nil {
+		return fmt.Errorf("auditstore: canonical hash: %w", err)
 	}
 
 	var argKeysJSON []byte
@@ -104,6 +141,48 @@ func (s *PostgresStore) Insert(ctx context.Context, e audit.Event) error {
 		}
 	}
 
+	// Resolve the chain-head tenant key. Old rows have NULL tenant
+	// (pre-0.9); new rows always carry a non-empty tenant set by
+	// gateway main.go to "default" when the operator hasn't enabled
+	// multi-tenancy. We treat empty string the same as "default"
+	// for the chain key to avoid accidentally creating a separate
+	// chain when a misconfigured caller emits empty tenant.
+	chainTenant := e.Tenant
+	if chainTenant == "" {
+		chainTenant = "default"
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("auditstore: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// Ensure the head row exists for this tenant.
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO audit_chain_heads (tenant, head_hash, head_id) VALUES ($1, '', NULL) ON CONFLICT DO NOTHING`,
+		chainTenant,
+	); err != nil {
+		return fmt.Errorf("auditstore: ensure chain head: %w", err)
+	}
+
+	// Lock the head row to serialize chain progression for this tenant.
+	var prevHash string
+	if err := tx.QueryRow(ctx,
+		`SELECT head_hash FROM audit_chain_heads WHERE tenant = $1 FOR UPDATE`,
+		chainTenant,
+	).Scan(&prevHash); err != nil {
+		return fmt.Errorf("auditstore: lock chain head: %w", err)
+	}
+
+	newHash := audit.ComputeHash(prevHash, canon)
+	// prev_hash is NULL only on the very first event in a tenant's
+	// chain (when prevHash is "").
+	var prevHashCol any = prevHash
+	if prevHash == "" {
+		prevHashCol = nil
+	}
+
 	const q = `
 		INSERT INTO audit_events (
 			ts, event_name, schema_version,
@@ -113,7 +192,8 @@ func (s *PostgresStore) Insert(ctx context.Context, e audit.Event) error {
 			capability_token_id, intent_summary,
 			latency_ms, remote_ip, upstream_status,
 			root_capability_token_id, caveat_count, tenant,
-			arg_values
+			arg_values,
+			prev_hash, hash
 		) VALUES (
 			$1, $2, $3,
 			$4, $5, $6,
@@ -122,10 +202,13 @@ func (s *PostgresStore) Insert(ctx context.Context, e audit.Event) error {
 			$11, $12,
 			$13, $14, $15,
 			$16, $17, $18,
-			$19
+			$19,
+			$20, $21
 		)
+		RETURNING id
 	`
-	if _, err := s.pool.Exec(ctx, q,
+	var insertedID int64
+	if err := tx.QueryRow(ctx, q,
 		ts, defaultStr(e.EventName, "intentgate.tool_call"), defaultStr(e.SchemaVersion, "1"),
 		string(e.Decision), string(e.Check), e.Reason,
 		e.AgentID, e.SessionID,
@@ -135,8 +218,22 @@ func (s *PostgresStore) Insert(ctx context.Context, e audit.Event) error {
 		nullableString(e.RootCapabilityTokenID), nullableInt(e.CaveatCount),
 		nullableString(e.Tenant),
 		argValuesJSON,
-	); err != nil {
+		prevHashCol, newHash,
+	).Scan(&insertedID); err != nil {
 		return fmt.Errorf("auditstore: insert: %w", err)
+	}
+
+	// Advance the chain head. UPDATE inside the same tx as the
+	// INSERT, so a crash between them rolls both back together.
+	if _, err := tx.Exec(ctx,
+		`UPDATE audit_chain_heads SET head_hash = $1, head_id = $2, updated_at = NOW() WHERE tenant = $3`,
+		newHash, insertedID, chainTenant,
+	); err != nil {
+		return fmt.Errorf("auditstore: update chain head: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("auditstore: commit: %w", err)
 	}
 	return nil
 }
@@ -242,6 +339,156 @@ func (s *PostgresStore) Query(ctx context.Context, f QueryFilter) ([]audit.Event
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("auditstore: rows iter: %w", err)
+	}
+	return out, nil
+}
+
+// VerifyChain walks the per-tenant chain over [from, to] in insertion
+// order, recomputing each row's hash and comparing to the stored
+// value. Returns the first divergence or an OK result.
+//
+// We scan rows ordered by id (the BIGSERIAL is monotonic per insert
+// transaction commit order) rather than by ts, because two events
+// with the same ts could legitimately be inserted in either id order
+// inside one tx burst — id is the canonical chain order.
+//
+// Rows with hash = ” are pre-feature rows (gateway < 1.7); they're
+// surfaced as Skipped count and don't fail verification.
+func (s *PostgresStore) VerifyChain(ctx context.Context, f VerifyFilter) (VerifyResult, error) {
+	tenant := f.Tenant
+	if tenant == "" {
+		tenant = "default"
+	}
+
+	// Build a per-verify WHERE with id ASC ordering.
+	q := `
+		SELECT id, ts, event_name, schema_version,
+			decision, check_stage, reason,
+			agent_id, session_id,
+			tool, arg_keys,
+			capability_token_id, intent_summary,
+			latency_ms, remote_ip, upstream_status,
+			root_capability_token_id, caveat_count, tenant,
+			prev_hash, hash
+		FROM audit_events
+		WHERE COALESCE(tenant, 'default') = $1
+	`
+	args := []any{tenant}
+	if !f.From.IsZero() {
+		args = append(args, f.From)
+		q += " AND ts >= $" + fmt.Sprintf("%d", len(args))
+	}
+	if !f.To.IsZero() {
+		args = append(args, f.To)
+		q += " AND ts <= $" + fmt.Sprintf("%d", len(args))
+	}
+	q += " ORDER BY id ASC"
+
+	rows, err := s.pool.Query(ctx, q, args...)
+	if err != nil {
+		return VerifyResult{}, fmt.Errorf("auditstore: verify query: %w", err)
+	}
+	defer rows.Close()
+
+	var prevHashLink string
+	out := VerifyResult{OK: true}
+
+	for rows.Next() {
+		var (
+			id          int64
+			ts          time.Time
+			argKeysJSON []byte
+			ev          audit.Event
+			decision    string
+			check       string
+			rootJTI     *string
+			caveatCount *int
+			tenantCol   *string
+			prevHashCol *string
+			hashStored  string
+		)
+		if err := rows.Scan(
+			&id, &ts, &ev.EventName, &ev.SchemaVersion,
+			&decision, &check, &ev.Reason,
+			&ev.AgentID, &ev.SessionID,
+			&ev.Tool, &argKeysJSON,
+			&ev.CapabilityTokenID, &ev.IntentSummary,
+			&ev.LatencyMS, &ev.RemoteIP, &ev.UpstreamStatus,
+			&rootJTI, &caveatCount, &tenantCol,
+			&prevHashCol, &hashStored,
+		); err != nil {
+			return VerifyResult{}, fmt.Errorf("auditstore: verify scan: %w", err)
+		}
+		if rootJTI != nil {
+			ev.RootCapabilityTokenID = *rootJTI
+		}
+		if caveatCount != nil {
+			ev.CaveatCount = *caveatCount
+		}
+		if tenantCol != nil {
+			ev.Tenant = *tenantCol
+		}
+		ev.Timestamp = ts.UTC().Format(time.RFC3339Nano)
+		ev.Decision = audit.Decision(decision)
+		ev.Check = audit.Check(check)
+		if len(argKeysJSON) > 0 {
+			_ = json.Unmarshal(argKeysJSON, &ev.ArgKeys)
+		}
+
+		// Pre-feature rows: hash empty + prev_hash NULL. Skip but count.
+		if hashStored == "" {
+			out.Skipped++
+			continue
+		}
+
+		// Walk the link: each row's prev_hash must equal the previous
+		// verified row's stored hash (or be NULL only on the first
+		// verified row of the chain).
+		var prevFromRow string
+		if prevHashCol != nil {
+			prevFromRow = *prevHashCol
+		}
+		// If this is the first verified row in the window, we don't
+		// have a prevHashLink to compare against (the previous row may
+		// be outside the window). Trust the stored prev_hash for the
+		// recompute; the chain integrity from "true beginning" can be
+		// verified by widening the window to the start of time.
+		if out.Verified > 0 {
+			if prevFromRow != prevHashLink {
+				out.OK = false
+				out.BrokenAt = &VerifyBreak{
+					ID:           id,
+					Timestamp:    ts,
+					StoredHash:   hashStored,
+					ExpectedHash: prevHashLink,
+					Reason:       "prev_hash mismatch (chain link broken — row inserted/deleted)",
+				}
+				return out, nil
+			}
+		}
+
+		canon, err := audit.CanonicalForHash(ev)
+		if err != nil {
+			return VerifyResult{}, fmt.Errorf("auditstore: canonical hash: %w", err)
+		}
+		recomputed := audit.ComputeHash(prevFromRow, canon)
+		if recomputed != hashStored {
+			out.OK = false
+			out.BrokenAt = &VerifyBreak{
+				ID:           id,
+				Timestamp:    ts,
+				StoredHash:   hashStored,
+				ExpectedHash: recomputed,
+				Reason:       "hash mismatch (row body tampered)",
+			}
+			return out, nil
+		}
+
+		out.Verified++
+		prevHashLink = hashStored
+	}
+	if err := rows.Err(); err != nil {
+		return VerifyResult{}, fmt.Errorf("auditstore: verify iter: %w", err)
 	}
 	return out, nil
 }
