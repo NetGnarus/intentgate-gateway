@@ -353,6 +353,28 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Cross-replica policy refresh. Subscribe to active-pointer
+	// changes so a promote / rollback on a sibling replica swaps
+	// THIS replica's compiled engine in near-real-time, instead of
+	// only on pod restart. No-op when policyStore is nil.
+	//
+	// Seed the watcher with the current active draft id so its
+	// first polling-fallback delivery (which always fires
+	// pollFallbackInterval seconds after start) doesn't log a
+	// misleading "swapped from sibling replica" line for state
+	// this pod already loaded at startup.
+	startupDraftID := ""
+	if policyStore != nil {
+		if active, gErr := policyStore.GetActive(context.Background()); gErr == nil {
+			startupDraftID = active.CurrentDraftID
+		}
+	}
+	watchCtx, cancelWatch := context.WithCancel(context.Background())
+	defer cancelWatch()
+	if policyStore != nil {
+		go watchAndReloadPolicy(watchCtx, logger, policyStore, policyReloader, startupDraftID)
+	}
+
 	adminTokenDesc := "disabled"
 	if adminToken != "" {
 		adminTokenDesc = "configured"
@@ -916,6 +938,90 @@ func reloadActivePolicy(ctx context.Context, logger *slog.Logger, store policyst
 		"promoted_by", active.PromotedBy,
 	)
 	return "draft", nil
+}
+
+// watchAndReloadPolicy is the cross-replica refresh loop. It
+// subscribes to the policy store's Watch channel and, for every
+// active-pointer change observed (either via Postgres NOTIFY from
+// a sibling replica or via the polling fallback), fetches the
+// referenced draft, compiles it, and Swaps the live engine.
+//
+// Reliability semantics:
+//
+//   - Idempotent. If the incoming active.CurrentDraftID matches what
+//     we last loaded, the swap is skipped — no compile, no engine
+//     churn. Handles both "redundant NOTIFY after a no-op promote"
+//     and "polling fallback fires on an unchanged active".
+//   - Compile failures DON'T crash the gateway. A draft that
+//     somehow lands in the active row with broken Rego is logged
+//     loudly and the in-flight engine keeps serving traffic. The
+//     admin endpoint compiles on save AND on promote, so the only
+//     way to get here is a manual DB poke or a deeply weird race.
+//   - The loop exits when the Watch channel closes (store Close
+//     during shutdown OR ctx cancelled).
+//
+// The startup-time [reloadActivePolicy] hydration already covers
+// "what's currently active" before the server takes traffic; this
+// watcher only handles changes that happen WHILE the gateway is
+// running.
+//
+// startupDraftID seeds the de-dup so the first polling-fallback
+// delivery (which always fires within pollFallbackInterval of
+// startup and re-broadcasts the current active row) is recognized
+// as the state this pod already loaded at startup — no re-compile,
+// no misleading "swapped from sibling" log line.
+func watchAndReloadPolicy(ctx context.Context, logger *slog.Logger, store policystore.Store, reloader *policy.Reloader, startupDraftID string) {
+	ch, err := store.Watch(ctx)
+	if err != nil {
+		logger.Error("policy watcher failed to subscribe; cross-replica refresh disabled",
+			"err", err)
+		return
+	}
+	logger.Info("policy watcher started", "seeded_draft_id", startupDraftID)
+
+	// Track the last applied draft id so we can short-circuit
+	// redundant notifications (idempotent reload). Seeded from
+	// startup so we don't re-load what reloadActivePolicy already
+	// installed.
+	lastApplied := startupDraftID
+
+	for active := range ch {
+		if active.CurrentDraftID == "" {
+			// The active pointer was cleared (shouldn't happen via
+			// the admin API, but handle it gracefully if a future
+			// path lands here — leave the live engine alone, log).
+			logger.Info("policy watcher: active pointer cleared; keeping current engine")
+			continue
+		}
+		if active.CurrentDraftID == lastApplied {
+			continue
+		}
+
+		draft, err := store.GetDraft(ctx, active.CurrentDraftID)
+		if err != nil {
+			logger.Error("policy watcher: failed to read promoted draft; keeping current engine",
+				"draft_id", active.CurrentDraftID, "err", err)
+			continue
+		}
+		engine, err := policy.NewEngine(ctx, draft.RegoSource)
+		if err != nil {
+			logger.Error("policy watcher: failed to compile promoted draft; keeping current engine",
+				"draft_id", active.CurrentDraftID, "err", err)
+			continue
+		}
+		if _, err := reloader.Swap(engine); err != nil {
+			logger.Error("policy watcher: engine swap failed; keeping current engine",
+				"draft_id", active.CurrentDraftID, "err", err)
+			continue
+		}
+		lastApplied = active.CurrentDraftID
+		logger.Info("policy watcher: swapped to promoted draft from sibling replica",
+			"draft_id", active.CurrentDraftID,
+			"promoted_at", active.PromotedAt,
+			"promoted_by", active.PromotedBy,
+		)
+	}
+	logger.Info("policy watcher stopped")
 }
 
 // loadRevocation constructs the revocation store. When postgresURL is

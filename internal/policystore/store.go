@@ -237,7 +237,38 @@ type Store interface {
 	// rollback from promote.
 	Rollback(ctx context.Context, rolledBackBy string) (Active, error)
 
+	// Watch subscribes to active-pointer changes for the lifetime of
+	// ctx. The returned channel delivers one [Active] value per
+	// observed change; callers fetch the corresponding draft via
+	// GetDraft, compile it, and Swap it onto their live policy
+	// engine.
+	//
+	// Semantics:
+	//
+	//   - No initial value is delivered. Callers should always seed
+	//     their state with [GetActive] before starting Watch — the
+	//     watcher then keeps that state fresh.
+	//   - The channel is buffered (small). A slow consumer that fails
+	//     to drain it can miss notifications, in which case the
+	//     polling fallback (PostgresStore) or the next Promote/
+	//     Rollback (MemoryStore) eventually delivers a fresh value
+	//     for the same field. The consumer's reaction is itself
+	//     idempotent — comparing the incoming current_draft_id
+	//     against the locally-loaded one short-circuits no-op
+	//     refreshes — so a few extra channel sends never hurt.
+	//   - The channel closes when ctx is cancelled (or when Close
+	//     is called on the store).
+	//
+	// Implementations MUST tolerate any number of concurrent
+	// watchers; production deployments expect one per gateway
+	// replica. The PostgresStore uses LISTEN/NOTIFY for the wakeup,
+	// with a 5-second polling fallback so reconnect windows can't
+	// leave a replica running stale policy indefinitely.
+	Watch(ctx context.Context) (<-chan Active, error)
+
 	// Close releases resources (the Postgres connection pool, etc.).
-	// Safe to call multiple times. Memory store's Close is a no-op.
+	// Safe to call multiple times. Memory store's Close is a no-op
+	// for the pool but does close any outstanding Watch channels so
+	// callers blocked on the channel see a clean exit.
 	Close() error
 }

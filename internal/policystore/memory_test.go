@@ -244,6 +244,142 @@ func TestActiveMarshalJSON_PreservesPromotedAtWhenSet(t *testing.T) {
 	}
 }
 
+func TestMemoryStore_WatchDeliversOnPromote(t *testing.T) {
+	t.Parallel()
+	s := NewMemoryStore()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ch, err := s.Watch(ctx)
+	if err != nil {
+		t.Fatalf("watch: %v", err)
+	}
+
+	d, _ := s.CreateDraft(context.Background(), Draft{Name: "v1", RegoSource: validRego})
+	_, err = s.Promote(context.Background(), d.ID, "alice")
+	if err != nil {
+		t.Fatalf("promote: %v", err)
+	}
+
+	select {
+	case got := <-ch:
+		if got.CurrentDraftID != d.ID {
+			t.Fatalf("delivered active.CurrentDraftID=%q, want %q", got.CurrentDraftID, d.ID)
+		}
+		if got.PromotedBy != "alice" {
+			t.Fatalf("delivered PromotedBy=%q, want alice", got.PromotedBy)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Watch did not deliver promotion within 1s")
+	}
+}
+
+func TestMemoryStore_WatchDeliversOnRollback(t *testing.T) {
+	t.Parallel()
+	s := NewMemoryStore()
+	d1, _ := s.CreateDraft(context.Background(), Draft{Name: "v1", RegoSource: validRego})
+	d2, _ := s.CreateDraft(context.Background(), Draft{Name: "v2", RegoSource: validRego2})
+	_, _ = s.Promote(context.Background(), d1.ID, "")
+	_, _ = s.Promote(context.Background(), d2.ID, "")
+	// Subscribe AFTER both promotes so we only see the rollback.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ch, _ := s.Watch(ctx)
+
+	if _, err := s.Rollback(context.Background(), "alice"); err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+	select {
+	case got := <-ch:
+		if got.CurrentDraftID != d1.ID {
+			t.Fatalf("after rollback delivered CurrentDraftID=%q, want %q", got.CurrentDraftID, d1.ID)
+		}
+		if got.PreviousDraftID != "" {
+			t.Fatalf("rollback should clear previous, got %q", got.PreviousDraftID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Watch did not deliver rollback within 1s")
+	}
+}
+
+func TestMemoryStore_WatchCtxCancelClosesChannel(t *testing.T) {
+	t.Parallel()
+	s := NewMemoryStore()
+	ctx, cancel := context.WithCancel(context.Background())
+	ch, _ := s.Watch(ctx)
+	cancel()
+	// Give the unsubscribe goroutine a moment to run.
+	deadline := time.After(time.Second)
+	for {
+		select {
+		case _, open := <-ch:
+			if !open {
+				return // expected
+			}
+		case <-deadline:
+			t.Fatal("Watch channel did not close after ctx cancel")
+		}
+	}
+}
+
+func TestMemoryStore_WatchMultipleSubscribers(t *testing.T) {
+	t.Parallel()
+	s := NewMemoryStore()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	a, _ := s.Watch(ctx)
+	b, _ := s.Watch(ctx)
+	c, _ := s.Watch(ctx)
+
+	d, _ := s.CreateDraft(context.Background(), Draft{Name: "v1", RegoSource: validRego})
+	_, _ = s.Promote(context.Background(), d.ID, "")
+
+	for i, ch := range []<-chan Active{a, b, c} {
+		select {
+		case got := <-ch:
+			if got.CurrentDraftID != d.ID {
+				t.Fatalf("subscriber %d got %q, want %q", i, got.CurrentDraftID, d.ID)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("subscriber %d did not receive within 1s", i)
+		}
+	}
+}
+
+func TestMemoryStore_WatchSlowConsumerDoesNotBlock(t *testing.T) {
+	t.Parallel()
+	s := NewMemoryStore()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// Subscribe but never read. After we fill the buffer the next
+	// promote should drop on send rather than block — verify by
+	// timing: a bunch of promotes should complete promptly.
+	_, _ = s.Watch(ctx)
+
+	d, _ := s.CreateDraft(context.Background(), Draft{Name: "v1", RegoSource: validRego})
+
+	done := make(chan struct{})
+	go func() {
+		// 20 promotes against the same draft is a no-op except for
+		// the very first one (re-promote of same id is idempotent),
+		// so we alternate to force a state change each time.
+		d2, _ := s.CreateDraft(context.Background(), Draft{Name: "v2", RegoSource: validRego2})
+		for i := 0; i < 20; i++ {
+			target := d.ID
+			if i%2 == 0 {
+				target = d2.ID
+			}
+			_, _ = s.Promote(context.Background(), target, "")
+		}
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("slow consumer blocked promote chain")
+	}
+}
+
 func TestMemoryStore_UpdateKeepsTenantAndCreatedAt(t *testing.T) {
 	t.Parallel()
 	s := NewMemoryStore()

@@ -6,6 +6,8 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
+	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -15,14 +17,45 @@ import (
 //go:embed schema.sql
 var schemaSQL string
 
+// notifyChannel is the Postgres LISTEN/NOTIFY channel used to
+// broadcast active-pointer changes across gateway replicas. Each
+// Promote and Rollback emits NOTIFY <channel>, '<draft_id>' inside
+// its existing transaction so the payload is committed atomically
+// with the pointer write.
+const notifyChannel = "intentgate_policy_active_changed"
+
+// pollFallbackInterval is how often the listener goroutine
+// re-reads the active row as a belt-and-suspenders check during
+// reconnect windows. 5 seconds is operator-noticeable (worst case)
+// without being chatty against Postgres on idle clusters.
+const pollFallbackInterval = 5 * time.Second
+
 // PostgresStore is a durable, multi-replica-safe policy-draft store.
 //
 // Promote and Rollback are transactional: existence check on the
 // referenced draft and the update of policy_active happen inside a
 // single SERIALIZABLE-equivalent transaction, so a concurrent
 // DeleteDraft can't slip between the check and the write.
+//
+// # Cross-replica refresh
+//
+// Each Promote and Rollback emits NOTIFY [notifyChannel] inside its
+// transaction. A background goroutine started by NewPostgresStore
+// LISTENs on the same channel and fans incoming notifications out
+// to every Watch subscriber. A polling fallback (every
+// [pollFallbackInterval]) re-reads the active row so a brief
+// connection drop can't leave a replica running stale policy
+// indefinitely. Together they give same-rollout multi-replica
+// gateways near-real-time agreement on which draft is live.
 type PostgresStore struct {
-	pool *pgxpool.Pool
+	pool   *pgxpool.Pool
+	logger *slog.Logger
+
+	mu       sync.Mutex
+	watchers []chan Active
+
+	listenerCancel context.CancelFunc
+	listenerDone   chan struct{}
 }
 
 // NewPostgresStore connects, pings, runs the embedded migration,
@@ -55,15 +88,188 @@ func NewPostgresStore(ctx context.Context, dsn string) (*PostgresStore, error) {
 		return nil, fmt.Errorf("policystore: migrate: %w", err)
 	}
 
-	return &PostgresStore{pool: pool}, nil
+	listenCtx, listenCancel := context.WithCancel(context.Background())
+	s := &PostgresStore{
+		pool:           pool,
+		logger:         slog.Default(),
+		listenerCancel: listenCancel,
+		listenerDone:   make(chan struct{}),
+	}
+	go s.runListener(listenCtx)
+	return s, nil
 }
 
-// Close releases the pool. Safe to call multiple times.
+// Close stops the listener goroutine, closes outstanding Watch
+// channels, and releases the pool. Safe to call multiple times.
 func (s *PostgresStore) Close() error {
+	if s.listenerCancel != nil {
+		s.listenerCancel()
+		<-s.listenerDone
+		s.listenerCancel = nil
+	}
+	s.mu.Lock()
+	for _, ch := range s.watchers {
+		close(ch)
+	}
+	s.watchers = nil
+	s.mu.Unlock()
 	if s.pool != nil {
 		s.pool.Close()
 	}
 	return nil
+}
+
+// Watch returns a buffered channel that receives an [Active] value
+// every time the policy_active row changes — either via a NOTIFY
+// from another replica or via the polling fallback. The channel
+// closes when ctx is cancelled or the store is closed.
+func (s *PostgresStore) Watch(ctx context.Context) (<-chan Active, error) {
+	ch := make(chan Active, 4)
+	s.mu.Lock()
+	s.watchers = append(s.watchers, ch)
+	s.mu.Unlock()
+
+	go func() {
+		<-ctx.Done()
+		s.unsubscribe(ch)
+	}()
+	return ch, nil
+}
+
+func (s *PostgresStore) unsubscribe(target chan Active) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i, ch := range s.watchers {
+		if ch == target {
+			s.watchers = append(s.watchers[:i], s.watchers[i+1:]...)
+			close(ch)
+			return
+		}
+	}
+}
+
+// fanOut delivers an Active value to every subscriber. Drops on
+// full buffer so one slow consumer can't stall the listener.
+func (s *PostgresStore) fanOut(a Active) {
+	s.mu.Lock()
+	subs := make([]chan Active, len(s.watchers))
+	copy(subs, s.watchers)
+	s.mu.Unlock()
+	for _, ch := range subs {
+		select {
+		case ch <- a:
+		default:
+		}
+	}
+}
+
+// runListener is the long-lived goroutine that LISTENs on the
+// notify channel and polls every [pollFallbackInterval] as a
+// reconnect-window safety net. Reconnects on connection drop with
+// a small backoff. Returns when ctx is cancelled (Close).
+func (s *PostgresStore) runListener(ctx context.Context) {
+	defer close(s.listenerDone)
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		if err := s.listenerSession(ctx); err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			s.logger.Warn("policystore: listener session error; reconnecting",
+				"err", err)
+			// Brief backoff before reconnecting so we don't tight-loop
+			// against a misconfigured Postgres.
+			select {
+			case <-time.After(time.Second):
+			case <-ctx.Done():
+				return
+			}
+		}
+	}
+}
+
+// listenerSession runs one acquire→LISTEN→wait-loop. On any error
+// from the underlying pgconn (other than the poll-timeout we
+// orchestrate ourselves) it returns to runListener, which decides
+// whether to reconnect. Returns when ctx (the parent / shutdown
+// context) is cancelled too.
+func (s *PostgresStore) listenerSession(ctx context.Context) error {
+	conn, err := s.pool.Acquire(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire: %w", err)
+	}
+	defer conn.Release()
+
+	if _, err := conn.Exec(ctx, "LISTEN "+notifyChannel); err != nil {
+		return fmt.Errorf("listen: %w", err)
+	}
+
+	// Track the last fan-out's CurrentDraftID so the polling
+	// fallback doesn't broadcast on every poll — only when the
+	// active row actually changed since last seen. The listener
+	// path emits unconditionally because by definition a NOTIFY
+	// fired only because something committed.
+	lastID := ""
+
+	for {
+		// We want WaitForNotification to return either when a real
+		// NOTIFY arrives OR when our polling interval lapses, so we
+		// derive a child ctx with that interval as a deadline. On
+		// DeadlineExceeded we do the poll; on a real notification
+		// we fan-out the fresh Active; on the parent ctx being
+		// cancelled we bail out cleanly.
+		waitCtx, cancelWait := context.WithTimeout(ctx, pollFallbackInterval)
+		n, err := conn.Conn().WaitForNotification(waitCtx)
+		cancelWait()
+
+		switch {
+		case err == nil:
+			// Real NOTIFY. Read active and fan-out unconditionally
+			// — a notify-without-change is impossible by construction
+			// (Promote/Rollback are the only emitters and both run
+			// inside their own pointer-mutating transactions).
+			_ = n // payload carries the draft id, but we re-read for safety
+			active, getErr := s.GetActive(ctx)
+			if getErr != nil {
+				s.logger.Warn("policystore: GetActive after NOTIFY failed",
+					"err", getErr)
+				continue
+			}
+			lastID = active.CurrentDraftID
+			s.fanOut(active)
+
+		case errors.Is(err, context.DeadlineExceeded):
+			// Polling fallback fires. Only emit if the active row
+			// looks different from what we last delivered — keeps
+			// the every-5s tick from spamming the bus on an idle
+			// cluster.
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			active, getErr := s.GetActive(ctx)
+			if getErr != nil {
+				s.logger.Warn("policystore: polling GetActive failed",
+					"err", getErr)
+				continue
+			}
+			if active.CurrentDraftID != lastID {
+				lastID = active.CurrentDraftID
+				s.fanOut(active)
+			}
+
+		case errors.Is(err, context.Canceled):
+			// Parent ctx cancelled (Close). Propagate.
+			return err
+
+		default:
+			// pgconn-level error — connection dropped, server
+			// rebooted, network blip. Return so runListener
+			// reconnects.
+			return fmt.Errorf("wait for notification: %w", err)
+		}
+	}
 }
 
 // CreateDraft inserts a row and returns the populated draft. The
@@ -314,6 +520,17 @@ func (s *PostgresStore) Promote(ctx context.Context, draftID, promotedBy string)
 	`, draftID, current, now, promotedBy); err != nil {
 		return Active{}, fmt.Errorf("policystore: promote update: %w", err)
 	}
+	// Broadcast to every replica's listener BEFORE commit so the
+	// NOTIFY rides in the same transaction as the pointer write —
+	// either both land or both roll back. Postgres queues the
+	// notification until commit, so subscribers only see it after
+	// the row update is visible. Payload is the new draft id so a
+	// future listener that wants to skip the GetActive round-trip
+	// could read it directly. pg_notify is the parameterized form;
+	// the bare NOTIFY statement doesn't accept placeholders.
+	if _, err := tx.Exec(ctx, "SELECT pg_notify($1, $2)", notifyChannel, draftID); err != nil {
+		return Active{}, fmt.Errorf("policystore: promote notify: %w", err)
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return Active{}, fmt.Errorf("policystore: promote commit: %w", err)
 	}
@@ -356,6 +573,11 @@ func (s *PostgresStore) Rollback(ctx context.Context, rolledBackBy string) (Acti
 		WHERE id = 'global'
 	`, previous, now, rolledBackBy); err != nil {
 		return Active{}, fmt.Errorf("policystore: rollback update: %w", err)
+	}
+	// Same NOTIFY hook as Promote — the listener handles both kinds
+	// of pointer change identically (re-fetch + fan-out).
+	if _, err := tx.Exec(ctx, "SELECT pg_notify($1, $2)", notifyChannel, previous); err != nil {
+		return Active{}, fmt.Errorf("policystore: rollback notify: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return Active{}, fmt.Errorf("policystore: rollback commit: %w", err)

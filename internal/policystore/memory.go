@@ -19,6 +19,11 @@ type MemoryStore struct {
 	mu     sync.RWMutex
 	drafts map[string]Draft
 	active Active
+	// watchers is the set of subscribers receiving fan-out
+	// notifications from Promote and Rollback. Each Watch call
+	// appends; ctx-cancel removes. Bounded buffer per channel so a
+	// slow consumer can't backpressure the writer goroutine.
+	watchers []chan Active
 }
 
 // NewMemoryStore returns an empty in-memory store.
@@ -26,8 +31,72 @@ func NewMemoryStore() *MemoryStore {
 	return &MemoryStore{drafts: make(map[string]Draft)}
 }
 
-// Close is a no-op (no resources to release).
-func (s *MemoryStore) Close() error { return nil }
+// Close closes any outstanding Watch channels so callers blocked on
+// them see a clean exit. Drafts and the active pointer remain
+// readable after Close — the store doesn't enforce a state machine
+// here; the gateway shuts down the whole process around it.
+func (s *MemoryStore) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, ch := range s.watchers {
+		close(ch)
+	}
+	s.watchers = nil
+	return nil
+}
+
+// Watch subscribes to active-pointer changes. The returned channel
+// is buffered (4) so a brief blip in the consumer doesn't drop
+// notifications; a sustained backlog drops on send (the consumer
+// resyncs via the next change or by re-reading on its own).
+//
+// The subscription stays alive until ctx is cancelled; a tiny
+// goroutine watches ctx.Done and unregisters the channel.
+func (s *MemoryStore) Watch(ctx context.Context) (<-chan Active, error) {
+	ch := make(chan Active, 4)
+	s.mu.Lock()
+	s.watchers = append(s.watchers, ch)
+	s.mu.Unlock()
+
+	go func() {
+		<-ctx.Done()
+		s.unsubscribe(ch)
+	}()
+	return ch, nil
+}
+
+// unsubscribe removes a watcher channel from the registry and
+// closes it. Idempotent: a no-op if the channel was already
+// removed (Close drained everyone).
+func (s *MemoryStore) unsubscribe(target chan Active) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i, ch := range s.watchers {
+		if ch == target {
+			s.watchers = append(s.watchers[:i], s.watchers[i+1:]...)
+			close(ch)
+			return
+		}
+	}
+}
+
+// notifyWatchers fans out an Active value to every subscribed
+// channel, dropping on full buffer (best-effort delivery — the
+// consumer's reaction is idempotent so missing one is fine, and
+// blocking here would let one slow consumer stall the next
+// Promote). Called from within Promote/Rollback under s.mu, so
+// watchers being mutated concurrently is impossible during the
+// fan-out.
+func (s *MemoryStore) notifyWatchers(a Active) {
+	for _, ch := range s.watchers {
+		select {
+		case ch <- a:
+		default:
+			// Slow consumer; drop. They'll see the next change or
+			// can re-read on their own.
+		}
+	}
+}
 
 // newID generates a short random hex ID. Collisions across an
 // operator's draft library are essentially zero at 16 hex chars
@@ -176,6 +245,7 @@ func (s *MemoryStore) Promote(_ context.Context, draftID, promotedBy string) (Ac
 		PromotedAt:      time.Now().UTC(),
 		PromotedBy:      promotedBy,
 	}
+	s.notifyWatchers(s.active)
 	return s.active, nil
 }
 
@@ -196,5 +266,6 @@ func (s *MemoryStore) Rollback(_ context.Context, rolledBackBy string) (Active, 
 		PromotedAt:      time.Now().UTC(),
 		PromotedBy:      rolledBackBy,
 	}
+	s.notifyWatchers(s.active)
 	return s.active, nil
 }
