@@ -1,70 +1,57 @@
 # IntentGate gateway benchmarks
 
-Run: `2026-05-10 19:54 UTC`  
-Gateway version: `dev` (locally-built, untagged)  
-Profile: `as-deployed` (single-replica, in-memory budget store, no upstream tool server, capability/intent/budget non-strict)  
-Host: Darwin/arm64, 10 cores  
+Run: `2026-05-11 17:36 UTC`
+Gateway version: `dev`
+Profile: `in-cluster`
+Host: in-cluster Job, 10 CPUs
 Sweep duration per rate: `30s`
 
 ## Headline
 
-At **2,000 requests per second**, the gateway holds **p50 = 0.77 ms** and **p99 = 1.50 ms** with **100% success**. Throughput climbs linearly from 100 → 2,000 RPS with a falling p99 (connections reuse instead of warming up). The first sign of saturation appears between 2k and 4k RPS: at 4,000 the gateway sustains ~3,992 RPS but p50 jumps 50× to 37 ms — clearly a ceiling, but worth measuring with a co-located vegeta before blaming the gateway, since `kubectl port-forward` is also in the path and is not built for throughput.
+At **500 requests per second**, the gateway holds
+**p50 = 0.88 ms** and **p99 = 9.50 ms** with
+**100.00% success**. (Highest rate in this sweep that
+stayed under a 10 ms p99 with >= 99.9% success — the script picks
+this automatically.)
 
 ## End-to-end latency by request rate
 
-Vegeta attacks `POST /v1/mcp` with a one-tool-call payload at
-increasing target rates. The full pipeline runs on every
-request: token decode + HMAC verify + revocation lookup +
-policy eval + audit emit. `success` is the fraction of
-requests the gateway returned a 2xx for; `errors` counts any
-non-2xx **or** transport failure (timeouts, connection drops).
+Vegeta attacks `POST /v1/mcp` IN-CLUSTER against the gateway Service
+(cluster DNS, no port-forward). The full pipeline runs on every
+request: token decode + HMAC verify + revocation lookup + policy
+eval + audit emit.
 
 | target rate | throughput | p50 (ms) | p95 (ms) | p99 (ms) | max (ms) | success | errors |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 100 | 100 | 3.47 | 5.96 | 8.79 | 27.65 | 100.00% | 0 |
-| 500 | 500 | 1.57 | 2.85 | 4.84 | 14.61 | 100.00% | 0 |
-| 1000 | 1000 | 0.97 | 1.50 | 2.67 | 33.56 | 100.00% | 0 |
-| 2000 | 2000 | 0.77 | 0.93 | 1.50 | 33.04 | 100.00% | 0 |
-| 4000 | 3992 | 37.09 | 216.34 | 364.81 | 672.04 | 100.00% | 0 |
+| 100 | 100 | 2.24 | 4.92 | 9.07 | 90.52 | 100.00% | 0 |
+| 500 | 500 | 0.88 | 1.32 | 9.50 | 63.50 | 100.00% | 0 |
+| 1000 | 1000 | 0.84 | 1.50 | 19.46 | 239.66 | 100.00% | 0 |
+| 2000 | 856 | 874.24 | 8191.35 | 9685.52 | 10005.71 | 57.01% | 1003 |
 
 ## Average latency by check (cumulative across sweep)
 
-Pulled from `/metrics` after the sweep completes — these are
-the histogram `sum/count` averages by check stage. Use them
-to spot which check dominates the request budget. n/a means
-the check is disabled (its histogram has zero observations).
-
 | check       | mean (ms) |
 | ----------- | --------: |
-| capability  | 0.040 |
+| capability  | n/a |
 | revocation  | n/a |
-| intent      | 4.086 |
-| policy      | 0.107 |
-| budget      | 0.003 |
+| intent      | n/a |
+| policy      | n/a |
+| budget      | n/a |
 
 ## Test setup
 
-- Gateway running in single-replica mode.
-- Token minted with a 1800s TTL and 10M max-calls so neither
-  TTL nor budget caps the sweep.
-- One vegeta worker on the same host as the gateway
-  (port-forwarded from the cluster). Cross-region numbers
-  will be dominated by network latency, not the gateway.
-- Strict-mode flags are reported via the metrics histogram
-  presence above: a check with `n/a` was disabled during the
-  run. To benchmark strict mode, flip `requireCapability /
-  Intent / Budget` to `true` in the helm values, restart,
-  and re-run with `PROFILE_NAME=strict`.
+- Gateway running in the same cluster; vegeta running as a Job in
+  the same namespace. No port-forward in the path.
+- Token minted with 1800s TTL and 10M max-calls so neither TTL
+  nor budget caps the sweep.
 
 ## Reproducing
 
 ```sh
-export ADMIN_TOKEN=<superadmin token>
-kubectl -n intentgate port-forward svc/ig-intentgate-gateway 8080:8080 &
-sleep 1
-./scripts/bench.sh
+kubectl -n intentgate delete job intentgate-bench --ignore-not-found
+kubectl apply -n intentgate -f scripts/bench-job.yaml
+kubectl -n intentgate logs -f job/intentgate-bench > BENCHMARKS.md
 ```
 
-Knobs: `DURATION`, `RATES` (space-separated), `PROFILE_NAME`,
+Knobs via env on the Job spec: `DURATION`, `RATES`, `PROFILE_NAME`,
 `GATEWAY_URL`.
-
