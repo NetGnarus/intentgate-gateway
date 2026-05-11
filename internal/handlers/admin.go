@@ -124,6 +124,7 @@ func NewAdminRevokeHandler(cfg AdminConfig) http.Handler {
 		ev.CapabilityTokenID = body.JTI
 		ev.Tenant = auth.tenant
 		ev.RemoteIP = r.RemoteAddr
+		ev.ElevationID = resolveElevationID(r)
 		cfg.Audit.Emit(r.Context(), ev)
 
 		cfg.Logger.Info("token revoked", "jti", body.JTI, "reason", body.Reason)
@@ -335,6 +336,7 @@ func NewAdminMintHandler(cfg AdminConfig) http.Handler {
 		ev.Tenant = tok.Tenant
 		ev.AgentID = body.Subject
 		ev.RemoteIP = r.RemoteAddr
+		ev.ElevationID = resolveElevationID(r)
 		cfg.Audit.Emit(r.Context(), ev)
 
 		var expiresAt string
@@ -417,6 +419,7 @@ func NewAdminAuditQueryHandler(cfg AdminConfig) http.Handler {
 			Check:             q.Get("check"),
 			CapabilityTokenID: q.Get("jti"),
 			Tenant:            tenant,
+			ElevationID:       q.Get("elevation_id"),
 			Limit:             parseIntParam(r, "limit", 100, 1, 1000),
 			Offset:            parseIntParam(r, "offset", 0, 0, 1<<31-1),
 		}
@@ -905,6 +908,33 @@ func checkAdminToken(r *http.Request, want string) bool {
 func adminError(w http.ResponseWriter, status int, msg string) {
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(map[string]any{"error": msg})
+}
+
+// resolveElevationID reads the X-IntentGate-Elevation-Id header
+// (Pro v2 #5, session 58). Console-pro sets it on every outbound
+// admin call when the signed-in operator has an active JIT
+// elevation; the gateway stamps it onto the resulting audit event
+// so an auditor can pull "every privileged operation under
+// elevation X" with one query.
+//
+// The gateway does NOT validate the id — it's metadata only. The
+// admin token authentication already proves the caller is trusted
+// to operate; the elevation id is the human-traceability story on
+// top. Console-pro is the authoritative source for what
+// elevation row exists and who approved it.
+//
+// Returns the empty string when the header is absent or
+// implausible. Length-cap at 128 chars to defend the audit row
+// against accidentally storing a megabyte of operator input.
+func resolveElevationID(r *http.Request) string {
+	v := strings.TrimSpace(r.Header.Get("X-IntentGate-Elevation-Id"))
+	if v == "" {
+		return ""
+	}
+	if len(v) > 128 {
+		return ""
+	}
+	return v
 }
 
 // parseIntParam reads a positive integer from a query string with

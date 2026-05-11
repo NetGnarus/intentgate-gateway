@@ -64,6 +64,7 @@ func CanonicalForHash(e Event) ([]byte, error) {
 		RemoteIP:              e.RemoteIP,
 		UpstreamStatus:        e.UpstreamStatus,
 		RequiresStepUp:        e.RequiresStepUp,
+		ElevationID:           e.ElevationID,
 	}
 	return json.Marshal(c)
 }
@@ -123,4 +124,5 @@ type canonicalEvent struct {
 	RemoteIP              string   `json:"remote_ip,omitempty"`
 	UpstreamStatus        int      `json:"upstream_status,omitempty"`
 	RequiresStepUp        bool     `json:"requires_step_up,omitempty"`
+	ElevationID           string   `json:"elevation_id,omitempty"`
 }

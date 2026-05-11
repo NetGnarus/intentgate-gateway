@@ -75,6 +75,11 @@ type QueryFilter struct {
 	// all tenants (admin / superuser view); set to "default" for
 	// single-tenant deployments that opt into explicit filtering.
 	Tenant string
+	// ElevationID returns only events emitted during a specific JIT
+	// elevation window (Pro v2 #5, session 58). Powers the compliance
+	// view "every privileged operation under elevation X". Empty
+	// matches all events.
+	ElevationID string
 	// Limit caps the page size. Implementations MUST cap further at
 	// their own internal maximum (1000) to avoid pathological queries.
 	// Zero is treated as the implementation default.

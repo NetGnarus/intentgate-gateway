@@ -73,7 +73,18 @@ CREATE TABLE IF NOT EXISTS audit_events (
     -- the verify endpoint distinguishes "covered by the chain" from
     -- "best-effort audit before chain was enabled".
     prev_hash                TEXT,
-    hash                     TEXT NOT NULL DEFAULT ''
+    hash                     TEXT NOT NULL DEFAULT '',
+
+    -- JIT admin-elevation trace (Pro v2 #5, gateway 1.8+).
+    -- Sourced from the X-IntentGate-Elevation-Id header on the
+    -- admin request that emitted this audit row. Empty for events
+    -- from non-elevated sessions and for agent /v1/mcp requests
+    -- (which don't go through operator JIT). When populated,
+    -- console-pro's compliance pack joins on this column to
+    -- produce "show me every privileged operation performed under
+    -- elevation X with its approver and justification" — a single
+    -- query answer to the SOC 2 break-glass evidence question.
+    elevation_id             TEXT
 );
 
 -- Idempotent ALTERs: existing 0.5/0.6 deployments whose audit_events
@@ -91,6 +102,14 @@ ALTER TABLE audit_events
     ADD COLUMN IF NOT EXISTS prev_hash TEXT;
 ALTER TABLE audit_events
     ADD COLUMN IF NOT EXISTS hash TEXT NOT NULL DEFAULT '';
+ALTER TABLE audit_events
+    ADD COLUMN IF NOT EXISTS elevation_id TEXT;
+
+-- Compliance lookup: "every event during elevation X". Partial
+-- index so non-elevated rows (the vast majority) don't bloat it.
+CREATE INDEX IF NOT EXISTS audit_events_elevation_idx
+    ON audit_events (elevation_id, ts DESC)
+    WHERE elevation_id IS NOT NULL;
 
 -- Per-tenant chain heads. One row per tenant; locked FOR UPDATE on
 -- every insert to serialize chain progression and prevent two

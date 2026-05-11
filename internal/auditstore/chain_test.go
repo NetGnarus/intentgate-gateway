@@ -198,6 +198,57 @@ func TestComputeHashDeterministic(t *testing.T) {
 	}
 }
 
+// --- elevation_id participates in the chain --------------------------
+
+// Two events that differ only in elevation_id MUST produce different
+// hashes — otherwise an attacker could swap the elevation row out of
+// from under an audited action and the chain would still verify.
+func TestChainHashCoversElevationID(t *testing.T) {
+	now := time.Date(2026, 5, 11, 22, 30, 0, 0, time.UTC)
+	a := mkChainEvent(now, audit.DecisionAllow, "admin/mint", "acme")
+	a.ElevationID = "elev-abc-123"
+	b := mkChainEvent(now, audit.DecisionAllow, "admin/mint", "acme")
+	b.ElevationID = "elev-xyz-789"
+
+	ha, err := audit.HashEvent("prev", a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hb, err := audit.HashEvent("prev", b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ha == hb {
+		t.Errorf("elevation_id should affect the chain hash; got identical %s", ha)
+	}
+}
+
+// Memory-store filter honors ElevationID. Two events with different
+// elevations; filtering returns only the matching one.
+func TestMemoryStoreFiltersByElevationID(t *testing.T) {
+	ctx := context.Background()
+	s := NewMemoryStore(0)
+
+	now := time.Now().UTC()
+	e1 := mkChainEvent(now, audit.DecisionAllow, "admin/mint", "acme")
+	e1.ElevationID = "elev-1"
+	e2 := mkChainEvent(now.Add(time.Second), audit.DecisionAllow, "admin/revoke", "acme")
+	e2.ElevationID = "elev-2"
+	e3 := mkChainEvent(now.Add(2*time.Second), audit.DecisionAllow, "admin/mint", "acme")
+	// no elevation_id on e3 — this row should never match a non-empty filter.
+	_ = s.Insert(ctx, e1)
+	_ = s.Insert(ctx, e2)
+	_ = s.Insert(ctx, e3)
+
+	got, err := s.Query(ctx, QueryFilter{ElevationID: "elev-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Errorf("want 1 event for elev-1, got %d", len(got))
+	}
+}
+
 // --- window filter --------------------------------------------------
 
 func TestVerifyChainRespectsWindow(t *testing.T) {

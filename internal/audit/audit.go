@@ -157,6 +157,24 @@ type Event struct {
 	// returns both `allow: false` AND `requires_step_up: true`; a
 	// policy observing only returns `allow: true` + `requires_step_up: true`.
 	RequiresStepUp bool `json:"requires_step_up,omitempty"`
+
+	// ElevationID is the JIT-elevation row id the calling operator
+	// held when this event was emitted (Pro v2 #5, session 58).
+	// Empty for events from non-elevated sessions and for agent
+	// requests (which don't go through operator JIT). When non-empty,
+	// it links the event back to the approval row in console-pro's
+	// console_elevations table — an auditor can pull every event
+	// performed during one elevation window with a single query, and
+	// console-pro's compliance pack joins on this to show "who
+	// approved the action that did X."
+	//
+	// Sourced from the `X-IntentGate-Elevation-Id` HTTP header on
+	// admin endpoints (set by console-pro's gateway client when the
+	// signed-in operator has an active elevation). The gateway
+	// itself doesn't validate the id — it's metadata only; the
+	// audit row's combination of (elevation_id, decided_by) is what
+	// the auditor verifies against the elevation table.
+	ElevationID string `json:"elevation_id,omitempty"`
 }
 
 // NewEvent constructs an Event with the timestamp, event name, and
@@ -185,11 +203,17 @@ type Event struct {
 //	      working unchanged. The Pro console reads this field to
 //	      surface a high-risk-feed badge; SIEMs can route on it for
 //	      alert pipelines.
+//	"6" — gateway 1.8+: adds optional `elevation_id` linking the
+//	      event back to a JIT admin elevation (Pro v2 #5). Empty
+//	      when no operator JIT was active. The Pro console joins on
+//	      this to surface "every operation performed under
+//	      elevation X" queries. v5 SIEM mappings keep working —
+//	      omitempty means absent rows don't change the wire shape.
 func NewEvent(d Decision, tool string) Event {
 	return Event{
 		Timestamp:     time.Now().UTC().Format(time.RFC3339Nano),
 		EventName:     "intentgate.tool_call",
-		SchemaVersion: "5",
+		SchemaVersion: "6",
 		Decision:      d,
 		Tool:          tool,
 	}

@@ -313,5 +313,8 @@ func matchesFilter(e audit.Event, f QueryFilter) bool {
 	if f.Tenant != "" && e.Tenant != f.Tenant {
 		return false
 	}
+	if f.ElevationID != "" && e.ElevationID != f.ElevationID {
+		return false
+	}
 	return true
 }

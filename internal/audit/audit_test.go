@@ -24,7 +24,7 @@ func TestNewEventPopulatesDefaults(t *testing.T) {
 	if e.EventName != "intentgate.tool_call" {
 		t.Errorf("event name: %v", e.EventName)
 	}
-	if e.SchemaVersion != "5" {
+	if e.SchemaVersion != "6" {
 		t.Errorf("schema version: %v", e.SchemaVersion)
 	}
 	// Timestamp must parse back to within one second of now.
@@ -124,6 +124,29 @@ func TestEventRequiresStepUpEmittedWhenSet(t *testing.T) {
 	raw, _ := json.Marshal(e)
 	if !strings.Contains(string(raw), `"requires_step_up":true`) {
 		t.Errorf("expected requires_step_up:true in JSON, got: %s", raw)
+	}
+}
+
+func TestEventElevationIDOmittedByDefault(t *testing.T) {
+	// Agent-side and non-elevated admin events MUST NOT carry
+	// elevation_id — empty string omitempty so v5 SIEM mappings
+	// keep working unchanged.
+	e := NewEvent(DecisionAllow, "read_invoice")
+	raw, _ := json.Marshal(e)
+	if strings.Contains(string(raw), `"elevation_id"`) {
+		t.Errorf("expected elevation_id absent when empty, got: %s", raw)
+	}
+}
+
+func TestEventElevationIDEmittedWhenSet(t *testing.T) {
+	// When an admin handler receives an X-IntentGate-Elevation-Id
+	// header from console-pro, the resulting audit event MUST carry
+	// elevation_id so the compliance pack can join on it.
+	e := NewEvent(DecisionAllow, "admin/mint")
+	e.ElevationID = "abc123def456"
+	raw, _ := json.Marshal(e)
+	if !strings.Contains(string(raw), `"elevation_id":"abc123def456"`) {
+		t.Errorf("expected elevation_id in JSON, got: %s", raw)
 	}
 }
 

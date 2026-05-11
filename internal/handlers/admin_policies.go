@@ -571,6 +571,7 @@ func NewAdminActiveDeleteHandler(cfg PolicyAdminConfig) http.Handler {
 		ev.Reason = "policy slot cleared: tenant=" + tenant
 		ev.Tenant = tenant
 		ev.RemoteIP = r.RemoteAddr
+		ev.ElevationID = resolveElevationID(r)
 		cfg.Audit.Emit(r.Context(), ev)
 
 		cfg.Logger.Info("policy slot cleared", "tenant", tenant)
@@ -715,6 +716,7 @@ func NewAdminPromoteHandler(cfg PolicyAdminConfig) http.Handler {
 			" by=" + body.PromotedBy
 		ev.Tenant = tenant
 		ev.RemoteIP = r.RemoteAddr
+		ev.ElevationID = resolveElevationID(r)
 		cfg.Audit.Emit(r.Context(), ev)
 
 		cfg.Logger.Info("policy promoted",
@@ -846,6 +848,7 @@ func NewAdminRollbackHandler(cfg PolicyAdminConfig) http.Handler {
 			" by=" + body.RolledBackBy
 		ev.Tenant = tenant
 		ev.RemoteIP = r.RemoteAddr
+		ev.ElevationID = resolveElevationID(r)
 		cfg.Audit.Emit(r.Context(), ev)
 
 		cfg.Logger.Info("policy rolled back",

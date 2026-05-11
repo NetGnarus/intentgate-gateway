@@ -193,7 +193,8 @@ func (s *PostgresStore) Insert(ctx context.Context, e audit.Event) error {
 			latency_ms, remote_ip, upstream_status,
 			root_capability_token_id, caveat_count, tenant,
 			arg_values,
-			prev_hash, hash
+			prev_hash, hash,
+			elevation_id
 		) VALUES (
 			$1, $2, $3,
 			$4, $5, $6,
@@ -203,7 +204,8 @@ func (s *PostgresStore) Insert(ctx context.Context, e audit.Event) error {
 			$13, $14, $15,
 			$16, $17, $18,
 			$19,
-			$20, $21
+			$20, $21,
+			$22
 		)
 		RETURNING id
 	`
@@ -219,6 +221,7 @@ func (s *PostgresStore) Insert(ctx context.Context, e audit.Event) error {
 		nullableString(e.Tenant),
 		argValuesJSON,
 		prevHashCol, newHash,
+		nullableString(e.ElevationID),
 	).Scan(&insertedID); err != nil {
 		return fmt.Errorf("auditstore: insert: %w", err)
 	}
@@ -279,7 +282,7 @@ func (s *PostgresStore) Query(ctx context.Context, f QueryFilter) ([]audit.Event
 			capability_token_id, intent_summary,
 			latency_ms, remote_ip, upstream_status,
 			root_capability_token_id, caveat_count, tenant,
-			arg_values
+			arg_values, elevation_id
 		FROM audit_events
 	` + where + `
 		ORDER BY ts DESC
@@ -304,6 +307,7 @@ func (s *PostgresStore) Query(ctx context.Context, f QueryFilter) ([]audit.Event
 			rootJTI       *string
 			caveatCount   *int
 			tenant        *string
+			elevationID   *string
 		)
 		if err := rows.Scan(
 			&ts, &ev.EventName, &ev.SchemaVersion,
@@ -313,7 +317,7 @@ func (s *PostgresStore) Query(ctx context.Context, f QueryFilter) ([]audit.Event
 			&ev.CapabilityTokenID, &ev.IntentSummary,
 			&ev.LatencyMS, &ev.RemoteIP, &ev.UpstreamStatus,
 			&rootJTI, &caveatCount, &tenant,
-			&argValuesJSON,
+			&argValuesJSON, &elevationID,
 		); err != nil {
 			return nil, fmt.Errorf("auditstore: scan: %w", err)
 		}
@@ -325,6 +329,9 @@ func (s *PostgresStore) Query(ctx context.Context, f QueryFilter) ([]audit.Event
 		}
 		if tenant != nil {
 			ev.Tenant = *tenant
+		}
+		if elevationID != nil {
+			ev.ElevationID = *elevationID
 		}
 		ev.Timestamp = ts.UTC().Format(time.RFC3339Nano)
 		ev.Decision = audit.Decision(decision)
@@ -541,6 +548,10 @@ func buildWhere(f QueryFilter) (string, []any) {
 	if f.Tenant != "" {
 		args = append(args, f.Tenant)
 		clauses = append(clauses, "tenant = "+placeholder(len(args)))
+	}
+	if f.ElevationID != "" {
+		args = append(args, f.ElevationID)
+		clauses = append(clauses, "elevation_id = "+placeholder(len(args)))
 	}
 	if len(clauses) == 0 {
 		return "", args
