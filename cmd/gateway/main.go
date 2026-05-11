@@ -76,6 +76,14 @@
 //	                                human decision before timing out
 //	                                and returning block. Default 300
 //	                                (5 minutes).
+//	INTENTGATE_POLICY_STORE        "off" (default), "memory", or
+//	                                "postgres". When "memory" or
+//	                                "postgres", /v1/admin/policies/*
+//	                                draft and active-pointer endpoints
+//	                                register. "postgres" uses
+//	                                INTENTGATE_POSTGRES_URL. Promotes
+//	                                survive restarts only on
+//	                                "postgres".
 //	INTENTGATE_TENANT_ADMINS       Comma-separated tenant:token pairs
 //	                                that scope admin operations to a
 //	                                single tenant.
@@ -134,6 +142,7 @@ import (
 	"github.com/NetGnarus/intentgate-gateway/internal/extractor"
 	"github.com/NetGnarus/intentgate-gateway/internal/metrics"
 	"github.com/NetGnarus/intentgate-gateway/internal/policy"
+	"github.com/NetGnarus/intentgate-gateway/internal/policystore"
 	"github.com/NetGnarus/intentgate-gateway/internal/revocation"
 	"github.com/NetGnarus/intentgate-gateway/internal/server"
 	"github.com/NetGnarus/intentgate-gateway/internal/siem"
@@ -185,6 +194,12 @@ func main() {
 	sentinelClientSecret := envOr("INTENTGATE_SIEM_SENTINEL_CLIENT_SECRET", "")
 	approvalsBackend := envOr("INTENTGATE_APPROVALS_BACKEND", "memory")
 	approvalTimeoutS := envOr("INTENTGATE_APPROVAL_TIMEOUT_S", "300")
+	// Policy-store backend: "off" disables the draft + promote /
+	// rollback flow entirely (older deployments stay unchanged).
+	// "memory" is the dev default — drafts live in-process and are
+	// lost on restart, fine for kicking the tires. "postgres" is
+	// the production default once a Postgres URL is configured.
+	policyStoreBackend := envOr("INTENTGATE_POLICY_STORE", "off")
 	tenantAdminsRaw := envOr("INTENTGATE_TENANT_ADMINS", "")
 	upstreamURL := envOr("INTENTGATE_UPSTREAM_URL", "")
 	upstreamTimeoutMS := envOr("INTENTGATE_UPSTREAM_TIMEOUT_MS", "")
@@ -210,6 +225,11 @@ func main() {
 		logger.Error("failed to load policy", "err", err)
 		os.Exit(1)
 	}
+	// Wrap the initial engine in a Reloader so promote / rollback
+	// can swap it at runtime. Static deployments that never promote
+	// pay nothing for the indirection (atomic-pointer load per
+	// request is single-digit nanoseconds).
+	policyReloader := policy.NewReloader(policyEngine)
 
 	budgetStore, budgetSource, err := loadBudgetStore(logger, redisURL)
 	if err != nil {
@@ -311,6 +331,28 @@ func main() {
 		os.Exit(1)
 	}
 
+	policyStore, policyStoreDesc, err := loadPolicyStore(context.Background(), logger, policyStoreBackend, postgresURL)
+	if err != nil {
+		logger.Error("failed to initialize policy store", "err", err)
+		os.Exit(1)
+	}
+	defer func() {
+		if policyStore != nil {
+			_ = policyStore.Close()
+		}
+	}()
+
+	// On startup, if the policy store already has a promoted draft,
+	// load its source and swap the reloader to it BEFORE the server
+	// starts taking traffic. This makes promotions survive gateway
+	// restarts — otherwise a pod recycle would silently fall back to
+	// the embedded default / INTENTGATE_POLICY_FILE policy.
+	startupPolicySource, err := reloadActivePolicy(context.Background(), logger, policyStore, policyReloader, policySource)
+	if err != nil {
+		logger.Error("failed to load active policy from store", "err", err)
+		os.Exit(1)
+	}
+
 	adminTokenDesc := "disabled"
 	if adminToken != "" {
 		adminTokenDesc = "configured"
@@ -356,6 +398,7 @@ func main() {
 		"admin_api", adminTokenDesc,
 		"tenant_admins", tenantAdminsDesc,
 		"approvals", approvalsDesc,
+		"policy_store", policyStoreDesc,
 		"metrics_endpoint", metricsEnabled,
 		"otel_tracing", otelDesc,
 	)
@@ -368,7 +411,7 @@ func main() {
 		RequireCapability:     requireCap,
 		Extractor:             extractorClient,
 		RequireIntent:         requireIntent,
-		Policy:                policyEngine,
+		Policy:                policyReloader,
 		Budget:                budgetStore,
 		RequireBudget:         requireBudget,
 		Audit:                 auditEmitter,
@@ -379,6 +422,9 @@ func main() {
 		Approvals:             approvalsStore,
 		ApprovalTimeout:       approvalTimeout,
 		ArgRedaction:          argRedaction,
+		PolicyStore:           policyStore,
+		PolicyReloader:        policyReloader,
+		PolicySource:          startupPolicySource,
 		TenantAdmins:          tenantAdmins,
 		AdminToken:            adminToken,
 		Metrics:               metricsHandle,
@@ -783,6 +829,93 @@ func parseApprovalTimeout(s string) (time.Duration, error) {
 		return 5 * time.Minute, nil
 	}
 	return time.Duration(n) * time.Second, nil
+}
+
+// loadPolicyStore constructs the optional draft + active-pointer
+// store backing /v1/admin/policies/*.
+//
+//	backend = "off"      → returns (nil, "off", nil); draft endpoints
+//	                       aren't registered. Existing deployments
+//	                       upgrading to v1.4 see no change unless they
+//	                       explicitly opt in.
+//	backend = "memory"   → in-process MemoryStore, fine for dev / smoke.
+//	backend = "postgres" → durable PostgresStore at the existing
+//	                       INTENTGATE_POSTGRES_URL.
+//
+// Misconfiguration (postgres without a DSN) is a fail-fast.
+func loadPolicyStore(ctx context.Context, logger *slog.Logger, backend, postgresURL string) (policystore.Store, string, error) {
+	switch backend {
+	case "", "off":
+		logger.Info("policy store: disabled",
+			"hint", "set INTENTGATE_POLICY_STORE=memory (dev) or postgres (prod) to enable /v1/admin/policies/*")
+		return nil, "off", nil
+	case "memory":
+		logger.Info("policy store: in-memory (single-replica only, lost on restart)")
+		return policystore.NewMemoryStore(), "memory", nil
+	case "postgres":
+		if postgresURL == "" {
+			return nil, "", fmt.Errorf("INTENTGATE_POLICY_STORE=postgres requires INTENTGATE_POSTGRES_URL")
+		}
+		store, err := policystore.NewPostgresStore(ctx, postgresURL)
+		if err != nil {
+			return nil, "", err
+		}
+		logger.Info("policy store: postgres")
+		return store, "postgres", nil
+	default:
+		return nil, "", fmt.Errorf("unknown INTENTGATE_POLICY_STORE %q (want off|memory|postgres)", backend)
+	}
+}
+
+// reloadActivePolicy hydrates the policy reloader from the store at
+// startup so promotions survive gateway restarts. Returns the
+// startup-source label fed back to the /v1/admin/policies/active
+// handler so the console knows whether the gateway is currently
+// running an embedded default, a file-supplied policy, or a
+// promoted draft.
+//
+// When the store is nil (INTENTGATE_POLICY_STORE=off) we leave the
+// reloader untouched and return the fallback source.
+//
+// When the store has no active draft (CurrentDraftID == ""), same
+// behavior — the embedded / file policy compiled at startup stays
+// live.
+//
+// When the store has an active draft and the recompile fails, we
+// log loudly and refuse to start: the gateway running the embedded
+// default while the database says "policy X is live" is exactly the
+// kind of confusion auditors flag, so failing fast is correct.
+func reloadActivePolicy(ctx context.Context, logger *slog.Logger, store policystore.Store, reloader *policy.Reloader, fallbackSource string) (string, error) {
+	if store == nil {
+		return fallbackSource, nil
+	}
+	active, err := store.GetActive(ctx)
+	if err != nil {
+		return "", fmt.Errorf("read active policy: %w", err)
+	}
+	if active.CurrentDraftID == "" {
+		logger.Info("policy store has no active draft; using fallback policy",
+			"fallback_source", fallbackSource)
+		return fallbackSource, nil
+	}
+	draft, err := store.GetDraft(ctx, active.CurrentDraftID)
+	if err != nil {
+		return "", fmt.Errorf("load active draft %q: %w", active.CurrentDraftID, err)
+	}
+	engine, err := policy.NewEngine(ctx, draft.RegoSource)
+	if err != nil {
+		return "", fmt.Errorf("compile active draft %q: %w", active.CurrentDraftID, err)
+	}
+	if _, err := reloader.Swap(engine); err != nil {
+		return "", fmt.Errorf("swap to active draft %q: %w", active.CurrentDraftID, err)
+	}
+	logger.Info("loaded promoted policy from store",
+		"draft_id", active.CurrentDraftID,
+		"name", draft.Name,
+		"promoted_at", active.PromotedAt,
+		"promoted_by", active.PromotedBy,
+	)
+	return "draft", nil
 }
 
 // loadRevocation constructs the revocation store. When postgresURL is

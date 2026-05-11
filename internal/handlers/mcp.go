@@ -41,10 +41,13 @@ type MCPHandlerConfig struct {
 	// RequireIntent rejects requests that don't carry an
 	// X-Intent-Prompt header. Independent of RequireCapability.
 	RequireIntent bool
-	// Policy is the OPA-backed policy engine, evaluated as the third of
-	// the four checks. May be nil only in dev mode (the policy check is
-	// skipped). main.go always supplies one in normal operation.
-	Policy *policy.Engine
+	// Policy evaluates the third of the four checks. Both a static
+	// [*policy.Engine] (the original shape) and a [*policy.Reloader]
+	// (live-swap on console-driven promote/rollback) satisfy the
+	// interface; the handler doesn't care which one was wired. May be
+	// nil only in dev mode (the policy check is skipped). main.go
+	// always supplies one in normal operation.
+	Policy policy.Evaluator
 	// Budget is the per-token call counter store. When nil, the budget
 	// check is skipped (and tokens with max_calls caveats produce a
 	// startup-time error rather than a runtime one). When RequireBudget

@@ -15,6 +15,7 @@ import (
 	"github.com/NetGnarus/intentgate-gateway/internal/handlers"
 	"github.com/NetGnarus/intentgate-gateway/internal/metrics"
 	"github.com/NetGnarus/intentgate-gateway/internal/policy"
+	"github.com/NetGnarus/intentgate-gateway/internal/policystore"
 	"github.com/NetGnarus/intentgate-gateway/internal/revocation"
 	"github.com/NetGnarus/intentgate-gateway/internal/siem"
 	"github.com/NetGnarus/intentgate-gateway/internal/upstream"
@@ -42,9 +43,11 @@ type Config struct {
 	// RequireIntent rejects /v1/mcp requests that don't carry an
 	// X-Intent-Prompt header. Default false (dev mode).
 	RequireIntent bool
-	// Policy is the OPA-backed policy engine. nil means the policy
-	// check is skipped (dev convenience).
-	Policy *policy.Engine
+	// Policy is the OPA-backed policy engine, evaluated via the
+	// [policy.Evaluator] interface so either a static [*policy.Engine]
+	// or a [*policy.Reloader] (live-swap on promote / rollback) drops
+	// in. nil means the policy check is skipped (dev convenience).
+	Policy policy.Evaluator
 	// Budget is the per-token call counter store. nil means the
 	// budget check is skipped (dev convenience). Production deployments
 	// supply a Redis-backed implementation; dev deployments fall back
@@ -111,6 +114,26 @@ type Config struct {
 	// policies. Read from INTENTGATE_AUDIT_PERSIST_ARG_VALUES at
 	// startup; see audit.ParseRedactionMode.
 	ArgRedaction audit.RedactionMode
+	// PolicyStore is the optional draft + active-pointer store
+	// backing the /v1/admin/policies/* endpoints. nil leaves those
+	// routes unregistered (older deployments and minimal dev
+	// installs see 404). Wired via INTENTGATE_POLICY_STORE=postgres
+	// at startup; main.go falls back to a MemoryStore for dev
+	// convenience when an admin token is configured but no
+	// dedicated env var is set.
+	PolicyStore policystore.Store
+	// PolicyReloader is the live policy holder used by both the
+	// MCP request path (via cfg.Policy when wired as a Reloader)
+	// and the promote / rollback handlers (which call Swap on it).
+	// nil disables promote / rollback (those handlers return 503).
+	PolicyReloader *policy.Reloader
+	// PolicySource is the human-readable label for where the active
+	// policy came from at startup: "embedded", "file:/path", or
+	// "draft" (the latter only when a promoted draft existed in the
+	// policy store at startup). Surfaced via
+	// GET /v1/admin/policies/active so the console can render a
+	// badge keyed off the source.
+	PolicySource string
 }
 
 // New constructs an *http.Server with all gateway routes and middleware.
@@ -211,6 +234,29 @@ func New(cfg Config) *http.Server {
 			adminCfg.Approvals = cfg.Approvals
 			mux.Handle("GET /v1/admin/approvals", handlers.NewAdminApprovalsListHandler(adminCfg))
 			mux.Handle("POST /v1/admin/approvals/{id}/decide", handlers.NewAdminApprovalsDecideHandler(adminCfg))
+		}
+		// Policy draft + active-pointer endpoints register only when
+		// a PolicyStore is wired. Promote / rollback additionally
+		// require the Reloader; when the Reloader is nil those two
+		// routes are still registered but return 503 (so the
+		// console can show "feature not enabled" rather than 404).
+		if cfg.PolicyStore != nil {
+			policyAdminCfg := handlers.PolicyAdminConfig{
+				Logger:       logger,
+				AdminToken:   cfg.AdminToken,
+				TenantAdmins: cfg.TenantAdmins,
+				Store:        cfg.PolicyStore,
+				Reloader:     cfg.PolicyReloader,
+				Audit:        cfg.Audit,
+			}
+			mux.Handle("GET /v1/admin/policies/drafts", handlers.NewAdminDraftsListHandler(policyAdminCfg))
+			mux.Handle("POST /v1/admin/policies/drafts", handlers.NewAdminDraftsCreateHandler(policyAdminCfg))
+			mux.Handle("GET /v1/admin/policies/drafts/{id}", handlers.NewAdminDraftGetHandler(policyAdminCfg))
+			mux.Handle("PUT /v1/admin/policies/drafts/{id}", handlers.NewAdminDraftUpdateHandler(policyAdminCfg))
+			mux.Handle("DELETE /v1/admin/policies/drafts/{id}", handlers.NewAdminDraftDeleteHandler(policyAdminCfg))
+			mux.Handle("GET /v1/admin/policies/active", handlers.NewAdminActiveGetHandler(policyAdminCfg, cfg.PolicySource))
+			mux.Handle("POST /v1/admin/policies/active", handlers.NewAdminPromoteHandler(policyAdminCfg))
+			mux.Handle("POST /v1/admin/policies/rollback", handlers.NewAdminRollbackHandler(policyAdminCfg))
 		}
 	}
 
@@ -330,13 +376,20 @@ func routeLabel(path string) string {
 		"/v1/admin/revoke", "/v1/admin/revocations", "/v1/admin/mint",
 		"/v1/admin/audit", "/v1/admin/integrations",
 		"/v1/admin/approvals", "/v1/admin/tenants",
-		"/v1/admin/policies/dry-run":
+		"/v1/admin/policies/dry-run",
+		"/v1/admin/policies/drafts",
+		"/v1/admin/policies/active",
+		"/v1/admin/policies/rollback":
 		return path
 	}
 	// /v1/admin/approvals/{id}/decide collapses to a fixed label so
 	// the metrics histogram doesn't blow up cardinality on the id.
 	if strings.HasPrefix(path, "/v1/admin/approvals/") && strings.HasSuffix(path, "/decide") {
 		return "/v1/admin/approvals/decide"
+	}
+	// /v1/admin/policies/drafts/{id} — same cardinality concern.
+	if strings.HasPrefix(path, "/v1/admin/policies/drafts/") {
+		return "/v1/admin/policies/drafts/{id}"
 	}
 	return "other"
 }
