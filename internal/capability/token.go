@@ -110,6 +110,18 @@ const (
 	// it without checking. The signed presence of the caveat in the
 	// chain ensures agents can't strip or alter the limit.
 	CaveatMaxCalls = "max_calls"
+	// CaveatStepUp — token was minted after a fresh step-up
+	// authentication factor (TOTP / WebAuthn / hardware key) was
+	// verified out-of-band by the operator. StepUpAt carries the
+	// unix-seconds timestamp of the step-up event. The capability
+	// layer accepts this caveat without enforcing recency — recency
+	// checks belong in the Rego policy
+	// (`time.now_ns()/1e9 - input.capability.step_up_at < 300`),
+	// because what "fresh enough" means depends on the operation:
+	// 5 minutes for a high-risk mint, 30 seconds for a policy delete.
+	// The signed presence of the caveat in the chain ensures a holder
+	// cannot forge a fake step-up annotation.
+	CaveatStepUp = "step_up"
 )
 
 // Caveat is a structured restriction recorded in a token's chain.
@@ -125,6 +137,13 @@ type Caveat struct {
 	Agent    string   `json:"agent,omitempty"`
 	Expiry   int64    `json:"exp,omitempty"`
 	MaxCalls int      `json:"max_calls,omitempty"`
+	// StepUpAt is the unix-seconds timestamp at which the operator
+	// completed an out-of-band step-up authentication factor (TOTP,
+	// WebAuthn, hardware key). Only meaningful when Type is
+	// [CaveatStepUp]. Used by Rego policies to gate high-risk
+	// operations on recent fresh-factor presence. Signed in the
+	// chain so a holder cannot fabricate one.
+	StepUpAt int64 `json:"step_up_at,omitempty"`
 }
 
 // canonicalPayload returns the bytes that seed the HMAC chain. It

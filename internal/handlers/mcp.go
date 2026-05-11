@@ -247,7 +247,8 @@ func (h *mcpHandler) handleToolsCall(ctx context.Context, req *mcp.Request, r *h
 			"tool", params.Name, "check", "policy",
 			"agent", capResult.agentID, "reason", polResult.err.Error())
 		h.emitAudit(ctx, r, params, capResult, intResult,
-			audit.DecisionBlock, audit.CheckPolicy, polResult.err.Error(), start, 0)
+			audit.DecisionBlock, audit.CheckPolicy, polResult.err.Error(), start, 0,
+			withRequiresStepUp(polResult.requiresStepUp))
 		return mcp.NewErrorResponse(req.ID, mcp.CodePolicyFailed,
 			"policy check failed", polResult.err.Error())
 	}
@@ -260,7 +261,7 @@ func (h *mcpHandler) handleToolsCall(ctx context.Context, req *mcp.Request, r *h
 	// CodePolicyFailed block — the agent doesn't need to know the
 	// flow took a detour through human review.
 	if polResult.escalate {
-		if escResp := h.runApprovalFlow(ctx, r, req, params, capResult, intResult, polResult.reason, start); escResp != nil {
+		if escResp := h.runApprovalFlow(ctx, r, req, params, capResult, intResult, polResult.reason, polResult.requiresStepUp, start); escResp != nil {
 			return escResp
 		}
 	}
@@ -297,11 +298,12 @@ func (h *mcpHandler) handleToolsCall(ctx context.Context, req *mcp.Request, r *h
 	// All four checks passed. Either forward to the configured upstream
 	// or return the stub allow.
 	if h.cfg.Upstream != nil {
-		return h.forwardToUpstream(ctx, r, req, params, capResult, intResult, start)
+		return h.forwardToUpstream(ctx, r, req, params, capResult, intResult, polResult.requiresStepUp, start)
 	}
 
 	h.emitAudit(ctx, r, params, capResult, intResult,
-		audit.DecisionAllow, audit.CheckNone, "all four checks passed (stub upstream)", start, 0)
+		audit.DecisionAllow, audit.CheckNone, "all four checks passed (stub upstream)", start, 0,
+		withRequiresStepUp(polResult.requiresStepUp))
 
 	result := mcp.ToolCallResult{
 		Content: []mcp.ContentBlock{{
@@ -345,6 +347,7 @@ func (h *mcpHandler) forwardToUpstream(
 	params *mcp.ToolCallParams,
 	cap capabilityCheckResult,
 	intent intentCheckResult,
+	requiresStepUp bool,
 	start time.Time,
 ) *mcp.Response {
 	// Re-serialize the validated request so we forward exactly the
@@ -353,7 +356,8 @@ func (h *mcpHandler) forwardToUpstream(
 	if err != nil {
 		h.emitAudit(ctx, r, params, cap, intent,
 			audit.DecisionBlock, audit.CheckUpstream,
-			"failed to re-serialize request: "+err.Error(), start, 0)
+			"failed to re-serialize request: "+err.Error(), start, 0,
+			withRequiresStepUp(requiresStepUp))
 		return mcp.NewErrorResponse(req.ID, mcp.CodeInternalError,
 			"failed to encode upstream request", err.Error())
 	}
@@ -375,7 +379,8 @@ func (h *mcpHandler) forwardToUpstream(
 			h.cfg.Metrics.ObserveUpstream(uerr.Kind.String(), upDur)
 			h.cfg.Metrics.ObserveCheck("upstream", "block", upDur)
 			h.emitAudit(ctx, r, params, cap, intent,
-				audit.DecisionBlock, audit.CheckUpstream, reason, start, uerr.Status)
+				audit.DecisionBlock, audit.CheckUpstream, reason, start, uerr.Status,
+				withRequiresStepUp(requiresStepUp))
 			return mcp.NewErrorResponse(req.ID, mcp.CodeInternalError,
 				"upstream "+uerr.Kind.String(),
 				map[string]any{
@@ -387,7 +392,8 @@ func (h *mcpHandler) forwardToUpstream(
 		h.cfg.Metrics.ObserveUpstream("transport", upDur)
 		h.cfg.Metrics.ObserveCheck("upstream", "block", upDur)
 		h.emitAudit(ctx, r, params, cap, intent,
-			audit.DecisionBlock, audit.CheckUpstream, err.Error(), start, 0)
+			audit.DecisionBlock, audit.CheckUpstream, err.Error(), start, 0,
+			withRequiresStepUp(requiresStepUp))
 		return mcp.NewErrorResponse(req.ID, mcp.CodeInternalError,
 			"upstream error", err.Error())
 	}
@@ -405,7 +411,8 @@ func (h *mcpHandler) forwardToUpstream(
 		)
 		h.emitAudit(ctx, r, params, cap, intent,
 			audit.DecisionBlock, audit.CheckUpstream,
-			"upstream returned non-JSON-RPC body: "+err.Error(), start, upResp.Status)
+			"upstream returned non-JSON-RPC body: "+err.Error(), start, upResp.Status,
+			withRequiresStepUp(requiresStepUp))
 		return mcp.NewErrorResponse(req.ID, mcp.CodeInternalError,
 			"upstream returned non-JSON-RPC body", err.Error())
 	}
@@ -419,7 +426,8 @@ func (h *mcpHandler) forwardToUpstream(
 	}
 
 	h.emitAudit(ctx, r, params, cap, intent,
-		audit.DecisionAllow, audit.CheckUpstream, "forwarded", start, upResp.Status)
+		audit.DecisionAllow, audit.CheckUpstream, "forwarded", start, upResp.Status,
+		withRequiresStepUp(requiresStepUp))
 
 	return &parsed
 }
@@ -576,6 +584,7 @@ func (h *mcpHandler) runApprovalFlow(
 	capResult capabilityCheckResult,
 	intResult intentCheckResult,
 	policyReason string,
+	requiresStepUp bool,
 	start time.Time,
 ) *mcp.Response {
 	// No queue wired? Block. We refuse to silently allow a call the
@@ -583,7 +592,8 @@ func (h *mcpHandler) runApprovalFlow(
 	if h.cfg.Approvals == nil {
 		reason := "escalation required but no approvals queue configured (set INTENTGATE_APPROVAL_QUEUE)"
 		h.emitAudit(ctx, r, params, capResult, intResult,
-			audit.DecisionBlock, audit.CheckPolicy, reason, start, 0)
+			audit.DecisionBlock, audit.CheckPolicy, reason, start, 0,
+			withRequiresStepUp(requiresStepUp))
 		return mcp.NewErrorResponse(req.ID, mcp.CodePolicyFailed,
 			"policy escalation required", reason)
 	}
@@ -606,7 +616,8 @@ func (h *mcpHandler) runApprovalFlow(
 		reason := "approval queue: " + err.Error()
 		h.cfg.Logger.Error("approval enqueue failed", "err", err, "tool", params.Name)
 		h.emitAudit(ctx, r, params, capResult, intResult,
-			audit.DecisionBlock, audit.CheckPolicy, reason, start, 0)
+			audit.DecisionBlock, audit.CheckPolicy, reason, start, 0,
+			withRequiresStepUp(requiresStepUp))
 		return mcp.NewErrorResponse(req.ID, mcp.CodePolicyFailed,
 			"policy escalation failed", reason)
 	}
@@ -614,7 +625,8 @@ func (h *mcpHandler) runApprovalFlow(
 	// Audit the escalation. PendingID lets SOC join this event with
 	// the eventual approve / reject / timeout event.
 	h.emitApprovalAudit(ctx, r, params, capResult, intResult,
-		audit.DecisionEscalate, "escalate: "+policyReason, row.PendingID, "", start)
+		audit.DecisionEscalate, "escalate: "+policyReason, row.PendingID, "", start,
+		withRequiresStepUp(requiresStepUp))
 
 	timeout := h.cfg.ApprovalTimeout
 	if timeout <= 0 {
@@ -628,7 +640,8 @@ func (h *mcpHandler) runApprovalFlow(
 		reason := "approval wait: " + werr.Error()
 		h.cfg.Logger.Error("approval wait failed", "err", werr, "pending_id", row.PendingID)
 		h.emitApprovalAudit(ctx, r, params, capResult, intResult,
-			audit.DecisionBlock, reason, row.PendingID, "", start)
+			audit.DecisionBlock, reason, row.PendingID, "", start,
+			withRequiresStepUp(requiresStepUp))
 		return mcp.NewErrorResponse(req.ID, mcp.CodePolicyFailed,
 			"policy escalation failed", reason)
 	}
@@ -644,7 +657,8 @@ func (h *mcpHandler) runApprovalFlow(
 			reason += ": " + final.DecideNote
 		}
 		h.emitApprovalAudit(ctx, r, params, capResult, intResult,
-			audit.DecisionAllow, reason, row.PendingID, final.DecidedBy, start)
+			audit.DecisionAllow, reason, row.PendingID, final.DecidedBy, start,
+			withRequiresStepUp(requiresStepUp))
 		h.cfg.Logger.Info("mcp tools/call approved by human",
 			"tool", params.Name, "agent", capResult.agentID,
 			"pending_id", row.PendingID, "by", final.DecidedBy)
@@ -656,7 +670,8 @@ func (h *mcpHandler) runApprovalFlow(
 			reason += ": " + final.DecideNote
 		}
 		h.emitApprovalAudit(ctx, r, params, capResult, intResult,
-			audit.DecisionBlock, reason, row.PendingID, final.DecidedBy, start)
+			audit.DecisionBlock, reason, row.PendingID, final.DecidedBy, start,
+			withRequiresStepUp(requiresStepUp))
 		h.cfg.Logger.Info("mcp tools/call rejected by human",
 			"tool", params.Name, "agent", capResult.agentID,
 			"pending_id", row.PendingID, "by", final.DecidedBy)
@@ -666,7 +681,8 @@ func (h *mcpHandler) runApprovalFlow(
 	case approvals.StatusTimeout:
 		reason := "approval window expired (" + timeout.String() + ")"
 		h.emitApprovalAudit(ctx, r, params, capResult, intResult,
-			audit.DecisionBlock, reason, row.PendingID, "", start)
+			audit.DecisionBlock, reason, row.PendingID, "", start,
+			withRequiresStepUp(requiresStepUp))
 		h.cfg.Logger.Info("mcp tools/call approval timed out",
 			"tool", params.Name, "agent", capResult.agentID,
 			"pending_id", row.PendingID)
@@ -676,7 +692,8 @@ func (h *mcpHandler) runApprovalFlow(
 	default:
 		reason := "unexpected approval status: " + string(final.Status)
 		h.emitApprovalAudit(ctx, r, params, capResult, intResult,
-			audit.DecisionBlock, reason, row.PendingID, "", start)
+			audit.DecisionBlock, reason, row.PendingID, "", start,
+			withRequiresStepUp(requiresStepUp))
 		return mcp.NewErrorResponse(req.ID, mcp.CodePolicyFailed,
 			"policy escalation failed", reason)
 	}
@@ -696,6 +713,7 @@ func (h *mcpHandler) emitApprovalAudit(
 	pendingID string,
 	decidedBy string,
 	start time.Time,
+	opts ...auditEmitOption,
 ) {
 	if h.cfg.Audit == nil {
 		return
@@ -727,6 +745,10 @@ func (h *mcpHandler) emitApprovalAudit(
 		e.IntentSummary = intent.intent.Summary
 	}
 
+	for _, o := range opts {
+		o(&e)
+	}
+
 	h.cfg.Audit.Emit(ctx, e)
 }
 
@@ -755,6 +777,12 @@ type policyCheckResult struct {
 	err      error
 	escalate bool   // policy returned {"escalate": true} — pause for human review
 	reason   string // operator-readable reason (used as summary on escalate path)
+	// requiresStepUp mirrors policy.Decision.RequiresStepUp. Carried
+	// onto the audit event so SOC dashboards / the Pro console's
+	// high-risk feed can surface calls that needed (or wanted) a
+	// fresh step-up factor, regardless of whether the policy also
+	// blocked them.
+	requiresStepUp bool
 }
 
 // budgetCheckResult bundles what the budget stage learned.
@@ -910,6 +938,18 @@ func (h *mcpHandler) runPolicyCheck(
 			// against acme's promoted engine, falling back to the
 			// default-fallback engine when acme has no slot.
 			in.Capability.Tenant = cap.token.Tenant
+			// StepUpAt is sourced from the signed step_up caveat on
+			// the token's chain (set by /v1/admin/mint when the
+			// operator confirmed an out-of-band factor). A token
+			// with no step_up caveat leaves the field at zero, which
+			// is what Rego policies treat as "no fresh factor on
+			// record." The most-recent caveat wins on the rare case
+			// a delegation chain stamped multiple step-ups.
+			for _, c := range cap.token.Caveats {
+				if c.Type == capability.CaveatStepUp && c.StepUpAt > in.Capability.StepUpAt {
+					in.Capability.StepUpAt = c.StepUpAt
+				}
+			}
 		}
 	}
 	if intent.intent != nil {
@@ -931,18 +971,19 @@ func (h *mcpHandler) runPolicyCheck(
 	// queue and pauses.
 	if d.Escalate {
 		return policyCheckResult{
-			escalate: true,
-			reason:   d.Reason,
-			summary:  "escalate: " + d.Reason,
+			escalate:       true,
+			reason:         d.Reason,
+			summary:        "escalate: " + d.Reason,
+			requiresStepUp: d.RequiresStepUp,
 		}
 	}
 	if !d.Allow {
-		return policyCheckResult{err: capError(d.Reason)}
+		return policyCheckResult{err: capError(d.Reason), requiresStepUp: d.RequiresStepUp}
 	}
 	if d.Reason != "" {
-		return policyCheckResult{summary: "ok: " + d.Reason}
+		return policyCheckResult{summary: "ok: " + d.Reason, requiresStepUp: d.RequiresStepUp}
 	}
-	return policyCheckResult{summary: "ok"}
+	return policyCheckResult{summary: "ok", requiresStepUp: d.RequiresStepUp}
 }
 
 // runBudgetCheck increments the per-token call counter and verifies
@@ -995,6 +1036,7 @@ func (h *mcpHandler) emitAudit(
 	reason string,
 	start time.Time,
 	upstreamStatus int,
+	opts ...auditEmitOption,
 ) {
 	if h.cfg.Audit == nil {
 		return
@@ -1025,7 +1067,30 @@ func (h *mcpHandler) emitAudit(
 		e.IntentSummary = intent.intent.Summary
 	}
 
+	// Apply optional annotations (requires_step_up, future fields).
+	// Variadic options keep the call sites that don't need them
+	// looking exactly the same as before.
+	for _, o := range opts {
+		o(&e)
+	}
+
 	h.cfg.Audit.Emit(ctx, e)
+}
+
+// auditEmitOption tweaks the audit event after the standard fields
+// land but before it's emitted. Used so the policy stage can attach
+// `requires_step_up` without ballooning emitAudit's positional signature.
+type auditEmitOption func(*audit.Event)
+
+// withRequiresStepUp returns an [auditEmitOption] that flips the
+// requires_step_up flag on an event when the Rego policy stage said so.
+// No-op when the flag is false, so call sites can pass it unconditionally.
+func withRequiresStepUp(b bool) auditEmitOption {
+	return func(e *audit.Event) {
+		if b {
+			e.RequiresStepUp = true
+		}
+	}
 }
 
 // checkDecision maps a (err, summary) pair from one of the runX

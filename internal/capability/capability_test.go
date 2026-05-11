@@ -449,3 +449,111 @@ func TestMasterKeyFromBase64(t *testing.T) {
 		t.Fatalf("expected error on non-base64 input")
 	}
 }
+
+// --- Step-up caveat ------------------------------------------------------
+
+// A token carrying a signed step_up caveat round-trips through Encode +
+// Decode + Verify and survives Check (capability layer treats it as
+// informational; recency is enforced by Rego policies).
+func TestStepUpCaveatRoundTrip(t *testing.T) {
+	key := mustKey(t)
+	stepUpAt := time.Now().UTC().Unix()
+	tok, err := Mint(key, MintOptions{
+		Subject: "alice",
+		Caveats: []Caveat{{Type: CaveatStepUp, StepUpAt: stepUpAt}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	encoded, err := tok.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	round, err := Decode(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := round.Verify(key); err != nil {
+		t.Fatalf("verify after encode/decode: %v", err)
+	}
+
+	// Last caveat should be the step_up with the same timestamp we
+	// stamped. (Agent-lock is at index 0.)
+	last := round.Caveats[len(round.Caveats)-1]
+	if last.Type != CaveatStepUp {
+		t.Fatalf("expected last caveat to be step_up, got %q", last.Type)
+	}
+	if last.StepUpAt != stepUpAt {
+		t.Errorf("step_up_at=%d want %d", last.StepUpAt, stepUpAt)
+	}
+
+	// Check (caveat evaluation) should pass — step_up is informational
+	// at the capability layer.
+	if err := round.Check(RequestContext{AgentID: "alice", Tool: "anything"}); err != nil {
+		t.Errorf("Check should accept step_up caveat: %v", err)
+	}
+}
+
+// Tampering with the step_up timestamp breaks the chain signature.
+func TestStepUpCaveatTamperingDetected(t *testing.T) {
+	key := mustKey(t)
+	tok, err := Mint(key, MintOptions{
+		Subject: "alice",
+		Caveats: []Caveat{{Type: CaveatStepUp, StepUpAt: 100}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Pretend the holder rewrote step_up_at to "just now" without
+	// re-signing. Verify must reject.
+	for i := range tok.Caveats {
+		if tok.Caveats[i].Type == CaveatStepUp {
+			tok.Caveats[i].StepUpAt = time.Now().UTC().Unix()
+		}
+	}
+	if err := tok.Verify(key); err == nil {
+		t.Fatalf("Verify should fail after step_up_at tampering")
+	}
+}
+
+// A step_up caveat with a negative timestamp is rejected at Check
+// time (defensive — a positive caveat type is fine; the constraint
+// is on the value).
+func TestStepUpCaveatNegativeTimestampRejected(t *testing.T) {
+	key := mustKey(t)
+	tok, err := Mint(key, MintOptions{
+		Subject: "alice",
+		Caveats: []Caveat{{Type: CaveatStepUp, StepUpAt: -1}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tok.Verify(key); err != nil {
+		t.Fatalf("Verify should succeed (chain still well-formed): %v", err)
+	}
+	if err := tok.Check(RequestContext{AgentID: "alice", Tool: "anything"}); err == nil {
+		t.Errorf("Check should reject negative step_up_at")
+	}
+}
+
+// Attenuation onto a token without step_up can ADD a step_up caveat,
+// which is what Pro will do once it has its own per-operator path.
+func TestAttenuateAppendsStepUpCaveat(t *testing.T) {
+	key := mustKey(t)
+	parent, err := Mint(key, MintOptions{Subject: "alice"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stepUpAt := time.Now().UTC().Unix()
+	child, err := Attenuate(parent, Caveat{Type: CaveatStepUp, StepUpAt: stepUpAt})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := child.Verify(key); err != nil {
+		t.Fatalf("attenuated child should verify: %v", err)
+	}
+	if got := child.Caveats[len(child.Caveats)-1]; got.Type != CaveatStepUp || got.StepUpAt != stepUpAt {
+		t.Errorf("last caveat on child = %+v; want step_up @ %d", got, stepUpAt)
+	}
+}

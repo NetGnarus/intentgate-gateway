@@ -70,10 +70,22 @@ func DefaultPolicy() string {
 //   - Allow=false, Escalate=true  → call paused for human approval;
 //     eventual outcome decided by an
 //     operator at /v1/admin/approvals.
+//
+// RequiresStepUp is an orthogonal advisory flag. When set, the
+// audit event is annotated so a downstream UI (the Pro console,
+// a SIEM dashboard) can surface "this call requires a fresh
+// step-up factor" — even on an allow. Whether to actually GATE
+// the call on step-up presence is encoded by the same Rego policy
+// via Decision.Allow against input.capability.step_up_at, so the
+// flag's purpose is observability rather than enforcement. A
+// policy that wants strict enforcement returns both Allow=false
+// AND RequiresStepUp=true; a policy that wants soft observation
+// returns Allow=true AND RequiresStepUp=true.
 type Decision struct {
-	Allow    bool
-	Escalate bool
-	Reason   string
+	Allow          bool
+	Escalate       bool
+	Reason         string
+	RequiresStepUp bool
 }
 
 // Engine wraps a prepared Rego query. Construct one at startup with
@@ -131,7 +143,18 @@ func (e *Engine) Evaluate(ctx context.Context, input any) (Decision, error) {
 	}
 	reason, _ := obj["reason"].(string)   // reason is optional; empty is fine
 	escalate, _ := obj["escalate"].(bool) // escalate is optional; default false
-	return Decision{Allow: allow, Escalate: escalate, Reason: reason}, nil
+	// requires_step_up is optional; default false. Rego writes:
+	//   decision := {"allow": ..., "reason": ..., "requires_step_up": true}
+	// to signal that a fresh out-of-band factor SHOULD/MUST gate this
+	// call. The audit event picks it up either way; the Rego rule
+	// chooses whether to also flip Allow to false.
+	requiresStepUp, _ := obj["requires_step_up"].(bool)
+	return Decision{
+		Allow:          allow,
+		Escalate:       escalate,
+		Reason:         reason,
+		RequiresStepUp: requiresStepUp,
+	}, nil
 }
 
 // Input is a convenience builder for the request shape policies see.
@@ -170,4 +193,21 @@ type InputCap struct {
 	Subject string `json:"subject,omitempty"`
 	Issuer  string `json:"issuer,omitempty"`
 	Tenant  string `json:"tenant,omitempty"`
+	// StepUpAt is the unix-seconds timestamp of the most recent
+	// out-of-band step-up authentication (TOTP / WebAuthn / hardware
+	// key) on this capability token's chain. Sourced from the
+	// signed [capability.CaveatStepUp] caveat the mint endpoint
+	// stamped when the operator confirmed a fresh factor; agents
+	// cannot fabricate or alter it.
+	//
+	// Zero when the token has no step-up caveat. Rego policies that
+	// gate high-risk operations write:
+	//
+	//   now := time.now_ns() / 1000000000
+	//   fresh := now - input.capability.step_up_at < 300
+	//   decision := { "allow": fresh, "reason": "...", "requires_step_up": true }
+	//
+	// What "fresh enough" means is operator policy — the gateway
+	// doesn't impose a window.
+	StepUpAt int64 `json:"step_up_at,omitempty"`
 }

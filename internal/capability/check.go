@@ -87,6 +87,20 @@ func evalCaveat(c Caveat, ctx RequestContext, now time.Time) error {
 		// by the capability stage.
 		return nil
 
+	case CaveatStepUp:
+		// Informational at this layer. Rego policies enforce recency
+		// against input.capability.step_up_at — the mcp handler
+		// surfaces the timestamp from this caveat into the policy
+		// input. We accept the caveat as valid here so that signed
+		// tokens carrying step_up aren't rejected by the capability
+		// stage. A missing step_up_at value means "no step-up
+		// recorded" — Rego treats it as 0 and any "must be recent"
+		// rule fires.
+		if c.StepUpAt < 0 {
+			return errors.New("step_up caveat has negative step_up_at value")
+		}
+		return nil
+
 	default:
 		return fmt.Errorf("unknown caveat type %q (deny by default)", c.Type)
 	}

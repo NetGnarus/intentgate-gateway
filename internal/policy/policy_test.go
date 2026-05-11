@@ -184,3 +184,115 @@ func contains(haystack, needle string) bool {
 		return false
 	})()
 }
+
+// --- Step-up: decision flag round-trip + recency rule -------------------
+
+// A policy can return a bare requires_step_up:true alongside allow:true
+// to signal "we let this through, but the operator should know it was a
+// high-risk operation." The Decision struct surfaces both.
+func TestDecisionCarriesRequiresStepUp(t *testing.T) {
+	custom := `
+package intentgate.policy
+import rego.v1
+default decision := {"allow": false, "reason": "default"}
+decision := {
+	"allow": true,
+	"reason": "observed",
+	"requires_step_up": true,
+} if {
+	input.tool == "transfer_funds"
+}
+`
+	e, err := NewEngine(context.Background(), custom)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, err := e.Evaluate(context.Background(), Input{Tool: "transfer_funds"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !d.Allow {
+		t.Errorf("expected allow, got %+v", d)
+	}
+	if !d.RequiresStepUp {
+		t.Errorf("expected RequiresStepUp=true, got %+v", d)
+	}
+}
+
+// A policy that requires a fresh step-up factor reads
+// input.capability.step_up_at and denies when zero.
+func TestPolicyEnforcesStepUpRecency(t *testing.T) {
+	custom := `
+package intentgate.policy
+import rego.v1
+default decision := {"allow": true, "reason": "default allow"}
+
+# Deny without a recent step-up.
+decision := {
+	"allow": false,
+	"reason": "step-up required",
+	"requires_step_up": true,
+} if {
+	input.tool == "policy_delete"
+	not _fresh_step_up
+}
+
+_fresh_step_up if {
+	input.capability.step_up_at > 0
+}
+`
+	e, err := NewEngine(context.Background(), custom)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Without a step-up timestamp: denied + flagged.
+	d, err := e.Evaluate(context.Background(), Input{
+		Tool:       "policy_delete",
+		Capability: &InputCap{Subject: "alice", StepUpAt: 0},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Allow {
+		t.Errorf("expected deny without step-up, got %+v", d)
+	}
+	if !d.RequiresStepUp {
+		t.Errorf("expected RequiresStepUp=true, got %+v", d)
+	}
+
+	// With a step-up timestamp: allow.
+	d, err = e.Evaluate(context.Background(), Input{
+		Tool:       "policy_delete",
+		Capability: &InputCap{Subject: "alice", StepUpAt: 1747000000},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !d.Allow {
+		t.Errorf("expected allow with step-up, got %+v", d)
+	}
+}
+
+// Decision omits requires_step_up entirely → defaults to false.
+func TestDecisionDefaultsRequiresStepUpFalse(t *testing.T) {
+	custom := `
+package intentgate.policy
+import rego.v1
+default decision := {"allow": false, "reason": "default"}
+decision := {"allow": true, "reason": "plain allow"} if {
+	input.tool == "ping"
+}
+`
+	e, err := NewEngine(context.Background(), custom)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, err := e.Evaluate(context.Background(), Input{Tool: "ping"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.RequiresStepUp {
+		t.Errorf("expected RequiresStepUp=false when policy omits it, got %+v", d)
+	}
+}

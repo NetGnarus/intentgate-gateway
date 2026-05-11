@@ -297,3 +297,64 @@ func TestAdminMint_DropsEmptyToolEntries(t *testing.T) {
 // same JSON shape we document, so the README example doesn't drift
 // from the schema.
 var _ = bytes.NewReader([]byte(`{"subject":"x","ttl_seconds":60,"tools":["a"],"max_calls":1}`))
+
+// step_up:true stamps a signed CaveatStepUp with the current
+// unix-seconds timestamp. Rego policies read input.capability.step_up_at
+// via the mcp handler to gate high-risk operations on a fresh factor.
+func TestAdminMint_StepUpStampsCaveat(t *testing.T) {
+	masterKey := []byte("0123456789abcdef0123456789abcdef")
+	cfg := AdminConfig{
+		AdminToken: "secret",
+		MasterKey:  masterKey,
+	}
+	before := time.Now().UTC().Unix()
+	resp := mintRequest(t, `{"subject":"alice","ttl_seconds":300,"step_up":true}`, "secret", cfg)
+	after := time.Now().UTC().Unix()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: %d", resp.StatusCode)
+	}
+	var out struct{ Token string }
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+
+	tok, err := capability.Decode(out.Token)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if err := tok.Verify(masterKey); err != nil {
+		t.Fatalf("verify under master key: %v", err)
+	}
+
+	var sawStepUp bool
+	for _, c := range tok.Caveats {
+		if c.Type == capability.CaveatStepUp {
+			sawStepUp = true
+			if c.StepUpAt < before || c.StepUpAt > after {
+				t.Errorf("step_up_at=%d outside [%d, %d]", c.StepUpAt, before, after)
+			}
+		}
+	}
+	if !sawStepUp {
+		t.Errorf("expected step_up caveat in minted token, got %+v", tok.Caveats)
+	}
+}
+
+// step_up:false (or omitted) leaves no step_up caveat on the token —
+// the default mint behavior is unchanged.
+func TestAdminMint_NoStepUpByDefault(t *testing.T) {
+	cfg := AdminConfig{
+		AdminToken: "secret",
+		MasterKey:  []byte("0123456789abcdef0123456789abcdef"),
+	}
+	resp := mintRequest(t, `{"subject":"alice"}`, "secret", cfg)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: %d", resp.StatusCode)
+	}
+	var out struct{ Token string }
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+	tok, _ := capability.Decode(out.Token)
+	for _, c := range tok.Caveats {
+		if c.Type == capability.CaveatStepUp {
+			t.Errorf("did not expect step_up caveat without step_up:true, got %+v", c)
+		}
+	}
+}

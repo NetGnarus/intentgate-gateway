@@ -24,7 +24,7 @@ func TestNewEventPopulatesDefaults(t *testing.T) {
 	if e.EventName != "intentgate.tool_call" {
 		t.Errorf("event name: %v", e.EventName)
 	}
-	if e.SchemaVersion != "4" {
+	if e.SchemaVersion != "5" {
 		t.Errorf("schema version: %v", e.SchemaVersion)
 	}
 	// Timestamp must parse back to within one second of now.
@@ -104,10 +104,26 @@ func TestEventOmitsEmptyOptionals(t *testing.T) {
 		`"capability_token_id":""`,
 		`"intent_summary":""`,
 		`"remote_ip":""`,
+		// requires_step_up is omitempty and false by default; the JSON
+		// line must NOT carry the key unless the policy flipped it.
+		`"requires_step_up":false`,
+		`"requires_step_up":`,
 	} {
 		if strings.Contains(string(raw), unwanted) {
 			t.Errorf("expected omitempty to drop %q, got: %s", unwanted, raw)
 		}
+	}
+}
+
+func TestEventRequiresStepUpEmittedWhenSet(t *testing.T) {
+	// When the policy stage flips RequiresStepUp, the JSON line MUST
+	// carry the field so downstream observers (Pro console high-risk
+	// feed, SIEM dashboards) can route on it.
+	e := NewEvent(DecisionAllow, "transfer_funds")
+	e.RequiresStepUp = true
+	raw, _ := json.Marshal(e)
+	if !strings.Contains(string(raw), `"requires_step_up":true`) {
+		t.Errorf("expected requires_step_up:true in JSON, got: %s", raw)
 	}
 }
 

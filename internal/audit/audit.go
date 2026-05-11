@@ -145,6 +145,18 @@ type Event struct {
 	// gateway was in stub mode (no upstream configured) or when the
 	// failure happened before any HTTP response (transport, timeout).
 	UpstreamStatus int `json:"upstream_status,omitempty"`
+
+	// RequiresStepUp marks the call as requiring a fresh out-of-band
+	// step-up authentication factor (TOTP / WebAuthn / hardware key).
+	// Populated from the Rego policy decision's `requires_step_up`
+	// field. Advisory: the decision (allow/block/escalate) is still
+	// authoritative for whether the call proceeded — this flag tells
+	// downstream observers (the Pro console's high-risk feed, SIEM
+	// dashboards) that the operation deserves extra scrutiny even
+	// when it was allowed. A Rego policy enforcing strict step-up
+	// returns both `allow: false` AND `requires_step_up: true`; a
+	// policy observing only returns `allow: true` + `requires_step_up: true`.
+	RequiresStepUp bool `json:"requires_step_up,omitempty"`
 }
 
 // NewEvent constructs an Event with the timestamp, event name, and
@@ -167,11 +179,17 @@ type Event struct {
 //	      bump signals to dry-run consumers that ArgValues may be
 //	      populated; older events still read NULL and dry-run falls
 //	      back to keys-only replay.
+//	"5" — gateway 1.6+: adds optional `requires_step_up` boolean
+//	      sourced from the Rego policy decision. Omitempty when the
+//	      policy didn't flag the call, so v4 SIEM mappings keep
+//	      working unchanged. The Pro console reads this field to
+//	      surface a high-risk-feed badge; SIEMs can route on it for
+//	      alert pipelines.
 func NewEvent(d Decision, tool string) Event {
 	return Event{
 		Timestamp:     time.Now().UTC().Format(time.RFC3339Nano),
 		EventName:     "intentgate.tool_call",
-		SchemaVersion: "4",
+		SchemaVersion: "5",
 		Decision:      d,
 		Tool:          tool,
 	}

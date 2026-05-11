@@ -177,7 +177,8 @@ func NewAdminRevocationsListHandler(cfg AdminConfig) http.Handler {
 //	  "issuer":      "<optional issuer>", // default "intentgate"
 //	  "ttl_seconds": 3600,                // optional; 0 = no expiry
 //	  "tools":       ["read_invoice"],    // optional whitelist
-//	  "max_calls":   100                  // optional budget cap
+//	  "max_calls":   100,                 // optional budget cap
+//	  "step_up":     true                 // optional step-up annotation
 //	}
 //
 // On success returns 200 with {"token": "<base64url>", "jti": "<jti>",
@@ -191,6 +192,20 @@ func NewAdminRevocationsListHandler(cfg AdminConfig) http.Handler {
 // every restriction (subject lock, expiry, tool whitelist, max-call
 // budget) is encoded as a signed caveat, so the resulting token cannot
 // be widened by anyone — including the agent that received it.
+//
+// # Step-up annotation
+//
+// When step_up is true the minted token carries a signed
+// [capability.CaveatStepUp] caveat with the current unix-seconds
+// timestamp. Rego policies gating high-risk operations read
+// `input.capability.step_up_at` to require recent fresh-factor
+// presence (e.g. `now - step_up_at < 300`). The gateway does NOT
+// verify a fresh factor here — that's the caller's responsibility:
+// the Pro console performs TOTP / WebAuthn verification and calls
+// this endpoint with step_up:true to mint an elevated token. The
+// admin-token authentication is the trust boundary; whoever holds it
+// can mint step-up tokens, so operators MUST rotate the admin token
+// out of band when an operator leaves.
 func NewAdminMintHandler(cfg AdminConfig) http.Handler {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
@@ -218,6 +233,7 @@ func NewAdminMintHandler(cfg AdminConfig) http.Handler {
 			TTLSeconds int64    `json:"ttl_seconds"`
 			Tools      []string `json:"tools"`
 			MaxCalls   int      `json:"max_calls"`
+			StepUp     bool     `json:"step_up"`
 		}
 		dec := json.NewDecoder(io.LimitReader(r.Body, 1<<16))
 		dec.DisallowUnknownFields()
@@ -281,6 +297,16 @@ func NewAdminMintHandler(cfg AdminConfig) http.Handler {
 			opts.Caveats = append(opts.Caveats, capability.Caveat{
 				Type:     capability.CaveatMaxCalls,
 				MaxCalls: body.MaxCalls,
+			})
+		}
+		if body.StepUp {
+			// Stamp the current unix-seconds timestamp into the
+			// signed caveat. Rego policies read this via
+			// input.capability.step_up_at and decide what "fresh
+			// enough" means for the operation at hand.
+			opts.Caveats = append(opts.Caveats, capability.Caveat{
+				Type:     capability.CaveatStepUp,
+				StepUpAt: time.Now().UTC().Unix(),
 			})
 		}
 
