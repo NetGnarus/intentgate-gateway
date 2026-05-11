@@ -9,16 +9,20 @@ import (
 	"time"
 )
 
-// MemoryStore keeps drafts and the active pointer in process-local
-// maps. Single-replica only, lost on restart. Production deployments
-// supply [PostgresStore].
+// MemoryStore keeps drafts and the per-tenant active pointers in
+// process-local maps. Single-replica only, lost on restart.
+// Production deployments supply [PostgresStore].
 //
 // Safe for concurrent use; one mutex guards every field. Contention
 // is fine: policy authoring is operator-driven (RPS << 1).
 type MemoryStore struct {
 	mu     sync.RWMutex
 	drafts map[string]Draft
-	active Active
+	// active is keyed by tenant. The empty-string key is the default-
+	// fallback row (the v1.4 "global" semantic). Per-tenant rows are
+	// only populated after a per-tenant admin promotes against their
+	// tenant slot.
+	active map[string]Active
 	// watchers is the set of subscribers receiving fan-out
 	// notifications from Promote and Rollback. Each Watch call
 	// appends; ctx-cancel removes. Bounded buffer per channel so a
@@ -28,7 +32,10 @@ type MemoryStore struct {
 
 // NewMemoryStore returns an empty in-memory store.
 func NewMemoryStore() *MemoryStore {
-	return &MemoryStore{drafts: make(map[string]Draft)}
+	return &MemoryStore{
+		drafts: make(map[string]Draft),
+		active: make(map[string]Active),
+	}
 }
 
 // Close closes any outstanding Watch channels so callers blocked on
@@ -191,9 +198,11 @@ func (s *MemoryStore) ListDrafts(_ context.Context, filter ListFilter) ([]Draft,
 	return out[filter.Offset:end], nil
 }
 
-// DeleteDraft removes the row. Refuses when the active pointer
-// references the draft as current OR previous; promoting away from
-// the row first is the operator's escape hatch.
+// DeleteDraft removes the row. Refuses when ANY tenant's active
+// pointer references the draft as current OR previous; promoting
+// away from the row first is the operator's escape hatch. The
+// sweep over every per-tenant active row is O(N tenants), fine at
+// expected scales (admin RPS is essentially zero).
 func (s *MemoryStore) DeleteDraft(_ context.Context, id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -201,71 +210,111 @@ func (s *MemoryStore) DeleteDraft(_ context.Context, id string) error {
 	if _, ok := s.drafts[id]; !ok {
 		return ErrNotFound
 	}
-	if s.active.CurrentDraftID == id || s.active.PreviousDraftID == id {
-		return ErrActiveDraftDelete
+	for _, a := range s.active {
+		if a.CurrentDraftID == id || a.PreviousDraftID == id {
+			return ErrActiveDraftDelete
+		}
 	}
 	delete(s.drafts, id)
 	return nil
 }
 
-// GetActive returns the active pointer.
-func (s *MemoryStore) GetActive(_ context.Context) (Active, error) {
+// GetActive returns the active pointer for the given tenant. Empty
+// tenant returns the default-fallback row. Missing rows return a
+// zero-value Active (with no error) — the caller distinguishes
+// "no active set" via CurrentDraftID == "".
+func (s *MemoryStore) GetActive(_ context.Context, tenant string) (Active, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.active, nil
+	a := s.active[tenant]
+	a.Tenant = tenant // make sure the response carries the key
+	return a, nil
 }
 
-// Promote sets CurrentDraftID = draftID and moves the existing
-// current onto PreviousDraftID. Validates the draft exists inside
-// the same critical section so a concurrent delete can't slip
-// between the existence check and the pointer write.
+// ListActive returns every tenant's active pointer. Ordered with
+// the default-fallback row (empty tenant) first so callers that
+// install engines in order (startup hydration) get the fallback
+// before per-tenant overlays.
+func (s *MemoryStore) ListActive(_ context.Context) ([]Active, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	out := make([]Active, 0, len(s.active))
+	// Default fallback first if present.
+	if def, ok := s.active[""]; ok {
+		def.Tenant = ""
+		out = append(out, def)
+	}
+	// Then per-tenant rows in deterministic order by tenant name.
+	tenants := make([]string, 0, len(s.active))
+	for t := range s.active {
+		if t == "" {
+			continue
+		}
+		tenants = append(tenants, t)
+	}
+	sort.Strings(tenants)
+	for _, t := range tenants {
+		a := s.active[t]
+		a.Tenant = t
+		out = append(out, a)
+	}
+	return out, nil
+}
+
+// Promote sets the given tenant's CurrentDraftID = draftID and
+// moves the existing current onto PreviousDraftID. Validates the
+// draft exists inside the same critical section so a concurrent
+// delete can't slip between the existence check and the pointer
+// write. Empty tenant operates on the default-fallback row.
 //
 // Promoting the already-current draft is a no-op: the pointer is
-// returned unchanged and the timestamps are not refreshed. Audit
-// emission on the handler side keys off "did Promote change
-// anything" via comparing the returned active against the prior
-// GetActive — but a simpler check is just "is CurrentDraftID
-// different from the requested ID after the call". We chose the
-// no-op-on-same-id branch so re-promote spam doesn't churn the
-// PromotedAt field.
-func (s *MemoryStore) Promote(_ context.Context, draftID, promotedBy string) (Active, error) {
+// returned unchanged and the timestamps are not refreshed.
+func (s *MemoryStore) Promote(_ context.Context, draftID, promotedBy, tenant string) (Active, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if _, ok := s.drafts[draftID]; !ok {
 		return Active{}, ErrNotFound
 	}
-	if s.active.CurrentDraftID == draftID {
-		return s.active, nil
+	current := s.active[tenant]
+	if current.CurrentDraftID == draftID {
+		current.Tenant = tenant
+		return current, nil
 	}
-	prev := s.active.CurrentDraftID
-	s.active = Active{
+	next := Active{
+		Tenant:          tenant,
 		CurrentDraftID:  draftID,
-		PreviousDraftID: prev,
+		PreviousDraftID: current.CurrentDraftID,
 		PromotedAt:      time.Now().UTC(),
 		PromotedBy:      promotedBy,
 	}
-	s.notifyWatchers(s.active)
-	return s.active, nil
+	s.active[tenant] = next
+	s.notifyWatchers(next)
+	return next, nil
 }
 
-// Rollback swaps Current and Previous, then clears Previous so a
-// second consecutive rollback returns ErrNotFound rather than
-// ping-ponging. ErrNotFound is also returned when there is nothing
-// to roll back to (a fresh install or after the rollback-clear above).
-func (s *MemoryStore) Rollback(_ context.Context, rolledBackBy string) (Active, error) {
+// Rollback swaps Current and Previous for the given tenant, then
+// clears Previous so a second consecutive rollback returns
+// ErrNotFound rather than ping-ponging. Empty tenant operates on
+// the default-fallback row. ErrNotFound is returned when there is
+// nothing to roll back to.
+func (s *MemoryStore) Rollback(_ context.Context, rolledBackBy, tenant string) (Active, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.active.PreviousDraftID == "" {
+	current := s.active[tenant]
+	if current.PreviousDraftID == "" {
 		return Active{}, ErrNotFound
 	}
-	s.active = Active{
-		CurrentDraftID:  s.active.PreviousDraftID,
+	next := Active{
+		Tenant:          tenant,
+		CurrentDraftID:  current.PreviousDraftID,
 		PreviousDraftID: "", // one-step rollback; clear to avoid ping-pong
 		PromotedAt:      time.Now().UTC(),
 		PromotedBy:      rolledBackBy,
 	}
-	s.notifyWatchers(s.active)
-	return s.active, nil
+	s.active[tenant] = next
+	s.notifyWatchers(next)
+	return next, nil
 }

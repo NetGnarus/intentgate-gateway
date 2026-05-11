@@ -107,7 +107,7 @@ func TestMemoryStore_PromoteSetsPrevious(t *testing.T) {
 	d1, _ := s.CreateDraft(ctx, Draft{Name: "v1", RegoSource: validRego, Tenant: ""})
 	d2, _ := s.CreateDraft(ctx, Draft{Name: "v2", RegoSource: validRego2, Tenant: ""})
 
-	a, err := s.Promote(ctx, d1.ID, "alice")
+	a, err := s.Promote(ctx, d1.ID, "alice", "")
 	if err != nil {
 		t.Fatalf("promote 1: %v", err)
 	}
@@ -118,7 +118,7 @@ func TestMemoryStore_PromoteSetsPrevious(t *testing.T) {
 		t.Fatalf("PromotedBy not captured, got %q", a.PromotedBy)
 	}
 
-	a, err = s.Promote(ctx, d2.ID, "bob")
+	a, err = s.Promote(ctx, d2.ID, "bob", "")
 	if err != nil {
 		t.Fatalf("promote 2: %v", err)
 	}
@@ -133,11 +133,11 @@ func TestMemoryStore_PromoteSameDraftIsNoOp(t *testing.T) {
 	ctx := context.Background()
 	d1, _ := s.CreateDraft(ctx, Draft{Name: "v1", RegoSource: validRego})
 
-	first, err := s.Promote(ctx, d1.ID, "alice")
+	first, err := s.Promote(ctx, d1.ID, "alice", "")
 	if err != nil {
 		t.Fatalf("promote 1: %v", err)
 	}
-	second, err := s.Promote(ctx, d1.ID, "alice-again")
+	second, err := s.Promote(ctx, d1.ID, "alice-again", "")
 	if err != nil {
 		t.Fatalf("promote 2: %v", err)
 	}
@@ -155,10 +155,10 @@ func TestMemoryStore_RollbackFlipsThenClears(t *testing.T) {
 	ctx := context.Background()
 	d1, _ := s.CreateDraft(ctx, Draft{Name: "v1", RegoSource: validRego})
 	d2, _ := s.CreateDraft(ctx, Draft{Name: "v2", RegoSource: validRego2})
-	_, _ = s.Promote(ctx, d1.ID, "alice")
-	_, _ = s.Promote(ctx, d2.ID, "bob")
+	_, _ = s.Promote(ctx, d1.ID, "alice", "")
+	_, _ = s.Promote(ctx, d2.ID, "bob", "")
 
-	a, err := s.Rollback(ctx, "carol")
+	a, err := s.Rollback(ctx, "carol", "")
 	if err != nil {
 		t.Fatalf("rollback: %v", err)
 	}
@@ -170,7 +170,7 @@ func TestMemoryStore_RollbackFlipsThenClears(t *testing.T) {
 	}
 
 	// Second rollback has nothing to do.
-	if _, err := s.Rollback(ctx, "carol"); !errors.Is(err, ErrNotFound) {
+	if _, err := s.Rollback(ctx, "carol", ""); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("second rollback should be ErrNotFound, got %v", err)
 	}
 }
@@ -181,8 +181,8 @@ func TestMemoryStore_DeleteRejectsActive(t *testing.T) {
 	ctx := context.Background()
 	d1, _ := s.CreateDraft(ctx, Draft{Name: "v1", RegoSource: validRego})
 	d2, _ := s.CreateDraft(ctx, Draft{Name: "v2", RegoSource: validRego2})
-	_, _ = s.Promote(ctx, d1.ID, "")
-	_, _ = s.Promote(ctx, d2.ID, "")
+	_, _ = s.Promote(ctx, d1.ID, "", "")
+	_, _ = s.Promote(ctx, d2.ID, "", "")
 	// After two promotes: d2 current, d1 previous. Both should be
 	// undeletable.
 	if err := s.DeleteDraft(ctx, d1.ID); !errors.Is(err, ErrActiveDraftDelete) {
@@ -205,7 +205,7 @@ func TestMemoryStore_DeleteRejectsActive(t *testing.T) {
 func TestMemoryStore_PromoteUnknownDraft(t *testing.T) {
 	t.Parallel()
 	s := NewMemoryStore()
-	if _, err := s.Promote(context.Background(), "nope", ""); !errors.Is(err, ErrNotFound) {
+	if _, err := s.Promote(context.Background(), "nope", "", ""); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("promote nonexistent should be ErrNotFound, got %v", err)
 	}
 }
@@ -255,7 +255,7 @@ func TestMemoryStore_WatchDeliversOnPromote(t *testing.T) {
 	}
 
 	d, _ := s.CreateDraft(context.Background(), Draft{Name: "v1", RegoSource: validRego})
-	_, err = s.Promote(context.Background(), d.ID, "alice")
+	_, err = s.Promote(context.Background(), d.ID, "alice", "")
 	if err != nil {
 		t.Fatalf("promote: %v", err)
 	}
@@ -278,14 +278,14 @@ func TestMemoryStore_WatchDeliversOnRollback(t *testing.T) {
 	s := NewMemoryStore()
 	d1, _ := s.CreateDraft(context.Background(), Draft{Name: "v1", RegoSource: validRego})
 	d2, _ := s.CreateDraft(context.Background(), Draft{Name: "v2", RegoSource: validRego2})
-	_, _ = s.Promote(context.Background(), d1.ID, "")
-	_, _ = s.Promote(context.Background(), d2.ID, "")
+	_, _ = s.Promote(context.Background(), d1.ID, "", "")
+	_, _ = s.Promote(context.Background(), d2.ID, "", "")
 	// Subscribe AFTER both promotes so we only see the rollback.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	ch, _ := s.Watch(ctx)
 
-	if _, err := s.Rollback(context.Background(), "alice"); err != nil {
+	if _, err := s.Rollback(context.Background(), "alice", ""); err != nil {
 		t.Fatalf("rollback: %v", err)
 	}
 	select {
@@ -331,7 +331,7 @@ func TestMemoryStore_WatchMultipleSubscribers(t *testing.T) {
 	c, _ := s.Watch(ctx)
 
 	d, _ := s.CreateDraft(context.Background(), Draft{Name: "v1", RegoSource: validRego})
-	_, _ = s.Promote(context.Background(), d.ID, "")
+	_, _ = s.Promote(context.Background(), d.ID, "", "")
 
 	for i, ch := range []<-chan Active{a, b, c} {
 		select {
@@ -368,7 +368,7 @@ func TestMemoryStore_WatchSlowConsumerDoesNotBlock(t *testing.T) {
 			if i%2 == 0 {
 				target = d2.ID
 			}
-			_, _ = s.Promote(context.Background(), target, "")
+			_, _ = s.Promote(context.Background(), target, "", "")
 		}
 		close(done)
 	}()
@@ -416,5 +416,153 @@ func TestMemoryStore_UpdateKeepsTenantAndCreatedAt(t *testing.T) {
 	}
 	if updated.RegoSource != validRego2 {
 		t.Fatal("update did not change rego_source")
+	}
+}
+
+// --- Per-tenant active pointer tests (session 38) ---
+
+// TestMemoryStore_PerTenantPromoteIsolation proves that promoting
+// against tenant=acme leaves tenant=globex and the default-fallback
+// slot untouched. This is the central correctness claim of the
+// per-tenant active design — one tenant's policy change must not
+// be visible from another tenant's active pointer.
+func TestMemoryStore_PerTenantPromoteIsolation(t *testing.T) {
+	t.Parallel()
+	s := NewMemoryStore()
+	ctx := context.Background()
+
+	acmeDraft, _ := s.CreateDraft(ctx, Draft{Name: "acme-v1", RegoSource: validRego, Tenant: "acme"})
+	globexDraft, _ := s.CreateDraft(ctx, Draft{Name: "globex-v1", RegoSource: validRego2, Tenant: "globex"})
+
+	if _, err := s.Promote(ctx, acmeDraft.ID, "acme-admin", "acme"); err != nil {
+		t.Fatalf("promote acme: %v", err)
+	}
+
+	acmeActive, _ := s.GetActive(ctx, "acme")
+	globexActive, _ := s.GetActive(ctx, "globex")
+	defaultActive, _ := s.GetActive(ctx, "")
+
+	if acmeActive.CurrentDraftID != acmeDraft.ID {
+		t.Errorf("acme active should be acme draft, got %q", acmeActive.CurrentDraftID)
+	}
+	if acmeActive.Tenant != "acme" {
+		t.Errorf("acme active should carry tenant=acme, got %q", acmeActive.Tenant)
+	}
+	if globexActive.CurrentDraftID != "" {
+		t.Errorf("globex active should be empty after acme promote, got %q", globexActive.CurrentDraftID)
+	}
+	if defaultActive.CurrentDraftID != "" {
+		t.Errorf("default active should be empty after acme promote, got %q", defaultActive.CurrentDraftID)
+	}
+
+	// Globex promotes its own — acme's row must remain untouched.
+	if _, err := s.Promote(ctx, globexDraft.ID, "globex-admin", "globex"); err != nil {
+		t.Fatalf("promote globex: %v", err)
+	}
+	acmeAfter, _ := s.GetActive(ctx, "acme")
+	if acmeAfter.CurrentDraftID != acmeDraft.ID {
+		t.Errorf("acme active changed after globex promote: %q (want %q)", acmeAfter.CurrentDraftID, acmeDraft.ID)
+	}
+	globexAfter, _ := s.GetActive(ctx, "globex")
+	if globexAfter.CurrentDraftID != globexDraft.ID {
+		t.Errorf("globex active wrong: %q (want %q)", globexAfter.CurrentDraftID, globexDraft.ID)
+	}
+}
+
+// TestMemoryStore_PerTenantRollbackIsolation proves rollback only
+// flips the named tenant's pointer.
+func TestMemoryStore_PerTenantRollbackIsolation(t *testing.T) {
+	t.Parallel()
+	s := NewMemoryStore()
+	ctx := context.Background()
+
+	a1, _ := s.CreateDraft(ctx, Draft{Name: "acme-v1", RegoSource: validRego, Tenant: "acme"})
+	a2, _ := s.CreateDraft(ctx, Draft{Name: "acme-v2", RegoSource: validRego2, Tenant: "acme"})
+	g1, _ := s.CreateDraft(ctx, Draft{Name: "globex-v1", RegoSource: validRego, Tenant: "globex"})
+
+	_, _ = s.Promote(ctx, a1.ID, "", "acme")
+	_, _ = s.Promote(ctx, a2.ID, "", "acme")
+	_, _ = s.Promote(ctx, g1.ID, "", "globex")
+
+	// Rollback acme — globex should be untouched.
+	rb, err := s.Rollback(ctx, "alice", "acme")
+	if err != nil {
+		t.Fatalf("rollback acme: %v", err)
+	}
+	if rb.CurrentDraftID != a1.ID {
+		t.Errorf("acme rollback current %q, want %q", rb.CurrentDraftID, a1.ID)
+	}
+	if rb.Tenant != "acme" {
+		t.Errorf("rollback tenant = %q, want acme", rb.Tenant)
+	}
+
+	globexActive, _ := s.GetActive(ctx, "globex")
+	if globexActive.CurrentDraftID != g1.ID {
+		t.Errorf("globex active changed by acme rollback: %q (want %q)", globexActive.CurrentDraftID, g1.ID)
+	}
+
+	// Rollback with no previous (we cleared it on the rollback above)
+	// returns ErrNotFound.
+	if _, err := s.Rollback(ctx, "alice", "acme"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("second acme rollback expected ErrNotFound, got %v", err)
+	}
+	// But globex still has nothing to roll back to either (only one promote there).
+	if _, err := s.Rollback(ctx, "", "globex"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("globex single-promote rollback expected ErrNotFound, got %v", err)
+	}
+}
+
+// TestMemoryStore_ListActiveOrdersDefaultFirst proves ListActive
+// returns the default-fallback row before per-tenant overlays —
+// startup hydration depends on this ordering so the fallback is
+// installed before the per-tenant slots that might shadow it.
+func TestMemoryStore_ListActiveOrdersDefaultFirst(t *testing.T) {
+	t.Parallel()
+	s := NewMemoryStore()
+	ctx := context.Background()
+
+	def, _ := s.CreateDraft(ctx, Draft{Name: "default", RegoSource: validRego})
+	g, _ := s.CreateDraft(ctx, Draft{Name: "globex-v1", RegoSource: validRego2, Tenant: "globex"})
+	a, _ := s.CreateDraft(ctx, Draft{Name: "acme-v1", RegoSource: validRego, Tenant: "acme"})
+
+	// Promote in a deliberately non-alphabetical order.
+	_, _ = s.Promote(ctx, g.ID, "", "globex")
+	_, _ = s.Promote(ctx, a.ID, "", "acme")
+	_, _ = s.Promote(ctx, def.ID, "", "")
+
+	rows, err := s.ListActive(ctx)
+	if err != nil {
+		t.Fatalf("list active: %v", err)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("expected 3 active rows, got %d", len(rows))
+	}
+	if rows[0].Tenant != "" {
+		t.Errorf("first row should be default fallback (tenant=\"\"), got %q", rows[0].Tenant)
+	}
+	if rows[1].Tenant != "acme" {
+		t.Errorf("second row should be acme (alphabetical), got %q", rows[1].Tenant)
+	}
+	if rows[2].Tenant != "globex" {
+		t.Errorf("third row should be globex, got %q", rows[2].Tenant)
+	}
+}
+
+// TestMemoryStore_DeleteRejectsCrossTenantActive proves the active-
+// reference sweep covers EVERY tenant's pointer — a draft pinned
+// as acme's previous can't be deleted via the globex admin path.
+func TestMemoryStore_DeleteRejectsCrossTenantActive(t *testing.T) {
+	t.Parallel()
+	s := NewMemoryStore()
+	ctx := context.Background()
+
+	d, _ := s.CreateDraft(ctx, Draft{Name: "v1", RegoSource: validRego, Tenant: "acme"})
+	_, _ = s.Promote(ctx, d.ID, "", "acme")
+
+	// d is pinned as acme's current. Deleting it must fail regardless
+	// of how the caller is "labeled" — DeleteDraft is per-id, not
+	// per-tenant.
+	if err := s.DeleteDraft(ctx, d.ID); !errors.Is(err, ErrActiveDraftDelete) {
+		t.Fatalf("delete should be rejected, got %v", err)
 	}
 }

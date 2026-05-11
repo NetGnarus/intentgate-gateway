@@ -5,25 +5,17 @@
 --
 -- # History
 --
--- gateway 1.4.0  Initial: policy_drafts + policy_active.
---
--- # Layout
---
--- policy_drafts holds operator-authored Rego candidates. tenant is
--- NOT NULL (defaults to '' for superadmin-authored drafts) so
--- per-tenant queries can filter on it cleanly. We index
--- (tenant, updated_at DESC) because the dominant query is the
--- console's draft-list view, which is exactly that shape.
---
--- policy_active is a single-row pointer table with the literal
--- 'global' as its only valid id. Using a known string for the PK
--- rather than a NULL or omitted constraint means every gateway
--- replica reads and writes the same row, the active-pointer update
--- is a single UPSERT, and the schema documents "one active per
--- gateway install" at the table level. Per-tenant active policies
--- are a planned follow-on; when that lands, this table will gain a
--- tenant column and the PK becomes (id, tenant). For v1.4 the
--- single-row shape matches the gateway's single-engine semantics.
+-- gateway 1.4.0  Initial: policy_drafts + policy_active. policy_active
+--                had a single 'global' row keyed by literal id; one
+--                policy engine per gateway install.
+-- gateway 1.5.0  policy_active becomes per-tenant. The PK changes
+--                from (id) to (tenant). Existing 'global' rows
+--                migrate to tenant='' (the new "default fallback"
+--                slot, semantically identical to v1.4's single row).
+--                Per-tenant admins now promote against their own
+--                tenant slot; the gateway's reloader dispatches
+--                each request to the right compiled engine based on
+--                the verified capability token's tenant claim.
 
 CREATE TABLE IF NOT EXISTS policy_drafts (
     id           TEXT NOT NULL PRIMARY KEY,
@@ -40,15 +32,53 @@ CREATE INDEX IF NOT EXISTS policy_drafts_tenant_updated_at_idx
     ON policy_drafts (tenant, updated_at DESC);
 
 CREATE TABLE IF NOT EXISTS policy_active (
-    id                 TEXT NOT NULL PRIMARY KEY,
+    id                 TEXT NOT NULL,
+    tenant             TEXT NOT NULL DEFAULT '',
     current_draft_id   TEXT NOT NULL DEFAULT '',
     previous_draft_id  TEXT NOT NULL DEFAULT '',
     promoted_at        TIMESTAMPTZ,
     promoted_by        TEXT NOT NULL DEFAULT ''
 );
 
--- Seed the single 'global' row so the application code can use
--- plain UPDATEs after a fresh install without first checking
--- whether the row exists. ON CONFLICT keeps this idempotent.
-INSERT INTO policy_active (id) VALUES ('global')
-    ON CONFLICT (id) DO NOTHING;
+-- 1.4 -> 1.5 column add (no-op once present). Pre-1.5 deployments
+-- had only `id` as the PK; we add the tenant column, backfill, then
+-- swap the PK.
+ALTER TABLE policy_active
+    ADD COLUMN IF NOT EXISTS tenant TEXT;
+UPDATE policy_active
+    SET tenant = ''
+    WHERE tenant IS NULL;
+ALTER TABLE policy_active
+    ALTER COLUMN tenant SET DEFAULT '';
+ALTER TABLE policy_active
+    ALTER COLUMN tenant SET NOT NULL;
+
+-- 1.4 -> 1.5 PK migration. Drop the old PK on (id) only if it's
+-- still in place, then add the new PK on (tenant). The DO block
+-- makes this idempotent: a 1.5 gateway starting against a 1.5 DB
+-- finds the PK already on (tenant) and leaves it.
+DO $$
+DECLARE
+    pk_cols TEXT;
+BEGIN
+    SELECT string_agg(a.attname, ',' ORDER BY array_position(c.conkey, a.attnum))
+    INTO pk_cols
+    FROM pg_constraint c
+    JOIN pg_attribute  a ON a.attrelid = c.conrelid AND a.attnum = ANY (c.conkey)
+    WHERE c.conrelid = 'policy_active'::regclass AND c.contype = 'p';
+
+    IF pk_cols = 'id' THEN
+        ALTER TABLE policy_active DROP CONSTRAINT policy_active_pkey;
+        ALTER TABLE policy_active ADD PRIMARY KEY (tenant);
+    END IF;
+END$$;
+
+-- The `id` column is kept (it's NOT NULL DEFAULT '') for migration
+-- compatibility; queries operate on (tenant) only. A future schema
+-- pass can drop it once we're sure no downgrade path is needed.
+
+-- Seed the default-fallback row if a fresh install has no rows at
+-- all. ON CONFLICT keeps this idempotent across restarts and after
+-- per-tenant promotes have populated other rows.
+INSERT INTO policy_active (id, tenant) VALUES ('global', '')
+    ON CONFLICT (tenant) DO NOTHING;

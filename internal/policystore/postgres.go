@@ -206,12 +206,13 @@ func (s *PostgresStore) listenerSession(ctx context.Context) error {
 		return fmt.Errorf("listen: %w", err)
 	}
 
-	// Track the last fan-out's CurrentDraftID so the polling
-	// fallback doesn't broadcast on every poll — only when the
-	// active row actually changed since last seen. The listener
-	// path emits unconditionally because by definition a NOTIFY
-	// fired only because something committed.
-	lastID := ""
+	// Per-tenant cache of the last CurrentDraftID we fanned out for
+	// each tenant. The polling fallback consults it to avoid re-
+	// broadcasting unchanged rows on every 5-second tick. The
+	// listener path overwrites it on every NOTIFY (the notification
+	// itself proves the row changed). Empty-tenant ("") is the
+	// default-fallback row and lives in the same map.
+	lastActive := make(map[string]string)
 
 	for {
 		// We want WaitForNotification to return either when a real
@@ -226,37 +227,55 @@ func (s *PostgresStore) listenerSession(ctx context.Context) error {
 
 		switch {
 		case err == nil:
-			// Real NOTIFY. Read active and fan-out unconditionally
-			// — a notify-without-change is impossible by construction
-			// (Promote/Rollback are the only emitters and both run
-			// inside their own pointer-mutating transactions).
-			_ = n // payload carries the draft id, but we re-read for safety
-			active, getErr := s.GetActive(ctx)
-			if getErr != nil {
-				s.logger.Warn("policystore: GetActive after NOTIFY failed",
-					"err", getErr)
+			// Real NOTIFY. The payload encodes (tenant, draft_id) so
+			// we can fan-out directly to the right tenant slot
+			// without re-reading the whole row. Re-read is still
+			// useful when the payload is malformed (decodeNotify
+			// returns empty), so we fall back to ListActive in that
+			// case — degrades gracefully on a scrambled payload.
+			payloadTenant, payloadDraftID := decodeNotifyPayload(n.Payload)
+			if payloadDraftID == "" && payloadTenant == "" {
+				// Malformed: fan out every tenant's active so
+				// subscribers eventually reconverge.
+				if all, listErr := s.ListActive(ctx); listErr == nil {
+					for _, a := range all {
+						s.fanOut(a)
+						lastActive[a.Tenant] = a.CurrentDraftID
+					}
+				} else {
+					s.logger.Warn("policystore: ListActive after malformed NOTIFY failed",
+						"err", listErr)
+				}
 				continue
 			}
-			lastID = active.CurrentDraftID
+			active, getErr := s.GetActive(ctx, payloadTenant)
+			if getErr != nil {
+				s.logger.Warn("policystore: GetActive after NOTIFY failed",
+					"err", getErr, "tenant", payloadTenant)
+				continue
+			}
+			lastActive[payloadTenant] = active.CurrentDraftID
 			s.fanOut(active)
 
 		case errors.Is(err, context.DeadlineExceeded):
-			// Polling fallback fires. Only emit if the active row
-			// looks different from what we last delivered — keeps
-			// the every-5s tick from spamming the bus on an idle
-			// cluster.
+			// Polling fallback fires. Re-read every tenant's row
+			// and emit only the ones whose current_draft_id changed
+			// since last seen — keeps the every-5s tick from
+			// spamming the bus on an idle cluster.
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			active, getErr := s.GetActive(ctx)
-			if getErr != nil {
-				s.logger.Warn("policystore: polling GetActive failed",
-					"err", getErr)
+			all, listErr := s.ListActive(ctx)
+			if listErr != nil {
+				s.logger.Warn("policystore: polling ListActive failed",
+					"err", listErr)
 				continue
 			}
-			if active.CurrentDraftID != lastID {
-				lastID = active.CurrentDraftID
-				s.fanOut(active)
+			for _, a := range all {
+				if a.CurrentDraftID != lastActive[a.Tenant] {
+					lastActive[a.Tenant] = a.CurrentDraftID
+					s.fanOut(a)
+				}
 			}
 
 		case errors.Is(err, context.Canceled):
@@ -396,9 +415,10 @@ func (s *PostgresStore) ListDrafts(ctx context.Context, filter ListFilter) ([]Dr
 	return out, nil
 }
 
-// DeleteDraft refuses when the active pointer references the row.
-// The existence + active-reference check + DELETE all happen inside
-// one transaction so a concurrent promote can't slip in between.
+// DeleteDraft refuses when ANY tenant's active pointer references
+// the row (current OR previous). The existence + active-reference
+// check + DELETE all happen inside one transaction so a concurrent
+// promote can't slip in between.
 func (s *PostgresStore) DeleteDraft(ctx context.Context, id string) error {
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
@@ -416,13 +436,18 @@ func (s *PostgresStore) DeleteDraft(ctx context.Context, id string) error {
 		return ErrNotFound
 	}
 
-	var current, previous string
-	if err := tx.QueryRow(ctx,
-		`SELECT current_draft_id, previous_draft_id FROM policy_active WHERE id = 'global'`,
-	).Scan(&current, &previous); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+	// Active-reference sweep across every per-tenant row. A single
+	// EXISTS query covers them all without N round-trips.
+	var pinned bool
+	if err := tx.QueryRow(ctx, `
+		SELECT EXISTS(
+			SELECT 1 FROM policy_active
+			WHERE current_draft_id = $1 OR previous_draft_id = $1
+		)
+	`, id).Scan(&pinned); err != nil {
 		return fmt.Errorf("policystore: delete active check: %w", err)
 	}
-	if current == id || previous == id {
+	if pinned {
 		return ErrActiveDraftDelete
 	}
 
@@ -435,25 +460,25 @@ func (s *PostgresStore) DeleteDraft(ctx context.Context, id string) error {
 	return nil
 }
 
-// GetActive returns the active-pointer row. The migration seeded it,
-// so we always find the row; a fresh install returns the
-// zero-valued Active (empty current and previous).
-func (s *PostgresStore) GetActive(ctx context.Context) (Active, error) {
+// GetActive returns the active-pointer row for the given tenant.
+// Empty tenant returns the default-fallback row. A missing row
+// (tenant has never promoted) returns a zero-valued Active so
+// callers can detect "no active set" via CurrentDraftID == "".
+func (s *PostgresStore) GetActive(ctx context.Context, tenant string) (Active, error) {
 	const q = `
-		SELECT current_draft_id, previous_draft_id, promoted_at, promoted_by
+		SELECT tenant, current_draft_id, previous_draft_id, promoted_at, promoted_by
 		FROM policy_active
-		WHERE id = 'global'
+		WHERE tenant = $1
 	`
 	var (
 		a          Active
 		promotedAt sql.NullTime
 	)
-	if err := s.pool.QueryRow(ctx, q).Scan(
-		&a.CurrentDraftID, &a.PreviousDraftID, &promotedAt, &a.PromotedBy,
+	if err := s.pool.QueryRow(ctx, q, tenant).Scan(
+		&a.Tenant, &a.CurrentDraftID, &a.PreviousDraftID, &promotedAt, &a.PromotedBy,
 	); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) || errors.Is(err, sql.ErrNoRows) {
-			// Should not happen post-migration, but be permissive.
-			return Active{}, nil
+			return Active{Tenant: tenant}, nil
 		}
 		return Active{}, fmt.Errorf("policystore: get active: %w", err)
 	}
@@ -463,12 +488,57 @@ func (s *PostgresStore) GetActive(ctx context.Context) (Active, error) {
 	return a, nil
 }
 
-// Promote moves CurrentDraftID → PreviousDraftID, then writes
-// draftID into CurrentDraftID. All inside one transaction: the
-// draft-exists check guarding against ErrNotFound shares the
-// transaction with the active-row UPDATE so a concurrent delete
-// can't slip a deleted ID into the active row.
-func (s *PostgresStore) Promote(ctx context.Context, draftID, promotedBy string) (Active, error) {
+// ListActive returns every tenant's active pointer. Default-
+// fallback row (tenant=”) first so startup hydration installs it
+// before per-tenant overlays.
+func (s *PostgresStore) ListActive(ctx context.Context) ([]Active, error) {
+	const q = `
+		SELECT tenant, current_draft_id, previous_draft_id, promoted_at, promoted_by
+		FROM policy_active
+		ORDER BY (tenant = '') DESC, tenant ASC
+	`
+	rows, err := s.pool.Query(ctx, q)
+	if err != nil {
+		return nil, fmt.Errorf("policystore: list active: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]Active, 0, 8)
+	for rows.Next() {
+		var (
+			a          Active
+			promotedAt sql.NullTime
+		)
+		if err := rows.Scan(&a.Tenant, &a.CurrentDraftID, &a.PreviousDraftID, &promotedAt, &a.PromotedBy); err != nil {
+			return nil, fmt.Errorf("policystore: scan active: %w", err)
+		}
+		if promotedAt.Valid {
+			a.PromotedAt = promotedAt.Time.UTC()
+		}
+		out = append(out, a)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("policystore: active rows iter: %w", err)
+	}
+	return out, nil
+}
+
+// Promote moves the given tenant's CurrentDraftID →
+// PreviousDraftID, then writes draftID into CurrentDraftID. All
+// inside one transaction: the draft-exists check guarding against
+// ErrNotFound shares the transaction with the active-row UPSERT so
+// a concurrent delete can't slip a deleted ID into the active row.
+//
+// First-promote-for-this-tenant inserts a fresh row (the migration
+// seeds tenant=” only; other tenants get their row on first
+// promote via the ON CONFLICT UPDATE path).
+//
+// NOTIFY payload encodes the (tenant, draft_id) pair so listeners
+// know which engine to swap without an extra round-trip. Format:
+// "tenant:draft_id" — colon-safe because both fields are
+// gateway-controlled identifiers (hex draft id and the operator-
+// configured tenant string, both validated upstream).
+func (s *PostgresStore) Promote(ctx context.Context, draftID, promotedBy, tenant string) (Active, error) {
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return Active{}, fmt.Errorf("policystore: begin tx: %w", err)
@@ -487,18 +557,19 @@ func (s *PostgresStore) Promote(ctx context.Context, draftID, promotedBy string)
 
 	var current, previous, currentBy string
 	var currentAt sql.NullTime
-	if err := tx.QueryRow(ctx, `
+	rowErr := tx.QueryRow(ctx, `
 		SELECT current_draft_id, previous_draft_id, promoted_at, promoted_by
-		FROM policy_active WHERE id = 'global'
-	`).Scan(&current, &previous, &currentAt, &currentBy); err != nil &&
-		!errors.Is(err, pgx.ErrNoRows) {
-		return Active{}, fmt.Errorf("policystore: promote read active: %w", err)
+		FROM policy_active WHERE tenant = $1
+	`, tenant).Scan(&current, &previous, &currentAt, &currentBy)
+	if rowErr != nil && !errors.Is(rowErr, pgx.ErrNoRows) && !errors.Is(rowErr, sql.ErrNoRows) {
+		return Active{}, fmt.Errorf("policystore: promote read active: %w", rowErr)
 	}
 
 	// Idempotent: re-promoting the same draft is a no-op so timestamps
 	// don't churn under accidental double-clicks.
 	if current == draftID {
 		a := Active{
+			Tenant:          tenant,
 			CurrentDraftID:  current,
 			PreviousDraftID: previous,
 			PromotedBy:      currentBy,
@@ -510,31 +581,33 @@ func (s *PostgresStore) Promote(ctx context.Context, draftID, promotedBy string)
 	}
 
 	now := time.Now().UTC()
+	// UPSERT: tenants beyond the seeded '' default get their row
+	// created on first promote. id is a legacy column with a default
+	// of ''; the PK is (tenant) so the insert only collides on tenant.
 	if _, err := tx.Exec(ctx, `
-		UPDATE policy_active
-		SET current_draft_id = $1,
-		    previous_draft_id = $2,
-		    promoted_at = $3,
-		    promoted_by = $4
-		WHERE id = 'global'
-	`, draftID, current, now, promotedBy); err != nil {
-		return Active{}, fmt.Errorf("policystore: promote update: %w", err)
+		INSERT INTO policy_active (id, tenant, current_draft_id, previous_draft_id, promoted_at, promoted_by)
+		VALUES ('', $1, $2, $3, $4, $5)
+		ON CONFLICT (tenant) DO UPDATE
+		SET current_draft_id = EXCLUDED.current_draft_id,
+		    previous_draft_id = EXCLUDED.previous_draft_id,
+		    promoted_at = EXCLUDED.promoted_at,
+		    promoted_by = EXCLUDED.promoted_by
+	`, tenant, draftID, current, now, promotedBy); err != nil {
+		return Active{}, fmt.Errorf("policystore: promote upsert: %w", err)
 	}
-	// Broadcast to every replica's listener BEFORE commit so the
-	// NOTIFY rides in the same transaction as the pointer write —
-	// either both land or both roll back. Postgres queues the
-	// notification until commit, so subscribers only see it after
-	// the row update is visible. Payload is the new draft id so a
-	// future listener that wants to skip the GetActive round-trip
-	// could read it directly. pg_notify is the parameterized form;
-	// the bare NOTIFY statement doesn't accept placeholders.
-	if _, err := tx.Exec(ctx, "SELECT pg_notify($1, $2)", notifyChannel, draftID); err != nil {
+	// Broadcast inside the transaction so the NOTIFY commits atomic
+	// with the pointer write. Payload encodes both tenant and draft
+	// id so the listener can dispatch directly to the right engine
+	// slot without another GetActive round-trip.
+	if _, err := tx.Exec(ctx, "SELECT pg_notify($1, $2)",
+		notifyChannel, encodeNotifyPayload(tenant, draftID)); err != nil {
 		return Active{}, fmt.Errorf("policystore: promote notify: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return Active{}, fmt.Errorf("policystore: promote commit: %w", err)
 	}
 	return Active{
+		Tenant:          tenant,
 		CurrentDraftID:  draftID,
 		PreviousDraftID: current,
 		PromotedAt:      now,
@@ -542,10 +615,10 @@ func (s *PostgresStore) Promote(ctx context.Context, draftID, promotedBy string)
 	}, nil
 }
 
-// Rollback swaps Current and Previous, then clears Previous so a
-// second consecutive rollback returns ErrNotFound rather than
-// ping-ponging.
-func (s *PostgresStore) Rollback(ctx context.Context, rolledBackBy string) (Active, error) {
+// Rollback swaps the given tenant's Current and Previous, then
+// clears Previous so a second consecutive rollback returns
+// ErrNotFound rather than ping-ponging.
+func (s *PostgresStore) Rollback(ctx context.Context, rolledBackBy, tenant string) (Active, error) {
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return Active{}, fmt.Errorf("policystore: begin tx: %w", err)
@@ -553,11 +626,12 @@ func (s *PostgresStore) Rollback(ctx context.Context, rolledBackBy string) (Acti
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	var current, previous string
-	if err := tx.QueryRow(ctx, `
+	rowErr := tx.QueryRow(ctx, `
 		SELECT current_draft_id, previous_draft_id
-		FROM policy_active WHERE id = 'global'
-	`).Scan(&current, &previous); err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		return Active{}, fmt.Errorf("policystore: rollback read: %w", err)
+		FROM policy_active WHERE tenant = $1
+	`, tenant).Scan(&current, &previous)
+	if rowErr != nil && !errors.Is(rowErr, pgx.ErrNoRows) && !errors.Is(rowErr, sql.ErrNoRows) {
+		return Active{}, fmt.Errorf("policystore: rollback read: %w", rowErr)
 	}
 	if previous == "" {
 		return Active{}, ErrNotFound
@@ -570,22 +644,45 @@ func (s *PostgresStore) Rollback(ctx context.Context, rolledBackBy string) (Acti
 		    previous_draft_id = '',
 		    promoted_at = $2,
 		    promoted_by = $3
-		WHERE id = 'global'
-	`, previous, now, rolledBackBy); err != nil {
+		WHERE tenant = $4
+	`, previous, now, rolledBackBy, tenant); err != nil {
 		return Active{}, fmt.Errorf("policystore: rollback update: %w", err)
 	}
-	// Same NOTIFY hook as Promote — the listener handles both kinds
-	// of pointer change identically (re-fetch + fan-out).
-	if _, err := tx.Exec(ctx, "SELECT pg_notify($1, $2)", notifyChannel, previous); err != nil {
+	if _, err := tx.Exec(ctx, "SELECT pg_notify($1, $2)",
+		notifyChannel, encodeNotifyPayload(tenant, previous)); err != nil {
 		return Active{}, fmt.Errorf("policystore: rollback notify: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return Active{}, fmt.Errorf("policystore: rollback commit: %w", err)
 	}
 	return Active{
+		Tenant:          tenant,
 		CurrentDraftID:  previous,
 		PreviousDraftID: "",
 		PromotedAt:      now,
 		PromotedBy:      rolledBackBy,
 	}, nil
+}
+
+// encodeNotifyPayload packs (tenant, draft_id) into a single
+// pg_notify payload string. Format: "tenant\x1Edraft_id" — using
+// the ASCII Record Separator control char as a delimiter so it
+// can't appear inside either field (draft IDs are hex, tenant
+// names are operator-configured plain text). The listener side
+// uses [decodeNotifyPayload] to split.
+func encodeNotifyPayload(tenant, draftID string) string {
+	return tenant + "\x1E" + draftID
+}
+
+// decodeNotifyPayload splits an encoded payload back into
+// (tenant, draft_id). Returns empty strings on malformed input —
+// the listener falls back to a full ListActive in that case, so a
+// scrambled payload degrades gracefully rather than crashing.
+func decodeNotifyPayload(payload string) (tenant, draftID string) {
+	for i := 0; i < len(payload); i++ {
+		if payload[i] == 0x1E {
+			return payload[:i], payload[i+1:]
+		}
+	}
+	return "", ""
 }

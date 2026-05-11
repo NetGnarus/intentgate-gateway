@@ -70,7 +70,7 @@ func TestPostgresStore_CrossReplicaWatch(t *testing.T) {
 	// self-contained. We can't easily "reset" the policy_active
 	// row from outside the API; instead we just promote and check
 	// the resulting CurrentDraftID matches.
-	if _, err := a.Promote(ctx, d.ID, "cross-replica-test"); err != nil {
+	if _, err := a.Promote(ctx, d.ID, "cross-replica-test", ""); err != nil {
 		t.Fatalf("promote on A: %v", err)
 	}
 

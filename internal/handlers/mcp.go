@@ -902,8 +902,15 @@ func (h *mcpHandler) runPolicyCheck(
 		Args:    params.Arguments,
 		AgentID: cap.agentID,
 	}
-	if cap.agentID != "" {
+	if cap.agentID != "" || cap.token != nil {
 		in.Capability = &policy.InputCap{Subject: cap.agentID}
+		if cap.token != nil {
+			// Tenant on the input drives the Reloader's per-tenant
+			// dispatch — a request from tenant=acme evaluates
+			// against acme's promoted engine, falling back to the
+			// default-fallback engine when acme has no slot.
+			in.Capability.Tenant = cap.token.Tenant
+		}
 	}
 	if intent.intent != nil {
 		in.Intent = &policy.InputIntent{

@@ -158,7 +158,16 @@ type InputIntent struct {
 }
 
 // InputCap exposes a small slice of the verified capability token.
+//
+// Tenant is set by the MCP handler from the verified capability
+// token (see [capability.Token.Tenant]). The [Reloader] reads it to
+// dispatch the evaluation to the right per-tenant compiled engine
+// — customer Rego that doesn't care about multi-tenancy can ignore
+// the field, and tenants without their own promoted policy fall
+// back to the default fallback module installed at startup or by
+// a superadmin promote.
 type InputCap struct {
 	Subject string `json:"subject,omitempty"`
 	Issuer  string `json:"issuer,omitempty"`
+	Tenant  string `json:"tenant,omitempty"`
 }

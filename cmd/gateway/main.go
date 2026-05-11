@@ -358,21 +358,25 @@ func main() {
 	// THIS replica's compiled engine in near-real-time, instead of
 	// only on pod restart. No-op when policyStore is nil.
 	//
-	// Seed the watcher with the current active draft id so its
-	// first polling-fallback delivery (which always fires
-	// pollFallbackInterval seconds after start) doesn't log a
+	// Seed the watcher with the per-tenant current draft ids so
+	// its first polling-fallback delivery (which always fires
+	// within pollFallbackInterval of start) doesn't log a
 	// misleading "swapped from sibling replica" line for state
 	// this pod already loaded at startup.
-	startupDraftID := ""
+	startupDraftIDs := make(map[string]string)
 	if policyStore != nil {
-		if active, gErr := policyStore.GetActive(context.Background()); gErr == nil {
-			startupDraftID = active.CurrentDraftID
+		if rows, lErr := policyStore.ListActive(context.Background()); lErr == nil {
+			for _, a := range rows {
+				if a.CurrentDraftID != "" {
+					startupDraftIDs[a.Tenant] = a.CurrentDraftID
+				}
+			}
 		}
 	}
 	watchCtx, cancelWatch := context.WithCancel(context.Background())
 	defer cancelWatch()
 	if policyStore != nil {
-		go watchAndReloadPolicy(watchCtx, logger, policyStore, policyReloader, startupDraftID)
+		go watchAndReloadPolicy(watchCtx, logger, policyStore, policyReloader, startupDraftIDs)
 	}
 
 	adminTokenDesc := "disabled"
@@ -889,55 +893,89 @@ func loadPolicyStore(ctx context.Context, logger *slog.Logger, backend, postgres
 	}
 }
 
-// reloadActivePolicy hydrates the policy reloader from the store at
-// startup so promotions survive gateway restarts. Returns the
-// startup-source label fed back to the /v1/admin/policies/active
-// handler so the console knows whether the gateway is currently
-// running an embedded default, a file-supplied policy, or a
-// promoted draft.
+// reloadActivePolicy hydrates the policy reloader from the store
+// at startup so promotions survive gateway restarts. v1.5 makes
+// this per-tenant: every populated active row gets its target
+// draft compiled and installed in the reloader's matching slot.
+// The default-fallback row (tenant="") drives the reloader's
+// default engine, preserving v1.4 single-tenant semantics for
+// deployments that haven't promoted any per-tenant overlays.
+//
+// Returns the startup-source label fed back to the
+// /v1/admin/policies/active handler so the console knows whether
+// the gateway is currently running an embedded default, a file-
+// supplied policy, or a promoted draft.
 //
 // When the store is nil (INTENTGATE_POLICY_STORE=off) we leave the
 // reloader untouched and return the fallback source.
 //
-// When the store has no active draft (CurrentDraftID == ""), same
-// behavior — the embedded / file policy compiled at startup stays
-// live.
-//
-// When the store has an active draft and the recompile fails, we
-// log loudly and refuse to start: the gateway running the embedded
-// default while the database says "policy X is live" is exactly the
+// When any active row's recompile fails, we log loudly and refuse
+// to start: the gateway running the embedded default while the
+// database says "policy X is live for tenant Y" is exactly the
 // kind of confusion auditors flag, so failing fast is correct.
 func reloadActivePolicy(ctx context.Context, logger *slog.Logger, store policystore.Store, reloader *policy.Reloader, fallbackSource string) (string, error) {
 	if store == nil {
 		return fallbackSource, nil
 	}
-	active, err := store.GetActive(ctx)
+	rows, err := store.ListActive(ctx)
 	if err != nil {
-		return "", fmt.Errorf("read active policy: %w", err)
+		return "", fmt.Errorf("list active policies: %w", err)
 	}
-	if active.CurrentDraftID == "" {
-		logger.Info("policy store has no active draft; using fallback policy",
-			"fallback_source", fallbackSource)
-		return fallbackSource, nil
+	// Track whether the default-fallback slot got populated from
+	// the store, vs left at the startup-bootstrap engine (embedded
+	// default or INTENTGATE_POLICY_FILE).
+	defaultHydratedFromStore := false
+	tenantsLoaded := 0
+
+	for _, active := range rows {
+		if active.CurrentDraftID == "" {
+			continue
+		}
+		draft, err := store.GetDraft(ctx, active.CurrentDraftID)
+		if err != nil {
+			return "", fmt.Errorf("load active draft %q (tenant=%q): %w",
+				active.CurrentDraftID, active.Tenant, err)
+		}
+		engine, err := policy.NewEngine(ctx, draft.RegoSource)
+		if err != nil {
+			return "", fmt.Errorf("compile active draft %q (tenant=%q): %w",
+				active.CurrentDraftID, active.Tenant, err)
+		}
+		if _, err := reloader.SwapFor(active.Tenant, engine); err != nil {
+			return "", fmt.Errorf("swap to active draft %q (tenant=%q): %w",
+				active.CurrentDraftID, active.Tenant, err)
+		}
+		logger.Info("loaded promoted policy from store",
+			"tenant", active.Tenant,
+			"draft_id", active.CurrentDraftID,
+			"name", draft.Name,
+			"promoted_at", active.PromotedAt,
+			"promoted_by", active.PromotedBy,
+		)
+		if active.Tenant == "" {
+			defaultHydratedFromStore = true
+		} else {
+			tenantsLoaded++
+		}
 	}
-	draft, err := store.GetDraft(ctx, active.CurrentDraftID)
-	if err != nil {
-		return "", fmt.Errorf("load active draft %q: %w", active.CurrentDraftID, err)
+
+	if tenantsLoaded > 0 {
+		logger.Info("policy reloader hydrated per-tenant overlays",
+			"tenants_loaded", tenantsLoaded,
+			"default_from_store", defaultHydratedFromStore)
 	}
-	engine, err := policy.NewEngine(ctx, draft.RegoSource)
-	if err != nil {
-		return "", fmt.Errorf("compile active draft %q: %w", active.CurrentDraftID, err)
+	if defaultHydratedFromStore {
+		return "draft", nil
 	}
-	if _, err := reloader.Swap(engine); err != nil {
-		return "", fmt.Errorf("swap to active draft %q: %w", active.CurrentDraftID, err)
+	if tenantsLoaded > 0 {
+		// Some tenants have their own policy but the default slot
+		// still uses the startup bootstrap. Label reflects that the
+		// "live" answer depends on the calling tenant.
+		return fallbackSource + " + per-tenant overlays", nil
 	}
-	logger.Info("loaded promoted policy from store",
-		"draft_id", active.CurrentDraftID,
-		"name", draft.Name,
-		"promoted_at", active.PromotedAt,
-		"promoted_by", active.PromotedBy,
-	)
-	return "draft", nil
+	logger.Info("policy store has no active drafts; using fallback policy",
+		"fallback_source", fallbackSource)
+	return fallbackSource, nil
 }
 
 // watchAndReloadPolicy is the cross-replica refresh loop. It
@@ -965,57 +1003,63 @@ func reloadActivePolicy(ctx context.Context, logger *slog.Logger, store policyst
 // watcher only handles changes that happen WHILE the gateway is
 // running.
 //
-// startupDraftID seeds the de-dup so the first polling-fallback
-// delivery (which always fires within pollFallbackInterval of
-// startup and re-broadcasts the current active row) is recognized
-// as the state this pod already loaded at startup — no re-compile,
-// no misleading "swapped from sibling" log line.
-func watchAndReloadPolicy(ctx context.Context, logger *slog.Logger, store policystore.Store, reloader *policy.Reloader, startupDraftID string) {
+// startupDraftIDs is a per-tenant seed for the de-dup map: the
+// first polling-fallback delivery for each tenant slot recognizes
+// the state this pod already loaded at startup as a no-op and
+// skips the re-compile + misleading "swapped from sibling" log
+// line.
+func watchAndReloadPolicy(ctx context.Context, logger *slog.Logger, store policystore.Store, reloader *policy.Reloader, startupDraftIDs map[string]string) {
 	ch, err := store.Watch(ctx)
 	if err != nil {
 		logger.Error("policy watcher failed to subscribe; cross-replica refresh disabled",
 			"err", err)
 		return
 	}
-	logger.Info("policy watcher started", "seeded_draft_id", startupDraftID)
+	logger.Info("policy watcher started",
+		"seeded_tenants", len(startupDraftIDs))
 
-	// Track the last applied draft id so we can short-circuit
-	// redundant notifications (idempotent reload). Seeded from
-	// startup so we don't re-load what reloadActivePolicy already
-	// installed.
-	lastApplied := startupDraftID
+	// Per-tenant last-applied tracking. Seeded from startup so we
+	// don't re-load what reloadActivePolicy already installed.
+	lastApplied := make(map[string]string, len(startupDraftIDs))
+	for tenant, id := range startupDraftIDs {
+		lastApplied[tenant] = id
+	}
 
 	for active := range ch {
 		if active.CurrentDraftID == "" {
-			// The active pointer was cleared (shouldn't happen via
-			// the admin API, but handle it gracefully if a future
-			// path lands here — leave the live engine alone, log).
-			logger.Info("policy watcher: active pointer cleared; keeping current engine")
+			// The active pointer was cleared for this tenant
+			// (shouldn't happen via the admin API today, but handle
+			// it gracefully). Leave the live engine alone — the
+			// fallback engine will serve requests for tenants that
+			// don't have their own slot once we wire RemoveFor.
+			logger.Info("policy watcher: active pointer cleared; keeping current engine",
+				"tenant", active.Tenant)
 			continue
 		}
-		if active.CurrentDraftID == lastApplied {
+		if active.CurrentDraftID == lastApplied[active.Tenant] {
 			continue
 		}
 
 		draft, err := store.GetDraft(ctx, active.CurrentDraftID)
 		if err != nil {
 			logger.Error("policy watcher: failed to read promoted draft; keeping current engine",
-				"draft_id", active.CurrentDraftID, "err", err)
+				"draft_id", active.CurrentDraftID, "tenant", active.Tenant, "err", err)
 			continue
 		}
 		engine, err := policy.NewEngine(ctx, draft.RegoSource)
 		if err != nil {
 			logger.Error("policy watcher: failed to compile promoted draft; keeping current engine",
-				"draft_id", active.CurrentDraftID, "err", err)
+				"draft_id", active.CurrentDraftID, "tenant", active.Tenant, "err", err)
 			continue
 		}
-		if _, err := reloader.Swap(engine); err != nil {
+		if _, err := reloader.SwapFor(active.Tenant, engine); err != nil {
 			logger.Error("policy watcher: engine swap failed; keeping current engine",
-				"draft_id", active.CurrentDraftID, "err", err)
+				"draft_id", active.CurrentDraftID, "tenant", active.Tenant, "err", err)
 			continue
 		}
-		lastApplied = active.CurrentDraftID
+		lastApplied[active.Tenant] = active.CurrentDraftID
 		logger.Info("policy watcher: swapped to promoted draft from sibling replica",
+			"tenant", active.Tenant,
 			"draft_id", active.CurrentDraftID,
 			"promoted_at", active.PromotedAt,
 			"promoted_by", active.PromotedBy,

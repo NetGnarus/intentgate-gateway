@@ -205,7 +205,7 @@ func TestPolicyDrafts_DeleteActiveRejected(t *testing.T) {
 	cfg, store, _ := newPolicyAdminCfg(t)
 	ctx := context.Background()
 	d, _ := store.CreateDraft(ctx, policystore.Draft{Name: "live", RegoSource: policyTestRego})
-	_, _ = store.Promote(ctx, d.ID, "alice")
+	_, _ = store.Promote(ctx, d.ID, "alice", "")
 
 	mux := http.NewServeMux()
 	mux.Handle("DELETE /v1/admin/policies/drafts/{id}", NewAdminDraftDeleteHandler(cfg))
@@ -215,19 +215,61 @@ func TestPolicyDrafts_DeleteActiveRejected(t *testing.T) {
 	}
 }
 
-func TestPolicyPromote_RequiresSuperadmin(t *testing.T) {
+// TestPolicyPromote_PerTenantAllowed (v1.5+): a per-tenant admin
+// CAN promote within their own tenant — the v1.4 blanket-403 on
+// per-tenant promotes was the headline restriction this session
+// removed. The reloader's per-tenant slot is what receives the
+// new engine, not the default-fallback slot.
+func TestPolicyPromote_PerTenantAllowed(t *testing.T) {
 	t.Parallel()
-	cfg, store, _ := newPolicyAdminCfg(t)
+	cfg, store, reloader := newPolicyAdminCfg(t)
 	d, _ := store.CreateDraft(context.Background(), policystore.Draft{
-		Name: "v1", RegoSource: policyTestRego, Tenant: "acme",
+		Name: "acme-v1", RegoSource: policyTestRegoV2, Tenant: "acme",
 	})
 	h := NewAdminPromoteHandler(cfg)
 
-	// Per-tenant admin tries to promote — 403.
 	w := doReq(t, h, http.MethodPost, "/v1/admin/policies/active", "acme-tok",
-		map[string]any{"draft_id": d.ID}, nil)
+		map[string]any{"draft_id": d.ID, "promoted_by": "acme-admin"}, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("per-tenant promote: status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+
+	// Acme's slot now has the v2 (deny) engine.
+	acmeEngine := reloader.CurrentFor("acme")
+	if acmeEngine == nil {
+		t.Fatal("acme slot should be populated after promote")
+	}
+	dec, err := acmeEngine.Evaluate(context.Background(), map[string]any{"tool": "x"})
+	if err != nil {
+		t.Fatalf("acme engine evaluate: %v", err)
+	}
+	if dec.Allow {
+		t.Errorf("acme engine should evaluate v2 deny policy, got allow")
+	}
+
+	// Default fallback slot is untouched.
+	defaultEngine := reloader.Current()
+	defDec, _ := defaultEngine.Evaluate(context.Background(), map[string]any{"tool": "x"})
+	if !defDec.Allow {
+		t.Errorf("default slot changed by per-tenant promote — should still be the seeded allow policy")
+	}
+}
+
+// TestPolicyPromote_CrossTenantForbidden: a per-tenant admin
+// cannot promote against a different tenant via body.tenant.
+func TestPolicyPromote_CrossTenantForbidden(t *testing.T) {
+	t.Parallel()
+	cfg, store, _ := newPolicyAdminCfg(t)
+	d, _ := store.CreateDraft(context.Background(), policystore.Draft{
+		Name: "globex-v1", RegoSource: policyTestRego, Tenant: "globex",
+	})
+	h := NewAdminPromoteHandler(cfg)
+
+	// acme-tok holder tries to promote against globex — 403.
+	w := doReq(t, h, http.MethodPost, "/v1/admin/policies/active", "acme-tok",
+		map[string]any{"draft_id": d.ID, "tenant": "globex"}, nil)
 	if w.Code != http.StatusForbidden {
-		t.Fatalf("per-tenant promote: status = %d, want 403; body=%s", w.Code, w.Body.String())
+		t.Fatalf("cross-tenant promote should be 403, got %d; body=%s", w.Code, w.Body.String())
 	}
 }
 
@@ -280,7 +322,7 @@ func TestPolicyRollback_RestoresPrevious(t *testing.T) {
 	cfg, store, reloader := newPolicyAdminCfg(t)
 	d1, _ := store.CreateDraft(context.Background(), policystore.Draft{Name: "v1", RegoSource: policyTestRego})
 	d2, _ := store.CreateDraft(context.Background(), policystore.Draft{Name: "v2", RegoSource: policyTestRegoV2})
-	_, _ = store.Promote(context.Background(), d1.ID, "")
+	_, _ = store.Promote(context.Background(), d1.ID, "", "")
 	// Promote v2 via the handler so the live engine sees v2.
 	promoteH := NewAdminPromoteHandler(cfg)
 	w := doReq(t, promoteH, http.MethodPost, "/v1/admin/policies/active", "super",
@@ -309,7 +351,7 @@ func TestPolicyRollback_RestoresPrevious(t *testing.T) {
 	}
 
 	// And the store-level pointer matches.
-	active, _ := store.GetActive(context.Background())
+	active, _ := store.GetActive(context.Background(), "")
 	if active.CurrentDraftID != d1.ID || active.PreviousDraftID != "" {
 		t.Fatalf("after rollback: current=%q previous=%q want d1=%q previous=empty",
 			active.CurrentDraftID, active.PreviousDraftID, d1.ID)

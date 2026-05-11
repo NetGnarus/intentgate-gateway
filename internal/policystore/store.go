@@ -99,20 +99,29 @@ type Draft struct {
 	CreatedBy string `json:"created_by,omitempty"`
 }
 
-// Active is the gateway's active-policy pointer. There is exactly
-// one row per gateway install (PK fixed at the literal "global" —
-// see schema.sql for the reasoning).
+// Active is one tenant's active-policy pointer. The store holds
+// one row per tenant (empty Tenant = the default fallback row that
+// applies to every tenant without their own promoted policy).
+//
+// The v1.4 design used a single 'global' row for the whole gateway;
+// v1.5 evolves it into a per-tenant key while preserving the v1.4
+// semantic for the empty-tenant slot. Operationally, that means:
+//
+//   - Single-tenant deployment: keep promoting against the default
+//     slot (tenant=""), behavior is identical to v1.4.
+//   - Multi-tenant deployment: per-tenant admins promote against
+//     their own tenant slot; the gateway evaluates each request's
+//     policy against the tenant's promoted module, falling back to
+//     the default slot when the tenant hasn't promoted anything.
 //
 // CurrentDraftID points at the draft whose RegoSource the gateway
-// currently has compiled. Empty means "use the embedded default" —
-// the fallback for a fresh install that has never promoted.
-//
-// PreviousDraftID is rollback's one-step target. Empty after the
-// very first promote (nothing to roll back to). Cleared after a
-// rollback (so two consecutive rollbacks are a no-op rather than
-// ping-ponging forever).
+// has compiled for this tenant. Empty means "fall back to the
+// default slot" (or, when this IS the default slot, "use the
+// embedded default / file policy installed at startup").
 type Active struct {
-	// CurrentDraftID is what's compiled in the gateway right now.
+	// Tenant scopes the active pointer. Empty = default fallback.
+	Tenant string `json:"tenant,omitempty"`
+	// CurrentDraftID is what's compiled for this tenant right now.
 	CurrentDraftID string `json:"current_draft_id,omitempty"`
 	// PreviousDraftID is the rollback target. Empty when there is
 	// nothing to roll back to.
@@ -140,10 +149,12 @@ func (a Active) MarshalJSON() ([]byte, error) {
 		// trigger (the time itself is zero, but Format(RFC3339)
 		// produces "0001-...", so we need the explicit alias path).
 		return json.Marshal(struct {
+			Tenant          string `json:"tenant,omitempty"`
 			CurrentDraftID  string `json:"current_draft_id,omitempty"`
 			PreviousDraftID string `json:"previous_draft_id,omitempty"`
 			PromotedBy      string `json:"promoted_by,omitempty"`
 		}{
+			Tenant:          a.Tenant,
 			CurrentDraftID:  a.CurrentDraftID,
 			PreviousDraftID: a.PreviousDraftID,
 			PromotedBy:      a.PromotedBy,
@@ -201,21 +212,37 @@ type Store interface {
 
 	// DeleteDraft removes a draft by ID. Returns ErrNotFound if the
 	// ID is unknown, ErrActiveDraftDelete if the row is referenced
-	// by the active-policy pointer (current OR previous).
+	// by ANY tenant's active-policy pointer (current OR previous).
+	// The active-reference check sweeps every per-tenant row so a
+	// draft pinned by another tenant's pointer is also protected.
 	DeleteDraft(ctx context.Context, id string) error
 
-	// GetActive returns the active-policy pointer. Always returns a
-	// zero-value Active (with no error) when nothing has been
-	// promoted yet — the caller distinguishes "no active set" via
-	// CurrentDraftID == "".
-	GetActive(ctx context.Context) (Active, error)
+	// GetActive returns the active-policy pointer for the given
+	// tenant. Empty tenant returns the default-fallback row that
+	// applies to every tenant without their own promoted policy
+	// (the v1.4 "global" row in the new schema).
+	//
+	// Always returns a zero-value Active (with no error) when
+	// nothing has been promoted yet for that tenant — the caller
+	// distinguishes "no active set" via CurrentDraftID == "".
+	GetActive(ctx context.Context, tenant string) (Active, error)
 
-	// Promote sets the active-policy pointer to draftID. The
-	// existing CurrentDraftID (if any) becomes PreviousDraftID, so
-	// one rollback step is always available immediately after a
-	// promote.
+	// ListActive returns every tenant's active-policy pointer.
+	// Used at startup so main.go can hydrate the reloader's full
+	// map of engines in one pass instead of N round-trips per
+	// configured tenant. Returns rows ordered by tenant (empty
+	// first so the default fallback is processed before per-tenant
+	// overlays, which is the order the reloader expects for clean
+	// fallback dispatch when a tenant has no row yet).
+	ListActive(ctx context.Context) ([]Active, error)
+
+	// Promote sets the active-policy pointer for the given tenant
+	// to draftID. The existing CurrentDraftID (if any) becomes
+	// PreviousDraftID, so one rollback step is always available
+	// immediately after a promote.
 	//
 	// promotedBy is the operator label for the active row.
+	// Empty tenant operates on the default-fallback row.
 	//
 	// Returns ErrNotFound if draftID isn't a known draft. The
 	// implementation MUST validate this inside the same transaction
@@ -225,17 +252,18 @@ type Store interface {
 	// Idempotent in spirit: promoting the already-current draft is
 	// a no-op (no audit event, no PromotedAt update). Implementations
 	// detect this and return the unchanged Active without writing.
-	Promote(ctx context.Context, draftID, promotedBy string) (Active, error)
+	Promote(ctx context.Context, draftID, promotedBy, tenant string) (Active, error)
 
 	// Rollback swaps Current and Previous on the active-policy
-	// pointer, then clears Previous (so two consecutive rollbacks
-	// don't ping-pong). Returns ErrNotFound when PreviousDraftID is
-	// empty — there is nothing to roll back to.
+	// pointer for the given tenant, then clears Previous (so two
+	// consecutive rollbacks don't ping-pong). Returns ErrNotFound
+	// when PreviousDraftID is empty — there is nothing to roll
+	// back to. Empty tenant operates on the default-fallback row.
 	//
 	// rolledBackBy is captured into PromotedBy on the active row,
 	// with the convention that the audit-log entry will distinguish
 	// rollback from promote.
-	Rollback(ctx context.Context, rolledBackBy string) (Active, error)
+	Rollback(ctx context.Context, rolledBackBy, tenant string) (Active, error)
 
 	// Watch subscribes to active-pointer changes for the lifetime of
 	// ctx. The returned channel delivers one [Active] value per

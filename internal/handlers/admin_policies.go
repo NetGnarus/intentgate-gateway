@@ -409,6 +409,8 @@ type activeResponse struct {
 	//   "embedded" — embedded default (no promote has happened)
 	//   "file"     — INTENTGATE_POLICY_FILE was set at startup
 	//   "draft"    — a promoted draft (Active.CurrentDraftID set)
+	//   "fallback" — this tenant hasn't promoted; the default-
+	//                fallback slot's draft serves their requests
 	// Computed by the handler from the active pointer + the
 	// gateway's startup config; the console renders a badge keyed
 	// off this string.
@@ -416,6 +418,19 @@ type activeResponse struct {
 }
 
 // NewAdminActiveGetHandler returns GET /v1/admin/policies/active.
+//
+// Tenant scoping:
+//
+//   - Per-tenant admin: tenant is forced from the resolved token;
+//     ?tenant= disagreeing returns 403.
+//   - Superadmin: ?tenant=X scopes to X; omitted/empty returns the
+//     default-fallback row.
+//
+// When the requested tenant has no promoted policy of its own but
+// the default-fallback row IS populated, the response reports
+// source="fallback" along with the fallback draft so the console
+// can render "you're seeing the default-fallback policy because
+// this tenant hasn't promoted one".
 func NewAdminActiveGetHandler(cfg PolicyAdminConfig, startupSource string) http.Handler {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
@@ -433,7 +448,17 @@ func NewAdminActiveGetHandler(cfg PolicyAdminConfig, startupSource string) http.
 			return
 		}
 
-		a, err := cfg.Store.GetActive(r.Context())
+		tenant := r.URL.Query().Get("tenant")
+		if auth.tenant != "" {
+			if tenant != "" && tenant != auth.tenant {
+				adminError(w, http.StatusForbidden,
+					"tenant in query does not match admin token's tenant")
+				return
+			}
+			tenant = auth.tenant
+		}
+
+		a, err := cfg.Store.GetActive(r.Context(), tenant)
 		if err != nil {
 			cfg.Logger.Error("active get failed", "err", err)
 			adminError(w, http.StatusServiceUnavailable, "store error: "+err.Error())
@@ -446,6 +471,17 @@ func NewAdminActiveGetHandler(cfg PolicyAdminConfig, startupSource string) http.
 				resp.CurrentDraft = &d
 			}
 			resp.Source = "draft"
+		} else if tenant != "" {
+			// This tenant hasn't promoted. If the default-fallback
+			// row has a draft, that's what the gateway evaluates
+			// their requests against — surface it.
+			def, derr := cfg.Store.GetActive(r.Context(), "")
+			if derr == nil && def.CurrentDraftID != "" {
+				if d, gerr := cfg.Store.GetDraft(r.Context(), def.CurrentDraftID); gerr == nil {
+					resp.CurrentDraft = &d
+				}
+				resp.Source = "fallback"
+			}
 		}
 		if a.PreviousDraftID != "" {
 			d, err := cfg.Store.GetDraft(r.Context(), a.PreviousDraftID)
@@ -457,19 +493,30 @@ func NewAdminActiveGetHandler(cfg PolicyAdminConfig, startupSource string) http.
 	})
 }
 
-// promoteBody is the request shape for POST /v1/admin/policies/active.
-type promoteBody struct {
+// (promoteBody removed in v1.5; the per-tenant variant
+// promoteBodyWithTenant lives near NewAdminPromoteHandler above.)
+
+// promoteBody adds an optional tenant field so superadmins can
+// promote against any tenant's slot. Per-tenant admins have their
+// tenant forced from the resolved token; cross-tenant attempts
+// return 403 the same way the mint handler does.
+type promoteBodyWithTenant struct {
 	DraftID    string `json:"draft_id"`
 	PromotedBy string `json:"promoted_by"`
+	Tenant     string `json:"tenant,omitempty"`
 }
 
 // NewAdminPromoteHandler returns POST /v1/admin/policies/active.
 //
 // Compiles the target draft's Rego, swaps it into the live
-// Reloader, writes the active-pointer row, emits an audit event.
-// Superadmin-only — per-tenant admins return 403 because the
-// gateway runs a single global policy engine in v1.4. Per-tenant
-// promote is a planned follow-on (see policystore docs).
+// Reloader's per-tenant slot, writes the active-pointer row,
+// emits an audit event. Per-tenant admins promote against their
+// own tenant; superadmins promote against body.tenant (defaulting
+// to the empty/default-fallback slot, preserving v1.4 single-
+// tenant behavior).
+//
+// Cross-tenant attempts by per-tenant admins return 403 — the
+// resolved tenant from the constant-time admin auth wins.
 func NewAdminPromoteHandler(cfg PolicyAdminConfig) http.Handler {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
@@ -485,11 +532,6 @@ func NewAdminPromoteHandler(cfg PolicyAdminConfig) http.Handler {
 			adminError(w, http.StatusUnauthorized, "invalid or missing admin token")
 			return
 		}
-		if auth.tenant != "" {
-			adminError(w, http.StatusForbidden,
-				"promote requires the superadmin token; the gateway runs a single global policy engine in v1.4")
-			return
-		}
 		if cfg.Store == nil {
 			adminError(w, http.StatusServiceUnavailable, "policy store not configured")
 			return
@@ -500,7 +542,7 @@ func NewAdminPromoteHandler(cfg PolicyAdminConfig) http.Handler {
 			return
 		}
 
-		var body promoteBody
+		var body promoteBodyWithTenant
 		dec := json.NewDecoder(io.LimitReader(r.Body, 1<<16))
 		dec.DisallowUnknownFields()
 		if err := dec.Decode(&body); err != nil {
@@ -512,12 +554,23 @@ func NewAdminPromoteHandler(cfg PolicyAdminConfig) http.Handler {
 			return
 		}
 
+		// Tenant resolution: per-tenant admin's tenant wins; body
+		// tenant disagreement returns 403. Superadmin honors body
+		// verbatim (empty body.tenant = the default-fallback slot,
+		// which preserves the v1.4 single-engine semantic).
+		tenant := strings.TrimSpace(body.Tenant)
+		if auth.tenant != "" {
+			if tenant != "" && tenant != auth.tenant {
+				adminError(w, http.StatusForbidden,
+					"tenant in body does not match admin token's tenant")
+				return
+			}
+			tenant = auth.tenant
+		}
+
 		// Load draft + compile BEFORE we touch the active pointer.
 		// If the compile fails, we want to leave the gateway running
 		// the prior policy and surface the error to the operator.
-		// (Drafts were compile-checked at save time too, but rego
-		// dependencies on external data could theoretically have
-		// drifted; cheap insurance.)
 		d, err := cfg.Store.GetDraft(r.Context(), body.DraftID)
 		if errors.Is(err, policystore.ErrNotFound) {
 			adminError(w, http.StatusNotFound, "draft not found")
@@ -528,16 +581,23 @@ func NewAdminPromoteHandler(cfg PolicyAdminConfig) http.Handler {
 			adminError(w, http.StatusServiceUnavailable, "store error: "+err.Error())
 			return
 		}
+		// Cross-tenant draft selection by a per-tenant admin is also
+		// a 404 (don't leak existence). A superadmin promoting a
+		// draft from any tenant onto any tenant's slot is allowed —
+		// drafts are tenant-scoped storage, but the active pointer
+		// is just a reference to compiled Rego, not a tenant claim.
+		if auth.tenant != "" && d.Tenant != auth.tenant {
+			adminError(w, http.StatusNotFound, "draft not found")
+			return
+		}
 		newEngine, err := policy.NewEngine(r.Context(), d.RegoSource)
 		if err != nil {
 			adminError(w, http.StatusBadRequest, "rego compile error: "+err.Error())
 			return
 		}
 
-		active, err := cfg.Store.Promote(r.Context(), body.DraftID, body.PromotedBy)
+		active, err := cfg.Store.Promote(r.Context(), body.DraftID, body.PromotedBy, tenant)
 		if errors.Is(err, policystore.ErrNotFound) {
-			// Race: a concurrent delete slipped between Get and
-			// Promote. Same effect as draft-not-found.
 			adminError(w, http.StatusNotFound, "draft not found")
 			return
 		}
@@ -548,34 +608,31 @@ func NewAdminPromoteHandler(cfg PolicyAdminConfig) http.Handler {
 		}
 
 		// Pointer write succeeded; flip the compiled engine on the
-		// hot path so subsequent requests evaluate against the new
-		// rules. Any in-flight evaluation against the prior engine
-		// stays correct (atomic.Pointer.Swap is non-blocking; Rego
-		// prepared queries are concurrent-safe).
-		if _, swapErr := cfg.Reloader.Swap(newEngine); swapErr != nil {
-			// Shouldn't happen (Swap returns error only on nil), but
-			// surface it so a misconfigured Reloader doesn't silently
-			// keep running the old policy after a successful promote.
+		// hot path so subsequent requests for this tenant evaluate
+		// against the new rules. SwapFor with empty tenant updates
+		// the default-fallback engine (v1.4 path); with a non-empty
+		// tenant it installs / updates that tenant's slot in the
+		// reloader's map.
+		if _, swapErr := cfg.Reloader.SwapFor(tenant, newEngine); swapErr != nil {
 			cfg.Logger.Error("reloader swap failed after promote",
-				"err", swapErr, "id", body.DraftID)
+				"err", swapErr, "id", body.DraftID, "tenant", tenant)
 			adminError(w, http.StatusInternalServerError,
 				"promote recorded but engine swap failed: "+swapErr.Error())
 			return
 		}
 
-		// Audit: include both the new and prior draft IDs so SOC can
-		// reconstruct who flipped what to what. We stuff the operator
-		// label into Reason rather than AgentID — Event.AgentID is the
-		// agent making a tool call; admin operations don't have one.
 		ev := audit.NewEvent(audit.DecisionAllow, "admin/promote_policy")
 		ev.Check = audit.CheckPolicy
-		ev.Reason = "policy promoted: draft=" + body.DraftID +
+		ev.Reason = "policy promoted: tenant=" + tenant +
+			" draft=" + body.DraftID +
 			" prior=" + active.PreviousDraftID +
 			" by=" + body.PromotedBy
+		ev.Tenant = tenant
 		ev.RemoteIP = r.RemoteAddr
 		cfg.Audit.Emit(r.Context(), ev)
 
 		cfg.Logger.Info("policy promoted",
+			"tenant", tenant,
 			"draft_id", body.DraftID, "previous_draft_id", active.PreviousDraftID,
 			"promoted_by", body.PromotedBy)
 
@@ -590,13 +647,16 @@ func NewAdminPromoteHandler(cfg PolicyAdminConfig) http.Handler {
 // rollbackBody is the request shape for POST /v1/admin/policies/rollback.
 type rollbackBody struct {
 	RolledBackBy string `json:"rolled_back_by"`
+	Tenant       string `json:"tenant,omitempty"`
 }
 
 // NewAdminRollbackHandler returns POST /v1/admin/policies/rollback.
 //
-// Swaps Current ↔ Previous on the active pointer, recompiles the
-// target draft's source, swaps the live engine. Superadmin-only.
-// Returns 404 when there is nothing to roll back to.
+// Swaps Current ↔ Previous on the given tenant's active pointer,
+// recompiles the target draft's source, swaps the live engine in
+// that tenant's reloader slot. Per-tenant admins rollback their
+// own tenant; superadmins specify body.tenant (empty = default
+// fallback). Returns 404 when there is nothing to roll back to.
 func NewAdminRollbackHandler(cfg PolicyAdminConfig) http.Handler {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
@@ -612,11 +672,6 @@ func NewAdminRollbackHandler(cfg PolicyAdminConfig) http.Handler {
 			adminError(w, http.StatusUnauthorized, "invalid or missing admin token")
 			return
 		}
-		if auth.tenant != "" {
-			adminError(w, http.StatusForbidden,
-				"rollback requires the superadmin token")
-			return
-		}
 		if cfg.Store == nil {
 			adminError(w, http.StatusServiceUnavailable, "policy store not configured")
 			return
@@ -630,14 +685,24 @@ func NewAdminRollbackHandler(cfg PolicyAdminConfig) http.Handler {
 		var body rollbackBody
 		dec := json.NewDecoder(io.LimitReader(r.Body, 1<<16))
 		dec.DisallowUnknownFields()
-		// Empty body is fine — rolled_back_by is optional.
+		// Empty body is fine — both fields are optional.
 		_ = dec.Decode(&body)
 
+		tenant := strings.TrimSpace(body.Tenant)
+		if auth.tenant != "" {
+			if tenant != "" && tenant != auth.tenant {
+				adminError(w, http.StatusForbidden,
+					"tenant in body does not match admin token's tenant")
+				return
+			}
+			tenant = auth.tenant
+		}
+
 		// Read active first so we can fetch the target draft before
-		// the rollback flips the pointer. (We could read it after,
-		// but doing it before lets us compile-fail cleanly without
-		// leaving the active pointer in an inconsistent state.)
-		current, err := cfg.Store.GetActive(r.Context())
+		// the rollback flips the pointer. Doing it before lets us
+		// compile-fail cleanly without leaving the active pointer
+		// in an inconsistent state.
+		current, err := cfg.Store.GetActive(r.Context(), tenant)
 		if err != nil {
 			cfg.Logger.Error("rollback get active failed", "err", err)
 			adminError(w, http.StatusServiceUnavailable, "store error: "+err.Error())
@@ -666,7 +731,7 @@ func NewAdminRollbackHandler(cfg PolicyAdminConfig) http.Handler {
 			return
 		}
 
-		active, err := cfg.Store.Rollback(r.Context(), body.RolledBackBy)
+		active, err := cfg.Store.Rollback(r.Context(), body.RolledBackBy, tenant)
 		if errors.Is(err, policystore.ErrNotFound) {
 			// Race: someone else rolled back between our read and
 			// our write.
@@ -680,8 +745,9 @@ func NewAdminRollbackHandler(cfg PolicyAdminConfig) http.Handler {
 			return
 		}
 
-		if _, swapErr := cfg.Reloader.Swap(newEngine); swapErr != nil {
-			cfg.Logger.Error("reloader swap failed after rollback", "err", swapErr)
+		if _, swapErr := cfg.Reloader.SwapFor(tenant, newEngine); swapErr != nil {
+			cfg.Logger.Error("reloader swap failed after rollback",
+				"err", swapErr, "tenant", tenant)
 			adminError(w, http.StatusInternalServerError,
 				"rollback recorded but engine swap failed: "+swapErr.Error())
 			return
@@ -689,12 +755,15 @@ func NewAdminRollbackHandler(cfg PolicyAdminConfig) http.Handler {
 
 		ev := audit.NewEvent(audit.DecisionAllow, "admin/rollback_policy")
 		ev.Check = audit.CheckPolicy
-		ev.Reason = "policy rolled back to: draft=" + active.CurrentDraftID +
+		ev.Reason = "policy rolled back to: tenant=" + tenant +
+			" draft=" + active.CurrentDraftID +
 			" by=" + body.RolledBackBy
+		ev.Tenant = tenant
 		ev.RemoteIP = r.RemoteAddr
 		cfg.Audit.Emit(r.Context(), ev)
 
 		cfg.Logger.Info("policy rolled back",
+			"tenant", tenant,
 			"new_current_draft_id", active.CurrentDraftID,
 			"rolled_back_by", body.RolledBackBy)
 
