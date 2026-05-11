@@ -147,6 +147,7 @@ import (
 	"github.com/NetGnarus/intentgate-gateway/internal/server"
 	"github.com/NetGnarus/intentgate-gateway/internal/siem"
 	"github.com/NetGnarus/intentgate-gateway/internal/upstream"
+	"github.com/NetGnarus/intentgate-gateway/internal/webhook"
 	"github.com/redis/go-redis/v9"
 
 	"go.opentelemetry.io/otel"
@@ -192,6 +193,14 @@ func main() {
 	sentinelTenantID := envOr("INTENTGATE_SIEM_SENTINEL_TENANT_ID", "")
 	sentinelClientID := envOr("INTENTGATE_SIEM_SENTINEL_CLIENT_ID", "")
 	sentinelClientSecret := envOr("INTENTGATE_SIEM_SENTINEL_CLIENT_SECRET", "")
+	// Webhook fan-out (Pro v2 #3). URL is the operator-configured
+	// receiver — typically a console-pro endpoint that re-routes
+	// per-tenant to Slack / Teams / PagerDuty. Empty disables the
+	// emitter entirely (no Pro tier check at the gateway layer;
+	// console-pro gates which channels the operator can configure).
+	webhookURL := envOr("INTENTGATE_WEBHOOK_URL", "")
+	webhookSecret := envOr("INTENTGATE_WEBHOOK_SECRET", "")
+	webhookEventsRaw := envOr("INTENTGATE_WEBHOOK_EVENTS", "")
 	approvalsBackend := envOr("INTENTGATE_APPROVALS_BACKEND", "memory")
 	approvalTimeoutS := envOr("INTENTGATE_APPROVAL_TIMEOUT_S", "300")
 	// Policy-store backend: "off" disables the draft + promote /
@@ -284,6 +293,21 @@ func main() {
 		auditEmitter = audit.NewFanOut(all...)
 		auditDesc = auditDesc + "+" + siemDesc
 	}
+
+	// Webhook emitter (Pro v2 #3). Peer of the SIEM emitters in the
+	// fan-out: same Emit-must-not-block contract, separate buffer
+	// and worker, dropped events surface as counters on the admin
+	// /v1/admin/integrations response.
+	webhookEmitter, webhookDesc, err := loadWebhook(logger, webhookURL, webhookSecret, webhookEventsRaw)
+	if err != nil {
+		logger.Error("failed to initialize webhook emitter", "err", err)
+		os.Exit(1)
+	}
+	if webhookEmitter != nil {
+		auditEmitter = audit.NewFanOut(auditEmitter, webhookEmitter)
+		auditDesc = auditDesc + "+" + webhookDesc
+	}
+
 	defer func() {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -293,6 +317,9 @@ func main() {
 			if s, ok := e.(siem.Stoppable); ok {
 				_ = s.Stop(shutdownCtx)
 			}
+		}
+		if webhookEmitter != nil {
+			_ = webhookEmitter.Stop(shutdownCtx)
 		}
 		if auditStoreEmitter != nil {
 			_ = auditStoreEmitter.Stop(shutdownCtx)
@@ -743,6 +770,56 @@ func loadSIEM(logger *slog.Logger, env siemEnv) ([]audit.Emitter, []siem.StatusR
 		desc = strings.Join(labels, ",")
 	}
 	return emitters, reporters, desc, nil
+}
+
+// loadWebhook constructs the optional webhook emitter. Returns
+// (nil, "disabled", nil) when INTENTGATE_WEBHOOK_URL is unset —
+// webhook fan-out is fully opt-in. When the URL IS set, we
+// validate the secret (warning when empty, since unsigned webhooks
+// can be spoofed by anyone who knows the receiver URL) and parse
+// the optional events allowlist.
+func loadWebhook(logger *slog.Logger, url, secret, eventsRaw string) (*webhook.Emitter, string, error) {
+	if strings.TrimSpace(url) == "" {
+		return nil, "disabled", nil
+	}
+	parsedSecret, err := webhook.MustParseSecret(secret)
+	if err != nil {
+		return nil, "", fmt.Errorf("INTENTGATE_WEBHOOK_SECRET: %w", err)
+	}
+	if len(parsedSecret) == 0 {
+		logger.Warn("webhook configured without a signing secret; receivers cannot verify authenticity",
+			"hint", "set INTENTGATE_WEBHOOK_SECRET to a 32-byte hex string")
+	}
+
+	sink, err := webhook.NewHTTPSink(webhook.HTTPSinkConfig{
+		URL:    url,
+		Secret: parsedSecret,
+		Logger: logger,
+	})
+	if err != nil {
+		return nil, "", fmt.Errorf("webhook sink: %w", err)
+	}
+
+	var allowed []string
+	if eventsRaw != "" {
+		for _, s := range strings.Split(eventsRaw, ",") {
+			if s = strings.TrimSpace(s); s != "" {
+				allowed = append(allowed, s)
+			}
+		}
+	}
+
+	em := webhook.NewEmitter(webhook.EmitterConfig{
+		Sink:   sink,
+		Filter: webhook.DefaultFilter(allowed),
+		Logger: logger,
+	})
+	logger.Info("webhook emitter configured",
+		"url", url,
+		"signed", len(parsedSecret) > 0,
+		"events_filter", eventsRaw,
+	)
+	return em, "webhook", nil
 }
 
 // loadAuditStore constructs the optional Postgres-backed audit store
