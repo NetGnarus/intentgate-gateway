@@ -1027,13 +1027,18 @@ func watchAndReloadPolicy(ctx context.Context, logger *slog.Logger, store policy
 
 	for active := range ch {
 		if active.CurrentDraftID == "" {
-			// The active pointer was cleared for this tenant
-			// (shouldn't happen via the admin API today, but handle
-			// it gracefully). Leave the live engine alone — the
-			// fallback engine will serve requests for tenants that
-			// don't have their own slot once we wire RemoveFor.
-			logger.Info("policy watcher: active pointer cleared; keeping current engine",
-				"tenant", active.Tenant)
+			// DeleteActive signal. For a per-tenant slot, drop it
+			// so subsequent requests from that tenant fall back to
+			// the default. For the default-fallback slot, no-op:
+			// clearing the default would leave the gateway with
+			// nothing to serve — the store's DeleteActive enforces
+			// that on the write path too, but defense-in-depth.
+			if active.Tenant != "" {
+				reloader.RemoveFor(active.Tenant)
+				delete(lastApplied, active.Tenant)
+				logger.Info("policy watcher: tenant slot cleared from sibling replica",
+					"tenant", active.Tenant)
+			}
 			continue
 		}
 		if active.CurrentDraftID == lastApplied[active.Tenant] {

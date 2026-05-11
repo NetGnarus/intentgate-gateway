@@ -256,6 +256,7 @@ func New(cfg Config) *http.Server {
 			mux.Handle("DELETE /v1/admin/policies/drafts/{id}", handlers.NewAdminDraftDeleteHandler(policyAdminCfg))
 			mux.Handle("GET /v1/admin/policies/active", handlers.NewAdminActiveGetHandler(policyAdminCfg, cfg.PolicySource))
 			mux.Handle("POST /v1/admin/policies/active", handlers.NewAdminPromoteHandler(policyAdminCfg))
+			mux.Handle("DELETE /v1/admin/policies/active", handlers.NewAdminActiveDeleteHandler(policyAdminCfg))
 			mux.Handle("POST /v1/admin/policies/rollback", handlers.NewAdminRollbackHandler(policyAdminCfg))
 		}
 	}

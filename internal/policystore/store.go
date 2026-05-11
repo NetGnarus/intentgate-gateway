@@ -265,6 +265,31 @@ type Store interface {
 	// rollback from promote.
 	Rollback(ctx context.Context, rolledBackBy, tenant string) (Active, error)
 
+	// DeleteActive clears the tenant's active-policy pointer row
+	// entirely. Requests from that tenant resume falling back to
+	// the default-fallback slot (or, when this IS the default-
+	// fallback slot, to the embedded / file policy installed at
+	// startup). Useful when an operator has promoted a tenant-
+	// specific policy and now wants to "revert to platform default"
+	// without rolling back through their previous drafts one step
+	// at a time.
+	//
+	// Empty tenant on the default-fallback row is a no-op (the row
+	// is seeded by the migration and we don't want to leave the
+	// gateway with no default-fallback row at all). Callers that
+	// want to "reset" the default-fallback slot should promote a
+	// fresh draft instead.
+	//
+	// Idempotent: clearing an already-empty / nonexistent row is
+	// not an error — returns the zero-valued Active so the caller
+	// can use the result as the post-state without checking error
+	// kinds.
+	//
+	// Cross-replica: the Postgres implementation fires a NOTIFY
+	// with a payload signaling the slot was cleared so sibling
+	// replicas know to call Reloader.RemoveFor for that tenant.
+	DeleteActive(ctx context.Context, tenant string) (Active, error)
+
 	// Watch subscribes to active-pointer changes for the lifetime of
 	// ctx. The returned channel delivers one [Active] value per
 	// observed change; callers fetch the corresponding draft via

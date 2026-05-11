@@ -318,3 +318,27 @@ func (s *MemoryStore) Rollback(_ context.Context, rolledBackBy, tenant string) (
 	s.notifyWatchers(next)
 	return next, nil
 }
+
+// DeleteActive clears the tenant's active-policy pointer row.
+// Empty tenant is a no-op (we don't want to leave the default-
+// fallback slot without a row in the table). Idempotent: clearing
+// an empty row returns the zero-value Active without error.
+//
+// Fan-out: subscribers receive an Active with empty CurrentDraftID
+// and the affected tenant; the watcher in main.go treats that
+// payload as a "drop the slot" signal and calls Reloader.RemoveFor.
+func (s *MemoryStore) DeleteActive(_ context.Context, tenant string) (Active, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if tenant == "" {
+		// No-op: the default-fallback row is special. To "reset" it
+		// the operator promotes a different draft.
+		return s.active[""], nil
+	}
+
+	cleared := Active{Tenant: tenant}
+	delete(s.active, tenant)
+	s.notifyWatchers(cleared)
+	return cleared, nil
+}

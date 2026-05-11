@@ -358,6 +358,59 @@ func TestPolicyRollback_RestoresPrevious(t *testing.T) {
 	}
 }
 
+// TestPolicyClearActive: a per-tenant admin can DELETE their own
+// tenant's active slot. The reloader's per-tenant slot is removed;
+// the default-fallback engine takes over for that tenant's
+// subsequent requests (which we verify by checking CurrentFor
+// before and after).
+func TestPolicyClearActive(t *testing.T) {
+	t.Parallel()
+	cfg, store, reloader := newPolicyAdminCfg(t)
+	d, _ := store.CreateDraft(context.Background(), policystore.Draft{
+		Name: "acme-v1", RegoSource: policyTestRegoV2, Tenant: "acme",
+	})
+	// Pre-state: acme has a promoted policy.
+	promoteH := NewAdminPromoteHandler(cfg)
+	w := doReq(t, promoteH, http.MethodPost, "/v1/admin/policies/active", "acme-tok",
+		map[string]any{"draft_id": d.ID}, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("pre-state promote: %d", w.Code)
+	}
+	if reloader.CurrentFor("acme") == reloader.Current() {
+		t.Fatal("after promote, acme slot should differ from default")
+	}
+
+	clearH := NewAdminActiveDeleteHandler(cfg)
+	w = doReq(t, clearH, http.MethodDelete, "/v1/admin/policies/active", "acme-tok", nil, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("clear active: status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+
+	// Acme requests now evaluate against the default engine.
+	if reloader.CurrentFor("acme") != reloader.Current() {
+		t.Errorf("after DeleteActive, acme should fall back to default engine")
+	}
+	// Store row is gone.
+	a, _ := store.GetActive(context.Background(), "acme")
+	if a.CurrentDraftID != "" {
+		t.Errorf("after DeleteActive, store should report empty acme active, got %q", a.CurrentDraftID)
+	}
+}
+
+// TestPolicyClearActive_CrossTenantForbidden: per-tenant admin
+// can't clear another tenant's slot via ?tenant=.
+func TestPolicyClearActive_CrossTenantForbidden(t *testing.T) {
+	t.Parallel()
+	cfg, _, _ := newPolicyAdminCfg(t)
+	mux := http.NewServeMux()
+	mux.Handle("DELETE /v1/admin/policies/active", NewAdminActiveDeleteHandler(cfg))
+	w := doReq(t, mux, http.MethodDelete,
+		"/v1/admin/policies/active?tenant=globex", "acme-tok", nil, nil)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("cross-tenant clear should be 403, got %d; body=%s", w.Code, w.Body.String())
+	}
+}
+
 func TestPolicyActive_Source(t *testing.T) {
 	t.Parallel()
 	cfg, _, _ := newPolicyAdminCfg(t)

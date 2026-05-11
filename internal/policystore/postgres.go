@@ -664,12 +664,50 @@ func (s *PostgresStore) Rollback(ctx context.Context, rolledBackBy, tenant strin
 	}, nil
 }
 
+// DeleteActive clears the tenant's active-policy pointer. Empty
+// tenant is a no-op (matches the Memory implementation).
+//
+// NOTIFY emits with an empty draft_id portion of the payload
+// (e.g. "acme\x1E") so the listener can tell this is a "slot
+// cleared" event rather than a promote/rollback, and dispatch to
+// Reloader.RemoveFor on the receiving side. Cross-replica
+// listeners that don't yet handle that case fall back to
+// re-reading the row and finding CurrentDraftID="", which the
+// main.go watcher already treats as a no-op.
+func (s *PostgresStore) DeleteActive(ctx context.Context, tenant string) (Active, error) {
+	if tenant == "" {
+		return s.GetActive(ctx, "")
+	}
+
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return Active{}, fmt.Errorf("policystore: delete active begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM policy_active WHERE tenant = $1`, tenant,
+	); err != nil {
+		return Active{}, fmt.Errorf("policystore: delete active: %w", err)
+	}
+	if _, err := tx.Exec(ctx, "SELECT pg_notify($1, $2)",
+		notifyChannel, encodeNotifyPayload(tenant, "")); err != nil {
+		return Active{}, fmt.Errorf("policystore: delete active notify: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Active{}, fmt.Errorf("policystore: delete active commit: %w", err)
+	}
+	return Active{Tenant: tenant}, nil
+}
+
 // encodeNotifyPayload packs (tenant, draft_id) into a single
 // pg_notify payload string. Format: "tenant\x1Edraft_id" — using
 // the ASCII Record Separator control char as a delimiter so it
 // can't appear inside either field (draft IDs are hex, tenant
-// names are operator-configured plain text). The listener side
-// uses [decodeNotifyPayload] to split.
+// names are operator-configured plain text). An empty draft_id
+// signals "slot cleared" (DeleteActive); the listener checks for
+// that and dispatches to Reloader.RemoveFor on the receiving side.
+// The listener side uses [decodeNotifyPayload] to split.
 func encodeNotifyPayload(tenant, draftID string) string {
 	return tenant + "\x1E" + draftID
 }

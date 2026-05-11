@@ -548,6 +548,102 @@ func TestMemoryStore_ListActiveOrdersDefaultFirst(t *testing.T) {
 	}
 }
 
+// TestMemoryStore_DeleteActiveClearsTenantSlot proves DeleteActive
+// removes the tenant's row entirely so a subsequent GetActive
+// returns the zero-value Active. Other tenants' rows are unaffected.
+func TestMemoryStore_DeleteActiveClearsTenantSlot(t *testing.T) {
+	t.Parallel()
+	s := NewMemoryStore()
+	ctx := context.Background()
+
+	a, _ := s.CreateDraft(ctx, Draft{Name: "acme-v1", RegoSource: validRego, Tenant: "acme"})
+	g, _ := s.CreateDraft(ctx, Draft{Name: "globex-v1", RegoSource: validRego2, Tenant: "globex"})
+	_, _ = s.Promote(ctx, a.ID, "", "acme")
+	_, _ = s.Promote(ctx, g.ID, "", "globex")
+
+	cleared, err := s.DeleteActive(ctx, "acme")
+	if err != nil {
+		t.Fatalf("delete active: %v", err)
+	}
+	if cleared.CurrentDraftID != "" {
+		t.Errorf("DeleteActive should return zero-value Active, got %+v", cleared)
+	}
+	if cleared.Tenant != "acme" {
+		t.Errorf("DeleteActive return should carry the cleared tenant, got %q", cleared.Tenant)
+	}
+
+	// Acme's row is gone.
+	acmeAfter, _ := s.GetActive(ctx, "acme")
+	if acmeAfter.CurrentDraftID != "" {
+		t.Errorf("acme active should be empty after DeleteActive, got %q", acmeAfter.CurrentDraftID)
+	}
+
+	// Globex's row survives.
+	globexAfter, _ := s.GetActive(ctx, "globex")
+	if globexAfter.CurrentDraftID != g.ID {
+		t.Errorf("globex active changed by acme DeleteActive: %q (want %q)",
+			globexAfter.CurrentDraftID, g.ID)
+	}
+}
+
+// TestMemoryStore_DeleteActiveEmptyTenantIsNoOp proves the default-
+// fallback slot is protected. Calling DeleteActive("") returns the
+// row unchanged so the gateway always has SOMETHING to serve as
+// the platform default.
+func TestMemoryStore_DeleteActiveEmptyTenantIsNoOp(t *testing.T) {
+	t.Parallel()
+	s := NewMemoryStore()
+	ctx := context.Background()
+
+	d, _ := s.CreateDraft(ctx, Draft{Name: "platform-default", RegoSource: validRego})
+	_, _ = s.Promote(ctx, d.ID, "", "")
+
+	before, _ := s.GetActive(ctx, "")
+	cleared, err := s.DeleteActive(ctx, "")
+	if err != nil {
+		t.Fatalf("delete active empty: %v", err)
+	}
+	// Cleared mirrors the row that's still there.
+	if cleared.CurrentDraftID != d.ID {
+		t.Errorf("DeleteActive('') should return the unchanged default row, got %+v", cleared)
+	}
+	after, _ := s.GetActive(ctx, "")
+	if after.CurrentDraftID != before.CurrentDraftID {
+		t.Errorf("DeleteActive('') changed the default row: before=%q after=%q",
+			before.CurrentDraftID, after.CurrentDraftID)
+	}
+}
+
+// TestMemoryStore_DeleteActiveFansOutClearSignal proves the watch
+// channel receives an Active with empty CurrentDraftID + the
+// affected tenant — the cross-replica signal main.go's watcher
+// uses to drop the tenant's reloader slot.
+func TestMemoryStore_DeleteActiveFansOutClearSignal(t *testing.T) {
+	t.Parallel()
+	s := NewMemoryStore()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	d, _ := s.CreateDraft(context.Background(), Draft{Name: "v1", RegoSource: validRego, Tenant: "acme"})
+	_, _ = s.Promote(context.Background(), d.ID, "", "acme")
+
+	ch, _ := s.Watch(ctx)
+	if _, err := s.DeleteActive(context.Background(), "acme"); err != nil {
+		t.Fatalf("delete active: %v", err)
+	}
+	select {
+	case got := <-ch:
+		if got.Tenant != "acme" {
+			t.Errorf("clear signal tenant = %q, want acme", got.Tenant)
+		}
+		if got.CurrentDraftID != "" {
+			t.Errorf("clear signal should carry empty CurrentDraftID, got %q", got.CurrentDraftID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Watch did not deliver clear signal within 1s")
+	}
+}
+
 // TestMemoryStore_DeleteRejectsCrossTenantActive proves the active-
 // reference sweep covers EVERY tenant's pointer — a draft pinned
 // as acme's previous can't be deleted via the globex admin path.

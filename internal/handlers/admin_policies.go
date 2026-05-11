@@ -496,6 +496,92 @@ func NewAdminActiveGetHandler(cfg PolicyAdminConfig, startupSource string) http.
 // (promoteBody removed in v1.5; the per-tenant variant
 // promoteBodyWithTenant lives near NewAdminPromoteHandler above.)
 
+// NewAdminActiveDeleteHandler returns DELETE /v1/admin/policies/active.
+//
+// Clears the caller's tenant slot in the policystore + the live
+// Reloader, so subsequent /v1/mcp requests from that tenant fall
+// back to the default-fallback policy. Useful for "revert this
+// tenant to platform default" without rolling back through every
+// previous draft.
+//
+// Tenant scoping mirrors the rest of the per-tenant admin API:
+//
+//   - Per-tenant admin: tenant forced from the resolved token;
+//     ?tenant= disagreeing returns 403.
+//   - Superadmin: ?tenant=X clears X's slot. ?tenant=  (empty) is
+//     a no-op on the store side (the default-fallback row is
+//     special) but still returns 200 with the current state — the
+//     console keys off this for the "revert to default" affordance.
+//
+// Emits an audit event so SOC has a record of the clear, same
+// pattern as promote/rollback.
+func NewAdminActiveDeleteHandler(cfg PolicyAdminConfig) http.Handler {
+	if cfg.Logger == nil {
+		cfg.Logger = slog.Default()
+	}
+	if cfg.Audit == nil {
+		cfg.Audit = audit.NewNullEmitter()
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		auth := resolveAdminAuth(r, cfg.adminConfig())
+		if !auth.ok {
+			adminError(w, http.StatusUnauthorized, "invalid or missing admin token")
+			return
+		}
+		if cfg.Store == nil {
+			adminError(w, http.StatusServiceUnavailable, "policy store not configured")
+			return
+		}
+		if cfg.Reloader == nil {
+			adminError(w, http.StatusServiceUnavailable, "policy reloader not configured")
+			return
+		}
+
+		tenant := strings.TrimSpace(r.URL.Query().Get("tenant"))
+		if auth.tenant != "" {
+			if tenant != "" && tenant != auth.tenant {
+				adminError(w, http.StatusForbidden,
+					"tenant in query does not match admin token's tenant")
+				return
+			}
+			tenant = auth.tenant
+		}
+
+		cleared, err := cfg.Store.DeleteActive(r.Context(), tenant)
+		if err != nil {
+			cfg.Logger.Error("active delete failed", "err", err, "tenant", tenant)
+			adminError(w, http.StatusServiceUnavailable, "store error: "+err.Error())
+			return
+		}
+
+		// Drop the local reloader slot too. The cross-replica
+		// listener handles sibling replicas via the NOTIFY emitted
+		// by DeleteActive. Empty tenant is a no-op on the reloader
+		// (RemoveFor("") is documented as a no-op).
+		if tenant != "" {
+			cfg.Reloader.RemoveFor(tenant)
+		}
+
+		// Audit: like promote/rollback, the operator label goes in
+		// Reason rather than AgentID.
+		ev := audit.NewEvent(audit.DecisionAllow, "admin/clear_policy")
+		ev.Check = audit.CheckPolicy
+		ev.Reason = "policy slot cleared: tenant=" + tenant
+		ev.Tenant = tenant
+		ev.RemoteIP = r.RemoteAddr
+		cfg.Audit.Emit(r.Context(), ev)
+
+		cfg.Logger.Info("policy slot cleared", "tenant", tenant)
+
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"cleared": cleared,
+			"swapped": tenant != "",
+		})
+	})
+}
+
 // promoteBody adds an optional tenant field so superadmins can
 // promote against any tenant's slot. Per-tenant admins have their
 // tenant forced from the resolved token; cross-tenant attempts
