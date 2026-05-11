@@ -1,0 +1,347 @@
+# Co-located benchmark Job for the IntentGate gateway.
+#
+# Runs vegeta IN-CLUSTER against the gateway Service, eliminating the
+# kubectl port-forward proxy from the path. This removes a known
+# confound from BENCHMARKS.md (see session 29 / chart 0.2.0 notes):
+# at 4k RPS the laptop run saturated, but the port-forward is itself
+# a single-connection userspace pipe and is not built for throughput
+# — so the cliff between 2k and 4k RPS might have been the proxy, not
+# the gateway. This Job answers that question without needing any
+# extra infra: it's just an apply-and-tail-the-logs cycle.
+#
+# What's deployed:
+#
+#   - ConfigMap (intentgate-bench-script) — the bench.sh logic
+#     adapted for in-cluster execution. Edit and re-apply to tweak
+#     the sweep without rebuilding any image.
+#   - Job (intentgate-bench) — runs `bash /scripts/bench.sh` inside
+#     an Alpine container with vegeta + jq + curl + bash installed
+#     via apk. Reads the admin token from the existing
+#     ig-intentgate-gateway-admin-token Secret. Speaks to the
+#     gateway via cluster DNS, not localhost.
+#
+# Run:
+#
+#   kubectl apply -n intentgate -f scripts/bench-job.yaml
+#   kubectl -n intentgate logs -f job/intentgate-bench
+#
+# To rerun cleanly (Jobs are immutable post-creation):
+#
+#   kubectl -n intentgate delete job intentgate-bench --ignore-not-found
+#   kubectl apply -n intentgate -f scripts/bench-job.yaml
+#
+# Capture the report:
+#
+#   kubectl -n intentgate logs job/intentgate-bench > BENCHMARKS.md
+#
+# Knobs (override via env on the Job spec below):
+#
+#   DURATION       per-rate sweep duration (default 30s)
+#   RATES          space-separated target RPS list (default 100..4000)
+#   PROFILE_NAME   label that lands in the report header
+#
+# Image:
+#
+#   Alpine 3.20 with vegeta + jq + curl + bash installed at startup.
+#   vegeta lives in alpine's community repository on 3.18+, so the
+#   image is small and the apk install is a few seconds. Switching
+#   to a pre-built vegeta image is fine if startup latency ever
+#   becomes a problem — the script doesn't depend on Alpine
+#   specifics.
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: intentgate-bench-script
+data:
+  bench.sh: |
+    #!/usr/bin/env bash
+    # IntentGate gateway benchmark — in-cluster variant.
+    #
+    # Speaks to the gateway via cluster DNS (no port-forward) and
+    # writes the report to stdout so the consumer can pipe
+    # `kubectl logs job/intentgate-bench > BENCHMARKS.md`.
+
+    set -euo pipefail
+
+    GATEWAY_URL="${GATEWAY_URL:-http://ig-intentgate-gateway:8080}"
+    ADMIN_TOKEN="${ADMIN_TOKEN:-}"
+    DURATION="${DURATION:-30s}"
+    RATES="${RATES:-100 500 1000 2000 4000 8000}"
+    PROFILE_NAME="${PROFILE_NAME:-as-deployed-in-cluster}"
+
+    OUT_DIR="/tmp/intentgate-bench"
+    mkdir -p "$OUT_DIR"
+
+    if [[ -z "$ADMIN_TOKEN" ]]; then
+      echo "error: ADMIN_TOKEN env var is required" >&2
+      exit 1
+    fi
+
+    # Wait briefly for the gateway to be reachable — useful when the
+    # Job is applied just after a chart upgrade.
+    for i in $(seq 1 30); do
+      if curl -sf "$GATEWAY_URL/healthz" >/dev/null; then break; fi
+      sleep 1
+    done
+    if ! curl -sf "$GATEWAY_URL/healthz" >/dev/null; then
+      echo "error: gateway not reachable at $GATEWAY_URL after 30s" >&2
+      exit 1
+    fi
+
+    GATEWAY_VERSION=$(curl -sf "$GATEWAY_URL/healthz" | jq -r '.version // "unknown"')
+    DATESTAMP=$(date -u +"%Y-%m-%d %H:%M UTC")
+    POD_CPUS=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo unknown)
+    HOST_DESC="in-cluster Job, $POD_CPUS CPUs"
+
+    # Mint a long-TTL bench token (mirrors scripts/bench.sh).
+    MINT_BODY='{
+      "subject":"bench-agent",
+      "ttl_seconds":1800,
+      "tools":["read_invoice"],
+      "max_calls":10000000
+    }'
+    MINT_RESP=$(curl -sf -X POST "$GATEWAY_URL/v1/admin/mint" \
+      -H "Authorization: Bearer $ADMIN_TOKEN" \
+      -H "Content-Type: application/json" \
+      -d "$MINT_BODY")
+    TOKEN=$(echo "$MINT_RESP" | jq -r '.token')
+    if [[ -z "$TOKEN" || "$TOKEN" == "null" ]]; then
+      echo "error: mint failed: $MINT_RESP" >&2
+      exit 1
+    fi
+
+    PAYLOAD="$OUT_DIR/payload.json"
+    cat >"$PAYLOAD" <<EOF
+    {
+      "jsonrpc": "2.0",
+      "id": 1,
+      "method": "tools/call",
+      "params": {"name": "read_invoice", "arguments": {"id": "bench-1"}}
+    }
+    EOF
+
+    TARGETS="$OUT_DIR/targets.txt"
+    cat >"$TARGETS" <<EOF
+    POST $GATEWAY_URL/v1/mcp
+    Authorization: Bearer $TOKEN
+    Content-Type: application/json
+    X-Intent-Prompt: Benchmark traffic.
+    @$PAYLOAD
+    EOF
+
+    scrape_check_avg_ms() {
+      local check="$1"
+      local metrics
+      metrics=$(curl -sf "$GATEWAY_URL/metrics" 2>/dev/null || echo "")
+      if [[ -z "$metrics" ]]; then echo "n/a"; return; fi
+      local sum count
+      sum=$(echo "$metrics" \
+        | grep -E "^intentgate_gateway_check_duration_seconds_sum\{check=\"$check\"\}" \
+        | awk '{print $NF}' | head -n1)
+      count=$(echo "$metrics" \
+        | grep -E "^intentgate_gateway_check_duration_seconds_count\{check=\"$check\"\}" \
+        | awk '{print $NF}' | head -n1)
+      if [[ -z "$sum" || -z "$count" || "$count" == "0" ]]; then
+        echo "n/a"; return
+      fi
+      awk -v s="$sum" -v c="$count" 'BEGIN { printf "%.3f", (s/c)*1000 }'
+    }
+
+    declare -a SUMMARY_ROWS=()
+    HEADLINE_RATE=""
+    HEADLINE_P50=""
+    HEADLINE_P99=""
+    HEADLINE_SUCCESS=""
+
+    # Log progress to stderr so stdout stays a pure markdown report.
+    >&2 echo "==> gateway version: $GATEWAY_VERSION"
+    >&2 echo "==> host: $HOST_DESC"
+    >&2 echo "==> rates: $RATES"
+    >&2 echo "==> duration: $DURATION"
+
+    for RATE in $RATES; do
+      >&2 echo "==> attacking at ${RATE} req/s for $DURATION..."
+
+      RAW="$OUT_DIR/rate-${RATE}.bin"
+      REPORT="$OUT_DIR/rate-${RATE}.json"
+
+      vegeta attack \
+        -targets="$TARGETS" \
+        -rate="$RATE" \
+        -duration="$DURATION" \
+        -timeout=10s \
+        >"$RAW"
+      vegeta report -type=json <"$RAW" >"$REPORT"
+
+      THROUGHPUT=$(jq -r '.throughput' "$REPORT")
+      P50=$(jq -r '.latencies."50th"' "$REPORT")
+      P95=$(jq -r '.latencies."95th"' "$REPORT")
+      P99=$(jq -r '.latencies."99th"' "$REPORT")
+      MAX=$(jq -r '.latencies.max' "$REPORT")
+      SUCCESS=$(jq -r '.success' "$REPORT")
+      ERRORS=$(jq -r '.errors | length' "$REPORT")
+
+      P50_MS=$(awk -v n="$P50" 'BEGIN { printf "%.2f", n/1e6 }')
+      P95_MS=$(awk -v n="$P95" 'BEGIN { printf "%.2f", n/1e6 }')
+      P99_MS=$(awk -v n="$P99" 'BEGIN { printf "%.2f", n/1e6 }')
+      MAX_MS=$(awk -v n="$MAX" 'BEGIN { printf "%.2f", n/1e6 }')
+      SUCCESS_PCT=$(awk -v s="$SUCCESS" 'BEGIN { printf "%.2f", s*100 }')
+      TPUT=$(awk -v t="$THROUGHPUT" 'BEGIN { printf "%.0f", t }')
+
+      >&2 printf "    throughput=%s/s p50=%sms p95=%sms p99=%sms max=%sms success=%s%%\n" \
+        "$TPUT" "$P50_MS" "$P95_MS" "$P99_MS" "$MAX_MS" "$SUCCESS_PCT"
+
+      SUMMARY_ROWS+=("| ${RATE} | ${TPUT} | ${P50_MS} | ${P95_MS} | ${P99_MS} | ${MAX_MS} | ${SUCCESS_PCT}% | ${ERRORS} |")
+
+      IS_HAPPY=$(awk -v p="$P99_MS" -v s="$SUCCESS" 'BEGIN { print (p<10 && s>=0.999) }')
+      if [[ "$IS_HAPPY" == "1" ]]; then
+        HEADLINE_RATE="$RATE"
+        HEADLINE_P50="$P50_MS"
+        HEADLINE_P99="$P99_MS"
+        HEADLINE_SUCCESS="$SUCCESS_PCT"
+      fi
+      IS_SATURATED=$(awk -v s="$SUCCESS" 'BEGIN { print (s<0.99) }')
+      if [[ "$IS_SATURATED" == "1" ]]; then
+        >&2 echo "    ! saturation detected (success<99%), stopping sweep"
+        break
+      fi
+    done
+
+    CHK_CAP=$(scrape_check_avg_ms "capability")
+    CHK_INT=$(scrape_check_avg_ms "intent")
+    CHK_POL=$(scrape_check_avg_ms "policy")
+    CHK_BUD=$(scrape_check_avg_ms "budget")
+    CHK_REV=$(scrape_check_avg_ms "revocation")
+
+    # The report goes to stdout so a caller can do:
+    #   kubectl logs job/intentgate-bench > BENCHMARKS.md
+    cat <<EOF
+    # IntentGate gateway benchmarks
+
+    Run: \`$DATESTAMP\`
+    Gateway version: \`$GATEWAY_VERSION\`
+    Profile: \`$PROFILE_NAME\`
+    Host: $HOST_DESC
+    Sweep duration per rate: \`$DURATION\`
+
+    EOF
+
+    if [[ -n "$HEADLINE_RATE" ]]; then
+      cat <<EOF
+    ## Headline
+
+    At **${HEADLINE_RATE} requests per second**, the gateway holds
+    **p50 = ${HEADLINE_P50} ms** and **p99 = ${HEADLINE_P99} ms** with
+    **${HEADLINE_SUCCESS}% success**. (Highest rate in this sweep that
+    stayed under a 10 ms p99 with >= 99.9% success — the script picks
+    this automatically.)
+
+    EOF
+    fi
+
+    cat <<EOF
+    ## End-to-end latency by request rate
+
+    Vegeta attacks \`POST /v1/mcp\` IN-CLUSTER against the gateway Service
+    (cluster DNS, no port-forward). The full pipeline runs on every
+    request: token decode + HMAC verify + revocation lookup + policy
+    eval + audit emit.
+
+    | target rate | throughput | p50 (ms) | p95 (ms) | p99 (ms) | max (ms) | success | errors |
+    | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+    EOF
+    for row in "${SUMMARY_ROWS[@]}"; do echo "$row"; done
+
+    cat <<EOF
+
+    ## Average latency by check (cumulative across sweep)
+
+    | check       | mean (ms) |
+    | ----------- | --------: |
+    | capability  | $CHK_CAP |
+    | revocation  | $CHK_REV |
+    | intent      | $CHK_INT |
+    | policy      | $CHK_POL |
+    | budget      | $CHK_BUD |
+
+    ## Test setup
+
+    - Gateway running in the same cluster; vegeta running as a Job in
+      the same namespace. No port-forward in the path.
+    - Token minted with 1800s TTL and 10M max-calls so neither TTL
+      nor budget caps the sweep.
+
+    ## Reproducing
+
+    \`\`\`sh
+    kubectl -n intentgate delete job intentgate-bench --ignore-not-found
+    kubectl apply -n intentgate -f scripts/bench-job.yaml
+    kubectl -n intentgate logs -f job/intentgate-bench > BENCHMARKS.md
+    \`\`\`
+
+    Knobs via env on the Job spec: \`DURATION\`, \`RATES\`, \`PROFILE_NAME\`,
+    \`GATEWAY_URL\`.
+    EOF
+
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: intentgate-bench
+  labels:
+    app.kubernetes.io/name: intentgate-bench
+    app.kubernetes.io/component: benchmark
+spec:
+  # Single attempt — a benchmark that fails is more useful left
+  # failed (so the operator can read the logs) than retried.
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400  # auto-clean after 24h
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: intentgate-bench
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: bench
+          image: alpine:3.20
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -e
+              # Install vegeta + companions. vegeta is in alpine's
+              # community repo on 3.18+.
+              apk add --no-cache --quiet vegeta jq curl bash >/dev/null
+              exec bash /scripts/bench.sh
+          env:
+            - name: ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: ig-intentgate-gateway-admin-token
+                  key: admin-token
+            - name: GATEWAY_URL
+              value: "http://ig-intentgate-gateway:8080"
+            # Default knobs. Edit and re-apply (or use kubectl set env)
+            # to tweak without rebuilding.
+            - name: DURATION
+              value: "30s"
+            - name: RATES
+              value: "100 500 1000 2000 4000 8000"
+            - name: PROFILE_NAME
+              value: "in-cluster"
+          volumeMounts:
+            - name: bench-script
+              mountPath: /scripts
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "256Mi"
+            limits:
+              cpu: "2000m"
+              memory: "512Mi"
+      volumes:
+        - name: bench-script
+          configMap:
+            name: intentgate-bench-script
+            defaultMode: 0o755
