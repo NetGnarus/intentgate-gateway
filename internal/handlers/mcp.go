@@ -599,11 +599,12 @@ func (h *mcpHandler) runApprovalFlow(
 	}
 
 	pending := approvals.PendingRequest{
-		AgentID:       capResult.agentID,
-		Tool:          params.Name,
-		Args:          params.Arguments,
-		IntentSummary: intentSummary(intResult),
-		Reason:        policyReason,
+		AgentID:        capResult.agentID,
+		Tool:           params.Name,
+		Args:           params.Arguments,
+		IntentSummary:  intentSummary(intResult),
+		Reason:         policyReason,
+		RequiresStepUp: requiresStepUp,
 	}
 	if capResult.token != nil {
 		pending.CapabilityTokenID = capResult.token.ID

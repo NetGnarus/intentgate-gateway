@@ -33,11 +33,21 @@ CREATE TABLE IF NOT EXISTS pending_approvals (
 
     -- Tenant scope (multi-tenant, gateway 1.0+). Per-tenant admins
     -- only see / decide their own tenant's pending rows.
-    tenant                   TEXT
+    tenant                   TEXT,
+
+    -- Whether the originating tool call was flagged for step-up
+    -- (Pro v2 #2 follow-up, session 59). Sourced from the Rego
+    -- policy's `requires_step_up` decision at escalate time; lets
+    -- the operator console route the Approve verdict through a
+    -- TOTP modal rather than firing direct.
+    requires_step_up         BOOLEAN NOT NULL DEFAULT FALSE
 );
 
 ALTER TABLE pending_approvals
     ADD COLUMN IF NOT EXISTS tenant TEXT;
+
+ALTER TABLE pending_approvals
+    ADD COLUMN IF NOT EXISTS requires_step_up BOOLEAN NOT NULL DEFAULT FALSE;
 
 CREATE INDEX IF NOT EXISTS pending_approvals_tenant_pending_idx
     ON pending_approvals (tenant, created_at DESC)

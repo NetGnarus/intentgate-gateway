@@ -152,3 +152,43 @@ func TestMemoryWaitOnUnknownID(t *testing.T) {
 		t.Errorf("err=%v want ErrNotFound", err)
 	}
 }
+
+// RequiresStepUp must survive Enqueue → Get → List unchanged. It's
+// metadata the console reads to gate the Approve button on step-up;
+// dropping it on either path defeats the gate.
+func TestMemoryRequiresStepUpRoundtrip(t *testing.T) {
+	s := NewMemoryStore()
+	req := newPending("delete_record")
+	req.RequiresStepUp = true
+	row, err := s.Enqueue(context.Background(), req)
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	if !row.RequiresStepUp {
+		t.Error("Enqueue dropped RequiresStepUp")
+	}
+
+	got, err := s.Get(context.Background(), row.PendingID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if !got.RequiresStepUp {
+		t.Error("Get dropped RequiresStepUp")
+	}
+
+	list, err := s.List(context.Background(), ListFilter{Status: StatusPending})
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(list) != 1 || !list[0].RequiresStepUp {
+		t.Errorf("List dropped RequiresStepUp: %+v", list)
+	}
+
+	// Default (omitted) must survive as false.
+	req2 := newPending("read_invoice")
+	row2, _ := s.Enqueue(context.Background(), req2)
+	got2, _ := s.Get(context.Background(), row2.PendingID)
+	if got2.RequiresStepUp {
+		t.Error("RequiresStepUp leaked true on a row that never set it")
+	}
+}

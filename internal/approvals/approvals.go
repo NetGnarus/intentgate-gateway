@@ -136,6 +136,23 @@ type PendingRequest struct {
 	DecidedAt  *time.Time `json:"decided_at,omitempty"`
 	DecidedBy  string     `json:"decided_by,omitempty"`
 	DecideNote string     `json:"decide_note,omitempty"`
+
+	// RequiresStepUp marks the originating tool call as needing a
+	// fresh out-of-band step-up factor (TOTP / WebAuthn) before the
+	// operator's approve verdict should fire (session 59). Sourced
+	// from the Rego policy's `requires_step_up` decision at escalate
+	// time and copied onto the row so the console can render a
+	// "step-up required" badge + route the Approve click through
+	// <StepUpModal/>. The gateway itself doesn't enforce this — it's
+	// console-side dual-control. The audit row's combination of
+	// (decided_by, requires_step_up) is what an auditor verifies
+	// against the step-up TOTP verification audit event.
+	//
+	// Defaults to false on pre-feature rows (gateway < 1.9) and on
+	// agent calls that the policy didn't flag. Backwards compatible:
+	// the JSON tag is omitempty so clients running against older
+	// gateways keep parsing the response shape unchanged.
+	RequiresStepUp bool `json:"requires_step_up,omitempty"`
 }
 
 // Decision is the operator's verdict, applied via [Store.Decide].

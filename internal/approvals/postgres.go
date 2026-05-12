@@ -163,17 +163,17 @@ func (s *PostgresStore) Enqueue(ctx context.Context, req PendingRequest) (Pendin
 		INSERT INTO pending_approvals (
 			pending_id, capability_token_id, root_capability_token_id,
 			agent_id, tool, args, intent_summary, reason,
-			status, created_at, tenant
+			status, created_at, tenant, requires_step_up
 		) VALUES (
 			$1, $2, $3,
 			$4, $5, $6, $7, $8,
-			'pending', $9, $10
+			'pending', $9, $10, $11
 		)
 	`
 	if _, err := s.pool.Exec(ctx, q,
 		req.PendingID, nullableString(req.CapabilityTokenID), nullableString(req.RootCapabilityTokenID),
 		req.AgentID, req.Tool, argsJSON, req.IntentSummary, req.Reason,
-		req.CreatedAt, nullableString(req.Tenant),
+		req.CreatedAt, nullableString(req.Tenant), req.RequiresStepUp,
 	); err != nil {
 		return PendingRequest{}, fmt.Errorf("approvals: insert: %w", err)
 	}
@@ -310,7 +310,8 @@ func (s *PostgresStore) Get(ctx context.Context, pendingID string) (PendingReque
 	const q = `
 		SELECT pending_id, capability_token_id, root_capability_token_id,
 			agent_id, tool, args, intent_summary, reason,
-			status, created_at, decided_at, decided_by, decide_note, tenant
+			status, created_at, decided_at, decided_by, decide_note, tenant,
+			requires_step_up
 		FROM pending_approvals
 		WHERE pending_id = $1
 	`
@@ -327,6 +328,7 @@ func (s *PostgresStore) Get(ctx context.Context, pendingID string) (PendingReque
 		&row.PendingID, &captok, &roottok,
 		&row.AgentID, &row.Tool, &args, &row.IntentSummary, &row.Reason,
 		&status, &row.CreatedAt, &decAt, &row.DecidedBy, &row.DecideNote, &tenant,
+		&row.RequiresStepUp,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return PendingRequest{}, ErrNotFound
@@ -368,7 +370,8 @@ func (s *PostgresStore) List(ctx context.Context, f ListFilter) ([]PendingReques
 	q := `
 		SELECT pending_id, capability_token_id, root_capability_token_id,
 			agent_id, tool, args, intent_summary, reason,
-			status, created_at, decided_at, decided_by, decide_note, tenant
+			status, created_at, decided_at, decided_by, decide_note, tenant,
+			requires_step_up
 		FROM pending_approvals
 	`
 	args := []any{}
@@ -408,6 +411,7 @@ func (s *PostgresStore) List(ctx context.Context, f ListFilter) ([]PendingReques
 			&row.PendingID, &captok, &roottok,
 			&row.AgentID, &row.Tool, &rawArgs, &row.IntentSummary, &row.Reason,
 			&status, &row.CreatedAt, &decAt, &row.DecidedBy, &row.DecideNote, &tenant,
+			&row.RequiresStepUp,
 		); err != nil {
 			return nil, fmt.Errorf("approvals: scan: %w", err)
 		}
