@@ -2,8 +2,10 @@ package handlers
 
 import (
 	"crypto/subtle"
+	"encoding/csv"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -566,6 +568,320 @@ func NewAdminAuditVerifyHandler(cfg AdminConfig) http.Handler {
 			}
 		}
 		_ = json.NewEncoder(w).Encode(resp)
+	})
+}
+
+// exportPageSize is how many rows the export handler pulls from the
+// audit store per page. Matches the store-internal cap so a single
+// page is always satisfiable in one round trip.
+const exportPageSize = 1000
+
+// exportMaxRows is the hard upper bound on rows the export handler
+// will stream in a single response. Matches the console-pro
+// fetchAllAudit cap so the two sides agree on what a "complete"
+// export looks like. When the cap fires, the gateway logs a warning
+// and the client can detect it by comparing the downloaded row count
+// to this constant. Operators pulling a full quarter for evidence
+// either get the whole set or see a loud signal that they need to
+// narrow the window.
+const exportMaxRows = 200_000
+
+// exportCSVHeader is the column order for CSV exports. Stable —
+// downstream pipelines (compliance-pack generators, manual analysis
+// in Excel) depend on positional reads. New audit fields get
+// appended at the end; never inserted in the middle.
+var exportCSVHeader = []string{
+	"ts",
+	"event",
+	"schema_version",
+	"decision",
+	"check",
+	"reason",
+	"tenant",
+	"agent_id",
+	"session_id",
+	"tool",
+	"arg_keys",
+	"capability_token_id",
+	"root_capability_token_id",
+	"caveat_count",
+	"pending_id",
+	"decided_by",
+	"intent_summary",
+	"latency_ms",
+	"remote_ip",
+	"upstream_status",
+	"requires_step_up",
+	"elevation_id",
+}
+
+// eventToCSVRow maps one audit.Event into the column order declared
+// by exportCSVHeader. ArgValues is deliberately omitted — it's a
+// nested map that doesn't fit a flat CSV row; operators wanting that
+// data should use format=json (NDJSON).
+func eventToCSVRow(e audit.Event) []string {
+	return []string{
+		e.Timestamp,
+		e.EventName,
+		e.SchemaVersion,
+		string(e.Decision),
+		string(e.Check),
+		e.Reason,
+		e.Tenant,
+		e.AgentID,
+		e.SessionID,
+		e.Tool,
+		strings.Join(e.ArgKeys, ";"),
+		e.CapabilityTokenID,
+		e.RootCapabilityTokenID,
+		strconv.Itoa(e.CaveatCount),
+		e.PendingID,
+		e.DecidedBy,
+		e.IntentSummary,
+		strconv.FormatInt(e.LatencyMS, 10),
+		e.RemoteIP,
+		strconv.Itoa(e.UpstreamStatus),
+		strconv.FormatBool(e.RequiresStepUp),
+		e.ElevationID,
+	}
+}
+
+// exportFilename builds the Content-Disposition filename for an
+// audit export. Pattern: intentgate-audit-{tenant}-{utc-timestamp}.{ext}
+// where tenant defaults to "all" for unscoped (superadmin) exports
+// and timestamp is the UTC moment the export was generated, in
+// filename-safe form (YYYYMMDDTHHMMSSZ).
+func exportFilename(tenant, ext string) string {
+	scope := tenant
+	if scope == "" {
+		scope = "all"
+	}
+	return fmt.Sprintf(
+		"intentgate-audit-%s-%s.%s",
+		scope,
+		time.Now().UTC().Format("20060102T150405Z"),
+		ext,
+	)
+}
+
+// NewAdminAuditExportHandler returns the GET /v1/admin/audit/export
+// handler. Streams the full filtered audit set as CSV or NDJSON for
+// download into compliance-evidence packs.
+//
+// Query params:
+//
+//	format        "csv" (default) or "json" (newline-delimited JSON).
+//	from / to     RFC3339 timestamps narrowing the window.
+//	tenant        scope to one tenant; forced for per-tenant admins.
+//	agent_id      equality filter on the actor.
+//	tool          equality filter on the resource.
+//	decision      "allow" or "block".
+//	check         "capability" / "intent" / "policy" / "budget" / "upstream".
+//	jti           capability token id (the audit row's
+//	              capability_token_id).
+//	elevation_id  scope to one JIT elevation window — surfaces the
+//	              "every privileged op under elevation X" query.
+//
+// Behavior:
+//
+//   - Pages through the store at exportPageSize rows at a time;
+//     caps total emitted rows at exportMaxRows. When the cap fires,
+//     the gateway logs a warning ("audit export hit row cap") and
+//     the stream ends after the last row inside the cap. Clients can
+//     detect truncation by comparing the downloaded row count to
+//     exportMaxRows. We deliberately do not communicate truncation
+//     via a response header: Go's http.ResponseWriter commits headers
+//     on the first body Write, so a flag set mid-stream wouldn't make
+//     it to the client reliably. Probing ahead with a second query is
+//     possible but adds an OFFSET=N read on every export; the
+//     log-plus-row-count signal is sufficient for this size cap.
+//
+//   - CSV: writes a stable header row, then one row per event. The
+//     arg_values field is omitted (use format=json for nested data).
+//     New audit fields are appended to the column list over time but
+//     never re-ordered, so existing import pipelines keep working.
+//
+//   - JSON: writes one JSON-encoded event per line (NDJSON). Streams
+//     cleanly — no buffering into an array — and matches what every
+//     compliance evidence consumer expects to ingest.
+//
+// Returns 401 on bad auth, 403 on tenant disagreement, 503 when the
+// audit store isn't configured, 400 on bad timestamps or an unknown
+// format value.
+func NewAdminAuditExportHandler(cfg AdminConfig) http.Handler {
+	if cfg.Logger == nil {
+		cfg.Logger = slog.Default()
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := resolveAdminAuth(r, cfg)
+		if !auth.ok {
+			w.Header().Set("Content-Type", "application/json")
+			adminError(w, http.StatusUnauthorized, "invalid or missing admin token")
+			return
+		}
+		if cfg.AuditStore == nil {
+			w.Header().Set("Content-Type", "application/json")
+			adminError(w, http.StatusServiceUnavailable, "audit store not configured")
+			return
+		}
+
+		q := r.URL.Query()
+
+		format := strings.ToLower(strings.TrimSpace(q.Get("format")))
+		if format == "" {
+			format = "csv"
+		}
+		if format != "csv" && format != "json" {
+			w.Header().Set("Content-Type", "application/json")
+			adminError(w, http.StatusBadRequest, "format must be 'csv' or 'json'")
+			return
+		}
+
+		// Tenant scoping mirrors /v1/admin/audit exactly. Per-tenant
+		// admins are forced; superadmin honors ?tenant= verbatim.
+		tenant := q.Get("tenant")
+		if auth.tenant != "" {
+			if tenant != "" && tenant != auth.tenant {
+				w.Header().Set("Content-Type", "application/json")
+				adminError(w, http.StatusForbidden,
+					"tenant in query does not match admin token's tenant")
+				return
+			}
+			tenant = auth.tenant
+		}
+
+		filter := auditstore.QueryFilter{
+			AgentID:           q.Get("agent_id"),
+			Tool:              q.Get("tool"),
+			Decision:          q.Get("decision"),
+			Check:             q.Get("check"),
+			CapabilityTokenID: q.Get("jti"),
+			Tenant:            tenant,
+			ElevationID:       q.Get("elevation_id"),
+			Limit:             exportPageSize,
+			Offset:            0,
+		}
+		if from := q.Get("from"); from != "" {
+			t, err := time.Parse(time.RFC3339, from)
+			if err != nil {
+				w.Header().Set("Content-Type", "application/json")
+				adminError(w, http.StatusBadRequest, "invalid 'from' timestamp: "+err.Error())
+				return
+			}
+			filter.From = t.UTC()
+		}
+		if to := q.Get("to"); to != "" {
+			t, err := time.Parse(time.RFC3339, to)
+			if err != nil {
+				w.Header().Set("Content-Type", "application/json")
+				adminError(w, http.StatusBadRequest, "invalid 'to' timestamp: "+err.Error())
+				return
+			}
+			filter.To = t.UTC()
+		}
+
+		// Probe the first page before flipping response headers so a
+		// store error surfaces as a clean 503 instead of a partially-
+		// streamed file with no content-disposition.
+		ctx := r.Context()
+		firstPage, err := cfg.AuditStore.Query(ctx, filter)
+		if err != nil {
+			cfg.Logger.Error("audit export query failed", "err", err)
+			w.Header().Set("Content-Type", "application/json")
+			adminError(w, http.StatusServiceUnavailable, "store error: "+err.Error())
+			return
+		}
+
+		// Headers committed past this point — the response is a file.
+		var ext string
+		switch format {
+		case "csv":
+			w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+			ext = "csv"
+		case "json":
+			w.Header().Set("Content-Type", "application/x-ndjson")
+			ext = "ndjson"
+		}
+		w.Header().Set("Content-Disposition",
+			`attachment; filename="`+exportFilename(tenant, ext)+`"`)
+
+		emitted := 0
+		truncated := false
+		pageOffset := 0
+		page := firstPage
+
+		if format == "csv" {
+			cw := csv.NewWriter(w)
+			if err := cw.Write(exportCSVHeader); err != nil {
+				cfg.Logger.Error("audit export header write failed", "err", err)
+				return
+			}
+			for {
+				for _, e := range page {
+					if emitted >= exportMaxRows {
+						truncated = true
+						break
+					}
+					if err := cw.Write(eventToCSVRow(e)); err != nil {
+						cfg.Logger.Error("audit export row write failed", "err", err)
+						cw.Flush()
+						return
+					}
+					emitted++
+				}
+				if truncated || len(page) < exportPageSize {
+					break
+				}
+				pageOffset += exportPageSize
+				nextFilter := filter
+				nextFilter.Offset = pageOffset
+				next, err := cfg.AuditStore.Query(ctx, nextFilter)
+				if err != nil {
+					cfg.Logger.Error("audit export page query failed",
+						"err", err, "offset", pageOffset)
+					cw.Flush()
+					return
+				}
+				page = next
+			}
+			cw.Flush()
+		} else {
+			enc := json.NewEncoder(w)
+			for {
+				for _, e := range page {
+					if emitted >= exportMaxRows {
+						truncated = true
+						break
+					}
+					if err := enc.Encode(e); err != nil {
+						cfg.Logger.Error("audit export ndjson encode failed", "err", err)
+						return
+					}
+					emitted++
+				}
+				if truncated || len(page) < exportPageSize {
+					break
+				}
+				pageOffset += exportPageSize
+				nextFilter := filter
+				nextFilter.Offset = pageOffset
+				next, err := cfg.AuditStore.Query(ctx, nextFilter)
+				if err != nil {
+					cfg.Logger.Error("audit export page query failed",
+						"err", err, "offset", pageOffset)
+					return
+				}
+				page = next
+			}
+		}
+
+		if truncated {
+			// Log loudly so an operator chasing missing rows can grep
+			// for this; the client also knows by comparing the
+			// downloaded row count to exportMaxRows.
+			cfg.Logger.Warn("audit export hit row cap",
+				"cap", exportMaxRows, "tenant", tenant, "format", format)
+		}
 	})
 }
 

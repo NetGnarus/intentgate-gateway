@@ -219,6 +219,11 @@ func New(cfg Config) *http.Server {
 			// rows as Skipped in the response, and operators see a
 			// "best-effort audit before chain was enabled" badge.
 			mux.Handle("GET /v1/admin/audit/verify", handlers.NewAdminAuditVerifyHandler(adminCfg))
+			// CSV / NDJSON export of the filtered audit set for
+			// compliance evidence packs (session 59). Streams pages
+			// from the store; caps at exportMaxRows. Same auth +
+			// tenant scoping as /v1/admin/audit.
+			mux.Handle("GET /v1/admin/audit/export", handlers.NewAdminAuditExportHandler(adminCfg))
 			// Dry-run policy authoring requires the audit store too —
 			// without persistence there's no historical traffic to
 			// replay the candidate Rego against. Older deployments
