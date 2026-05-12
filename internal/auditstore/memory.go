@@ -37,7 +37,14 @@ type MemoryStore struct {
 	filled int
 
 	chainHeads map[string]string // tenant → head hash
-	nextID     int64
+	// chainHeadsUpdated and chainHeadsID surface the per-tenant
+	// chain freshness on VerifyResult so console-pro can render a
+	// "chain last advanced N seconds ago" indicator. The Postgres
+	// store carries the same data in the audit_chain_heads table's
+	// updated_at + head_id columns; this is the in-memory parallel.
+	chainHeadsUpdated map[string]time.Time
+	chainHeadsID      map[string]int64
+	nextID            int64
 }
 
 // memoryEntry pairs an event with its chain metadata. The Postgres
@@ -60,9 +67,11 @@ func NewMemoryStore(capacity int) *MemoryStore {
 		capacity = DefaultMemoryCapacity
 	}
 	return &MemoryStore{
-		buf:        make([]memoryEntry, capacity),
-		cap:        capacity,
-		chainHeads: map[string]string{},
+		buf:               make([]memoryEntry, capacity),
+		cap:               capacity,
+		chainHeads:        map[string]string{},
+		chainHeadsUpdated: map[string]time.Time{},
+		chainHeadsID:      map[string]int64{},
 	}
 }
 
@@ -99,6 +108,8 @@ func (s *MemoryStore) Insert(_ context.Context, e audit.Event) error {
 		s.filled++
 	}
 	s.chainHeads[chainTenant] = newHash
+	s.chainHeadsID[chainTenant] = s.nextID
+	s.chainHeadsUpdated[chainTenant] = time.Now().UTC()
 	return nil
 }
 
@@ -236,6 +247,21 @@ func (s *MemoryStore) VerifyChain(_ context.Context, f VerifyFilter) (VerifyResu
 		out.Verified++
 		prevHashLink = entry.hash
 	}
+
+	// Stamp the per-tenant chain-head telemetry. Mirrors the Postgres
+	// store's behavior so console-pro's "chain last advanced N
+	// seconds ago" indicator works against both backends. Zero values
+	// (untouched tenant) are surfaced as zero, which console-pro
+	// hides.
+	s.mu.RLock()
+	if id, ok := s.chainHeadsID[tenant]; ok {
+		out.HeadID = id
+	}
+	if ts, ok := s.chainHeadsUpdated[tenant]; ok {
+		out.HeadAt = ts
+	}
+	s.mu.RUnlock()
+
 	return out, nil
 }
 

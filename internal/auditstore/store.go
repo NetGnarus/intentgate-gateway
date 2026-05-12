@@ -161,6 +161,21 @@ type VerifyResult struct {
 	Skipped int
 	// First divergence, populated when OK is false.
 	BrokenAt *VerifyBreak
+
+	// HeadID is the id of the most recent event in the per-tenant
+	// chain (the row whose hash is the current chain head). Zero
+	// when the tenant has never had an event written, or when the
+	// backend doesn't track a head pointer. Console-pro pairs this
+	// with HeadAt to render a "chain last advanced N seconds ago"
+	// indicator so an operator knows the chain is live, not stalled
+	// at some stale state.
+	HeadID int64
+	// HeadAt is when the chain head was last advanced — i.e. when
+	// the most recent event was inserted. Zero when the tenant has
+	// never had an event. This is a freshness indicator, not an
+	// authoritative timestamp; the audit row's own ts column is the
+	// source of truth for the event's wall-clock time.
+	HeadAt time.Time
 }
 
 // VerifyBreak describes the first row whose stored hash didn't match

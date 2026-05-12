@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/NetGnarus/intentgate-gateway/internal/audit"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -496,6 +497,35 @@ func (s *PostgresStore) VerifyChain(ctx context.Context, f VerifyFilter) (Verify
 	}
 	if err := rows.Err(); err != nil {
 		return VerifyResult{}, fmt.Errorf("auditstore: verify iter: %w", err)
+	}
+
+	// Stamp the per-tenant chain-head telemetry onto the result so
+	// console-pro can render "chain last advanced N seconds ago" on
+	// /audit/verify. Best effort: a tenant with no events has no row
+	// in audit_chain_heads, which the scan surfaces as ErrNoRows; we
+	// leave HeadID + HeadAt zero in that case. A genuine query error
+	// is logged via the returned error so the caller can degrade
+	// gracefully — verify already succeeded, we shouldn't fail the
+	// whole call over a freshness indicator.
+	var (
+		headID *int64
+		headAt time.Time
+	)
+	herr := s.pool.QueryRow(ctx,
+		`SELECT head_id, updated_at FROM audit_chain_heads WHERE tenant = $1`,
+		tenant,
+	).Scan(&headID, &headAt)
+	if herr == nil {
+		if headID != nil {
+			out.HeadID = *headID
+		}
+		out.HeadAt = headAt.UTC()
+	} else if !errors.Is(herr, pgx.ErrNoRows) {
+		// Don't fail the whole verify on a head-telemetry lookup error
+		// — the verify result is the operator's primary signal. Just
+		// leave the fields zero; console-pro hides the indicator when
+		// HeadAt is zero.
+		return out, nil
 	}
 	return out, nil
 }

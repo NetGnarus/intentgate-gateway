@@ -567,6 +567,16 @@ func NewAdminAuditVerifyHandler(cfg AdminConfig) http.Handler {
 				"reason":        result.BrokenAt.Reason,
 			}
 		}
+		// Chain-head freshness telemetry (session 59 polish). Omitted
+		// when the tenant has no events (HeadAt zero) so console-pro
+		// can render a "no events yet" hint instead of "advanced 56
+		// years ago." The id pairs with head_at so an operator can
+		// deep-link "show me the latest event" via /v1/admin/audit
+		// filtered on the id.
+		if !result.HeadAt.IsZero() {
+			resp["head_at"] = result.HeadAt.UTC().Format(time.RFC3339Nano)
+			resp["head_id"] = result.HeadID
+		}
 		_ = json.NewEncoder(w).Encode(resp)
 	})
 }

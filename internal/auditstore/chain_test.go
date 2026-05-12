@@ -274,3 +274,87 @@ func TestVerifyChainRespectsWindow(t *testing.T) {
 		t.Errorf("expected 4 events in [2h, 5h], got %d", r.Verified)
 	}
 }
+
+// --- chain-head telemetry -------------------------------------------
+
+// After inserting events, VerifyChain MUST surface the most-recent
+// event's id + insertion time on VerifyResult so console-pro can
+// render "chain last advanced N seconds ago" on /audit/verify.
+func TestVerifyChainSurfacesHeadTelemetry(t *testing.T) {
+	ctx := context.Background()
+	s := NewMemoryStore(0)
+
+	before := time.Now().UTC()
+	for i := 0; i < 3; i++ {
+		_ = s.Insert(ctx, mkChainEvent(
+			time.Date(2026, 5, 12, 9, 0, i, 0, time.UTC),
+			audit.DecisionAllow, "read", "acme",
+		))
+	}
+	after := time.Now().UTC().Add(time.Second)
+
+	r, err := s.VerifyChain(ctx, VerifyFilter{Tenant: "acme"})
+	if err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	if r.HeadID == 0 {
+		t.Errorf("HeadID not surfaced: %+v", r)
+	}
+	if r.HeadAt.IsZero() {
+		t.Errorf("HeadAt zero, want non-zero")
+	}
+	if r.HeadAt.Before(before) || r.HeadAt.After(after) {
+		t.Errorf("HeadAt=%v outside [%v, %v]", r.HeadAt, before, after)
+	}
+}
+
+// A tenant that has never had an event yields zero head fields. The
+// admin handler omits them from the JSON response in this state so
+// console-pro can render a "no events yet" hint.
+func TestVerifyChainEmptyTenantNoHeadTelemetry(t *testing.T) {
+	ctx := context.Background()
+	s := NewMemoryStore(0)
+
+	r, err := s.VerifyChain(ctx, VerifyFilter{Tenant: "ghost"})
+	if err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	if r.HeadID != 0 {
+		t.Errorf("HeadID=%d on empty tenant", r.HeadID)
+	}
+	if !r.HeadAt.IsZero() {
+		t.Errorf("HeadAt=%v on empty tenant", r.HeadAt)
+	}
+	if !r.OK {
+		t.Errorf("expected OK on empty tenant: %+v", r)
+	}
+}
+
+// Head telemetry is per-tenant. Inserting on acme must not advance
+// globex's head.
+func TestVerifyChainHeadPerTenantIsolation(t *testing.T) {
+	ctx := context.Background()
+	s := NewMemoryStore(0)
+
+	now := time.Now().UTC()
+	for i := 0; i < 3; i++ {
+		_ = s.Insert(ctx, mkChainEvent(now.Add(time.Duration(i)*time.Second),
+			audit.DecisionAllow, "read", "acme"))
+	}
+
+	gr, err := s.VerifyChain(ctx, VerifyFilter{Tenant: "globex"})
+	if err != nil {
+		t.Fatalf("globex verify: %v", err)
+	}
+	if !gr.HeadAt.IsZero() || gr.HeadID != 0 {
+		t.Errorf("globex head leaked from acme: %+v", gr)
+	}
+
+	ar, err := s.VerifyChain(ctx, VerifyFilter{Tenant: "acme"})
+	if err != nil {
+		t.Fatalf("acme verify: %v", err)
+	}
+	if ar.HeadAt.IsZero() || ar.HeadID == 0 {
+		t.Errorf("acme head missing: %+v", ar)
+	}
+}
