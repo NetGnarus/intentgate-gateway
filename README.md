@@ -8,6 +8,10 @@
 
 A self-hosted authorization gateway for AI agents.
 
+📖 **Background reading:** [The four-control bypass](https://intentgate.app/why-intentgate) — a 9-minute essay on why your existing identity stack (IAM, IGA, PAM, ABAC) approves every prompt-injected agent call, and what a fifth control layer does about it.
+
+🌐 **Website:** [intentgate.app](https://intentgate.app) · 🧪 **Live demo:** [intentgate.app/demo](https://intentgate.app/demo) · 📋 **Governance & open-core commitment:** [GOVERNANCE.md](GOVERNANCE.md)
+
 > **Performance** (single-replica, in-memory dev install): **2,000 RPS at p50 = 0.77 ms, p99 = 1.50 ms, 100% success**. Full numbers and reproducer in [`BENCHMARKS.md`](BENCHMARKS.md); rerun with `./scripts/bench.sh` against any IntentGate gateway you can reach.
 
 The gateway sits between an AI agent and the tool servers it wants to call.
