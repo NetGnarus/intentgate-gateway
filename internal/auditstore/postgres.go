@@ -112,10 +112,18 @@ func (s *PostgresStore) Insert(ctx context.Context, e audit.Event) error {
 	}
 	// Fix up the event's timestamp string to match what we'll store,
 	// so the hash on the way in matches the hash any consumer would
-	// recompute after loading the row back. Round-tripping RFC3339Nano
-	// through time.Parse + .Format is lossless, but defensively
-	// re-format here in case the source string was abbreviated.
-	e.Timestamp = ts.UTC().Format(time.RFC3339Nano)
+	// recompute after loading the row back.
+	//
+	// CRITICAL: we truncate to microsecond before formatting because
+	// Postgres TIMESTAMPTZ stores at microsecond precision (not
+	// nanosecond). audit.NewEvent emits RFC3339Nano with up to 9
+	// digits of fractional seconds; verify reads the column back as
+	// time.Time (microsecond precision) and re-formats as RFC3339Nano
+	// (≤6 digits). Without this truncation, the hash computed on
+	// insert covers a 9-digit string but verify hashes the 6-digit
+	// post-round-trip string, and every chain verify fails with
+	// "hash mismatch (row body tampered)" on the first row.
+	e.Timestamp = ts.UTC().Truncate(time.Microsecond).Format(time.RFC3339Nano)
 
 	// Canonical hash of this event, BEFORE the prev_hash is woven in
 	// (that happens inside the tx with the locked head).
@@ -195,7 +203,8 @@ func (s *PostgresStore) Insert(ctx context.Context, e audit.Event) error {
 			root_capability_token_id, caveat_count, tenant,
 			arg_values,
 			prev_hash, hash,
-			elevation_id
+			elevation_id,
+			pending_id, decided_by, requires_step_up
 		) VALUES (
 			$1, $2, $3,
 			$4, $5, $6,
@@ -206,7 +215,8 @@ func (s *PostgresStore) Insert(ctx context.Context, e audit.Event) error {
 			$16, $17, $18,
 			$19,
 			$20, $21,
-			$22
+			$22,
+			$23, $24, $25
 		)
 		RETURNING id
 	`
@@ -223,6 +233,7 @@ func (s *PostgresStore) Insert(ctx context.Context, e audit.Event) error {
 		argValuesJSON,
 		prevHashCol, newHash,
 		nullableString(e.ElevationID),
+		e.PendingID, e.DecidedBy, e.RequiresStepUp,
 	).Scan(&insertedID); err != nil {
 		return fmt.Errorf("auditstore: insert: %w", err)
 	}
@@ -369,6 +380,15 @@ func (s *PostgresStore) VerifyChain(ctx context.Context, f VerifyFilter) (Verify
 	}
 
 	// Build a per-verify WHERE with id ASC ordering.
+	//
+	// IMPORTANT: every column referenced by audit.canonicalEvent must
+	// be selected here so VerifyChain can reconstruct an event whose
+	// hash recompute matches the stored hash. Adding a field to
+	// canonicalEvent without updating this SELECT (and the Scan
+	// destinations below) is a chain-breaking change — chains will
+	// verify clean until the first event with that field populated,
+	// then fail with "hash mismatch (row body tampered)" on a row
+	// nothing actually tampered with.
 	q := `
 		SELECT id, ts, event_name, schema_version,
 			decision, check_stage, reason,
@@ -377,7 +397,8 @@ func (s *PostgresStore) VerifyChain(ctx context.Context, f VerifyFilter) (Verify
 			capability_token_id, intent_summary,
 			latency_ms, remote_ip, upstream_status,
 			root_capability_token_id, caveat_count, tenant,
-			prev_hash, hash
+			prev_hash, hash,
+			elevation_id, pending_id, decided_by, requires_step_up
 		FROM audit_events
 		WHERE COALESCE(tenant, 'default') = $1
 	`
@@ -403,17 +424,21 @@ func (s *PostgresStore) VerifyChain(ctx context.Context, f VerifyFilter) (Verify
 
 	for rows.Next() {
 		var (
-			id          int64
-			ts          time.Time
-			argKeysJSON []byte
-			ev          audit.Event
-			decision    string
-			check       string
-			rootJTI     *string
-			caveatCount *int
-			tenantCol   *string
-			prevHashCol *string
-			hashStored  string
+			id             int64
+			ts             time.Time
+			argKeysJSON    []byte
+			ev             audit.Event
+			decision       string
+			check          string
+			rootJTI        *string
+			caveatCount    *int
+			tenantCol      *string
+			prevHashCol    *string
+			hashStored     string
+			elevationCol   *string
+			pendingID      string
+			decidedBy      string
+			requiresStepUp bool
 		)
 		if err := rows.Scan(
 			&id, &ts, &ev.EventName, &ev.SchemaVersion,
@@ -424,6 +449,7 @@ func (s *PostgresStore) VerifyChain(ctx context.Context, f VerifyFilter) (Verify
 			&ev.LatencyMS, &ev.RemoteIP, &ev.UpstreamStatus,
 			&rootJTI, &caveatCount, &tenantCol,
 			&prevHashCol, &hashStored,
+			&elevationCol, &pendingID, &decidedBy, &requiresStepUp,
 		); err != nil {
 			return VerifyResult{}, fmt.Errorf("auditstore: verify scan: %w", err)
 		}
@@ -436,6 +462,12 @@ func (s *PostgresStore) VerifyChain(ctx context.Context, f VerifyFilter) (Verify
 		if tenantCol != nil {
 			ev.Tenant = *tenantCol
 		}
+		if elevationCol != nil {
+			ev.ElevationID = *elevationCol
+		}
+		ev.PendingID = pendingID
+		ev.DecidedBy = decidedBy
+		ev.RequiresStepUp = requiresStepUp
 		ev.Timestamp = ts.UTC().Format(time.RFC3339Nano)
 		ev.Decision = audit.Decision(decision)
 		ev.Check = audit.Check(check)

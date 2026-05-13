@@ -31,13 +31,22 @@ CREATE TABLE IF NOT EXISTS policy_drafts (
 CREATE INDEX IF NOT EXISTS policy_drafts_tenant_updated_at_idx
     ON policy_drafts (tenant, updated_at DESC);
 
+-- Fresh installs land here with PK on (tenant) directly (the v1.5
+-- shape). The DO block below still handles v1.4→v1.5 PK migration
+-- for deployments that started against an older schema where the PK
+-- was on (id).
+--
+-- Without the PK on the CREATE TABLE, the bottom-of-file seed's
+-- `INSERT ... ON CONFLICT (tenant) DO NOTHING` fails on fresh
+-- postgres with SQLSTATE 42P10 because nothing made (tenant) unique.
 CREATE TABLE IF NOT EXISTS policy_active (
     id                 TEXT NOT NULL,
     tenant             TEXT NOT NULL DEFAULT '',
     current_draft_id   TEXT NOT NULL DEFAULT '',
     previous_draft_id  TEXT NOT NULL DEFAULT '',
     promoted_at        TIMESTAMPTZ,
-    promoted_by        TEXT NOT NULL DEFAULT ''
+    promoted_by        TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (tenant)
 );
 
 -- 1.4 -> 1.5 column add (no-op once present). Pre-1.5 deployments

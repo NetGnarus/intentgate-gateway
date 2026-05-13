@@ -84,7 +84,26 @@ CREATE TABLE IF NOT EXISTS audit_events (
     -- produce "show me every privileged operation performed under
     -- elevation X with its approver and justification" — a single
     -- query answer to the SOC 2 break-glass evidence question.
-    elevation_id             TEXT
+    elevation_id             TEXT,
+
+    -- Approval-flow telemetry (escalate path, gateway 1.6+).
+    -- These three fields are part of audit.canonicalEvent and therefore
+    -- contribute to the chain hash. Without these columns, VerifyChain
+    -- can't reconstruct the canonical form of an escalate event (or any
+    -- approve/reject follow-up) and the chain verify reports a hash
+    -- mismatch on the first such row.
+    --
+    --   pending_id        correlates the escalate event with the eventual
+    --                     approve/reject/timeout follow-up.
+    --   decided_by        operator identity who approved or rejected;
+    --                     empty on the escalate event itself.
+    --   requires_step_up  flag for approvals that need fresh-factor
+    --                     (TOTP / WebAuthn) at the decision step.
+    --
+    -- Empty / FALSE for non-approval-flow events.
+    pending_id               TEXT NOT NULL DEFAULT '',
+    decided_by               TEXT NOT NULL DEFAULT '',
+    requires_step_up         BOOLEAN NOT NULL DEFAULT FALSE
 );
 
 -- Idempotent ALTERs: existing 0.5/0.6 deployments whose audit_events
@@ -104,6 +123,12 @@ ALTER TABLE audit_events
     ADD COLUMN IF NOT EXISTS hash TEXT NOT NULL DEFAULT '';
 ALTER TABLE audit_events
     ADD COLUMN IF NOT EXISTS elevation_id TEXT;
+ALTER TABLE audit_events
+    ADD COLUMN IF NOT EXISTS pending_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE audit_events
+    ADD COLUMN IF NOT EXISTS decided_by TEXT NOT NULL DEFAULT '';
+ALTER TABLE audit_events
+    ADD COLUMN IF NOT EXISTS requires_step_up BOOLEAN NOT NULL DEFAULT FALSE;
 
 -- Compliance lookup: "every event during elevation X". Partial
 -- index so non-elevated rows (the vast majority) don't bloat it.
