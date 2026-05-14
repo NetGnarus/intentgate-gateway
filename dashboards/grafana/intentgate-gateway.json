@@ -1,0 +1,589 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {"type": "grafana", "uid": "-- Grafana --"},
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "Operational view of the IntentGate gateway. Headline rate / latency / deny / upstream-health up top, four-control decision detail and per-stage latency in the middle, runtime + revocation diagnostics at the bottom. Scrapes `intentgate_gateway_*` metrics from a single gateway replica or summed across replicas.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "type": "row",
+      "id": 100,
+      "title": "Headline",
+      "gridPos": {"x": 0, "y": 0, "w": 24, "h": 1},
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "stat",
+      "id": 1,
+      "title": "Request rate",
+      "description": "Total HTTP requests/sec across all routes.",
+      "gridPos": {"x": 0, "y": 1, "w": 6, "h": 6},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(intentgate_gateway_http_requests_total[1m]))",
+          "legendFormat": "RPS"
+        }
+      ],
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "decimals": 0,
+          "color": {"mode": "thresholds"},
+          "thresholds": {"mode": "absolute", "steps": [
+            {"color": "blue", "value": null}
+          ]}
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "id": 2,
+      "title": "p99 latency",
+      "description": "End-to-end p99 over the last 5m, across all routes.",
+      "gridPos": {"x": 6, "y": 1, "w": 6, "h": 6},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.99, sum(rate(intentgate_gateway_http_request_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p99"
+        }
+      ],
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"]},
+        "colorMode": "value",
+        "graphMode": "area"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 4,
+          "color": {"mode": "thresholds"},
+          "thresholds": {"mode": "absolute", "steps": [
+            {"color": "green", "value": null},
+            {"color": "yellow", "value": 0.01},
+            {"color": "red", "value": 0.1}
+          ]}
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "id": 3,
+      "title": "Deny rate",
+      "description": "Authorization decisions denied per second (any check stage).",
+      "gridPos": {"x": 12, "y": 1, "w": 6, "h": 6},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(intentgate_gateway_check_decisions_total{decision=\"block\"}[1m]))",
+          "legendFormat": "denies/s"
+        }
+      ],
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"]},
+        "colorMode": "value",
+        "graphMode": "area"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "decimals": 2,
+          "color": {"mode": "thresholds"},
+          "thresholds": {"mode": "absolute", "steps": [
+            {"color": "green", "value": null},
+            {"color": "orange", "value": 1},
+            {"color": "red", "value": 10}
+          ]}
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "id": 4,
+      "title": "Upstream success",
+      "description": "Share of upstream forwards that returned successfully (last 5m).",
+      "gridPos": {"x": 18, "y": 1, "w": 6, "h": 6},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(intentgate_gateway_upstream_forward_total{outcome=\"success\"}[5m])) / clamp_min(sum(rate(intentgate_gateway_upstream_forward_total[5m])), 0.0001)",
+          "legendFormat": "success"
+        }
+      ],
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"]},
+        "colorMode": "value",
+        "graphMode": "area"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 2,
+          "min": 0,
+          "max": 1,
+          "color": {"mode": "thresholds"},
+          "thresholds": {"mode": "absolute", "steps": [
+            {"color": "red", "value": null},
+            {"color": "yellow", "value": 0.95},
+            {"color": "green", "value": 0.99}
+          ]}
+        }
+      }
+    },
+    {
+      "type": "row",
+      "id": 101,
+      "title": "Four-control authorization decisions",
+      "gridPos": {"x": 0, "y": 7, "w": 24, "h": 1},
+      "collapsed": false
+    },
+    {
+      "type": "timeseries",
+      "id": 5,
+      "title": "Decisions by check stage",
+      "description": "Per-second rate of decisions broken out by check (capability / intent / policy / budget / upstream) and outcome (allow / block / skip).",
+      "gridPos": {"x": 0, "y": 8, "w": 24, "h": 9},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (check, decision) (rate(intentgate_gateway_check_decisions_total[1m]))",
+          "legendFormat": "{{check}} → {{decision}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 15,
+            "stacking": {"mode": "none"},
+            "showPoints": "never",
+            "pointSize": 3,
+            "lineInterpolation": "smooth"
+          }
+        },
+        "overrides": [
+          {"matcher": {"id": "byRegexp", "options": ".*block"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "red"}}]}
+        ]
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["lastNotNull", "max"]},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      }
+    },
+    {
+      "type": "row",
+      "id": 102,
+      "title": "Latency",
+      "gridPos": {"x": 0, "y": 17, "w": 24, "h": 1},
+      "collapsed": false
+    },
+    {
+      "type": "timeseries",
+      "id": 6,
+      "title": "Per-check evaluation latency (p99)",
+      "description": "p99 evaluation time for each authorization check stage. Spikes here indicate slowdowns inside a specific check (e.g., Rego eval, revocation Redis lookup, extractor call).",
+      "gridPos": {"x": 0, "y": 18, "w": 12, "h": 9},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.99, sum by (check, le) (rate(intentgate_gateway_check_duration_seconds_bucket[5m])))",
+          "legendFormat": "{{check}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 4,
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 5,
+            "showPoints": "never",
+            "lineInterpolation": "smooth"
+          }
+        }
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"]},
+        "tooltip": {"mode": "multi"}
+      }
+    },
+    {
+      "type": "timeseries",
+      "id": 7,
+      "title": "End-to-end HTTP latency (p50 / p95 / p99)",
+      "description": "Total handler-side latency, including all four checks plus upstream forward.",
+      "gridPos": {"x": 12, "y": 18, "w": 12, "h": 9},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.5, sum(rate(intentgate_gateway_http_request_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p50"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95, sum(rate(intentgate_gateway_http_request_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p95"
+        },
+        {
+          "refId": "C",
+          "expr": "histogram_quantile(0.99, sum(rate(intentgate_gateway_http_request_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 4,
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "lineInterpolation": "smooth"
+          }
+        }
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"]},
+        "tooltip": {"mode": "multi"}
+      }
+    },
+    {
+      "type": "row",
+      "id": 103,
+      "title": "Upstream health",
+      "gridPos": {"x": 0, "y": 27, "w": 24, "h": 1},
+      "collapsed": false
+    },
+    {
+      "type": "timeseries",
+      "id": 8,
+      "title": "Upstream forward outcomes",
+      "description": "Per-second rate of upstream forward attempts by outcome (success / timeout / transport error / upstream non-2xx).",
+      "gridPos": {"x": 0, "y": 28, "w": 12, "h": 9},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (outcome) (rate(intentgate_gateway_upstream_forward_total[1m]))",
+          "legendFormat": "{{outcome}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 25,
+            "stacking": {"mode": "normal"},
+            "showPoints": "never"
+          }
+        },
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "success"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "green"}}]},
+          {"matcher": {"id": "byName", "options": "timeout"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "red"}}]},
+          {"matcher": {"id": "byName", "options": "transport"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "orange"}}]},
+          {"matcher": {"id": "byName", "options": "upstream_http"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "yellow"}}]}
+        ]
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"]},
+        "tooltip": {"mode": "multi"}
+      }
+    },
+    {
+      "type": "timeseries",
+      "id": 9,
+      "title": "Upstream forward latency (p99)",
+      "description": "p99 round-trip time to the upstream MCP tool server, by outcome.",
+      "gridPos": {"x": 12, "y": 28, "w": 12, "h": 9},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.99, sum by (outcome, le) (rate(intentgate_gateway_upstream_forward_duration_seconds_bucket[5m])))",
+          "legendFormat": "{{outcome}} p99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 3,
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 5,
+            "showPoints": "never"
+          }
+        }
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"]},
+        "tooltip": {"mode": "multi"}
+      }
+    },
+    {
+      "type": "row",
+      "id": 104,
+      "title": "Revocation store",
+      "gridPos": {"x": 0, "y": 37, "w": 24, "h": 1},
+      "collapsed": false
+    },
+    {
+      "type": "timeseries",
+      "id": 10,
+      "title": "Revocation lookups",
+      "description": "Capability-token revocation checks per second, by result. Non-zero `error` series is the operational red flag — points at a sick revocation backend.",
+      "gridPos": {"x": 0, "y": 38, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (result) (rate(intentgate_gateway_revocation_lookups_total[1m]))",
+          "legendFormat": "{{result}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 15,
+            "showPoints": "never"
+          }
+        },
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "error"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "red"}}]},
+          {"matcher": {"id": "byName", "options": "revoked"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "orange"}}]},
+          {"matcher": {"id": "byName", "options": "not_revoked"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "green"}}]}
+        ]
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull"]},
+        "tooltip": {"mode": "multi"}
+      }
+    },
+    {
+      "type": "timeseries",
+      "id": 11,
+      "title": "Revocation lookup latency (p99)",
+      "description": "End-to-end revocation-store lookup time. Sustained values above ~5ms typically mean the backing store (Postgres or Redis) is under pressure.",
+      "gridPos": {"x": 12, "y": 38, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.99, sum(rate(intentgate_gateway_revocation_lookup_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p99"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.5, sum(rate(intentgate_gateway_revocation_lookup_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p50"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 4,
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 5,
+            "showPoints": "never"
+          }
+        }
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"]},
+        "tooltip": {"mode": "multi"}
+      }
+    },
+    {
+      "type": "row",
+      "id": 105,
+      "title": "Runtime",
+      "gridPos": {"x": 0, "y": 46, "w": 24, "h": 1},
+      "collapsed": true,
+      "panels": [
+        {
+          "type": "timeseries",
+          "id": 12,
+          "title": "Goroutines",
+          "description": "Live goroutine count. Steady growth without traffic increase suggests a leak.",
+          "gridPos": {"x": 0, "y": 47, "w": 6, "h": 7},
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "targets": [
+            {"refId": "A", "expr": "go_goroutines", "legendFormat": "goroutines"}
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "color": {"mode": "palette-classic"},
+              "custom": {
+                "drawStyle": "line", "lineWidth": 2, "fillOpacity": 15,
+                "showPoints": "never"
+              }
+            }
+          },
+          "options": {
+            "legend": {"displayMode": "hidden"},
+            "tooltip": {"mode": "single"}
+          }
+        },
+        {
+          "type": "timeseries",
+          "id": 13,
+          "title": "GC pause (p99)",
+          "description": "99th-percentile GC pause duration. Sustained > 50ms suggests heap pressure.",
+          "gridPos": {"x": 6, "y": 47, "w": 6, "h": 7},
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "histogram_quantile(0.99, sum(rate(go_gc_duration_seconds_bucket[5m])) by (le))",
+              "legendFormat": "p99"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "decimals": 4,
+              "color": {"mode": "palette-classic"},
+              "custom": {
+                "drawStyle": "line", "lineWidth": 2, "fillOpacity": 5,
+                "showPoints": "never"
+              }
+            }
+          },
+          "options": {
+            "legend": {"displayMode": "hidden"},
+            "tooltip": {"mode": "single"}
+          }
+        },
+        {
+          "type": "timeseries",
+          "id": 14,
+          "title": "Heap in use",
+          "description": "Bytes currently allocated and in use on the heap.",
+          "gridPos": {"x": 12, "y": 47, "w": 6, "h": 7},
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "targets": [
+            {"refId": "A", "expr": "go_memstats_heap_inuse_bytes", "legendFormat": "heap inuse"}
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "bytes",
+              "color": {"mode": "palette-classic"},
+              "custom": {
+                "drawStyle": "line", "lineWidth": 2, "fillOpacity": 15,
+                "showPoints": "never"
+              }
+            }
+          },
+          "options": {
+            "legend": {"displayMode": "hidden"},
+            "tooltip": {"mode": "single"}
+          }
+        },
+        {
+          "type": "timeseries",
+          "id": 15,
+          "title": "Process CPU",
+          "description": "CPU seconds consumed per second (i.e. core-equivalents in use).",
+          "gridPos": {"x": 18, "y": 47, "w": 6, "h": 7},
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "targets": [
+            {"refId": "A", "expr": "rate(process_cpu_seconds_total[1m])", "legendFormat": "cpu cores"}
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "decimals": 3,
+              "color": {"mode": "palette-classic"},
+              "custom": {
+                "drawStyle": "line", "lineWidth": 2, "fillOpacity": 15,
+                "showPoints": "never"
+              }
+            }
+          },
+          "options": {
+            "legend": {"displayMode": "hidden"},
+            "tooltip": {"mode": "single"}
+          }
+        }
+      ]
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 39,
+  "tags": ["intentgate", "gateway", "authorization"],
+  "templating": {"list": []},
+  "time": {"from": "now-15m", "to": "now"},
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "IntentGate Gateway — Operations",
+  "uid": "intentgate-gateway-ops",
+  "version": 1,
+  "weekStart": "",
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "description": "Prometheus datasource scraping the IntentGate gateway's /metrics endpoint.",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    }
+  ],
+  "__requires": [
+    {"type": "grafana", "id": "grafana", "name": "Grafana", "version": "11.0.0"},
+    {"type": "datasource", "id": "prometheus", "name": "Prometheus", "version": "1.0.0"},
+    {"type": "panel", "id": "stat", "name": "Stat", "version": ""},
+    {"type": "panel", "id": "timeseries", "name": "Time series", "version": ""}
+  ]
+}
